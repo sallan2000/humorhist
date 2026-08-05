@@ -1,0 +1,7 @@
+pyproject.toml
+humorhist/__init__.py
+humorhist.egg-info/PKG-INFO
+humorhist.egg-info/SOURCES.txt
+humorhist.egg-info/dependency_links.txt
+humorhist.egg-info/requires.txt
+humorhist.egg-info/top_level.txt
