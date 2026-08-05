@@ -50,8 +50,12 @@ this passes.
 4. **Wikipedia source breadth.** Currently 5 list pages. `Lists_of_unusual_deaths`
    only yields 27 items (it is an index page) — could be replaced with the individual
    sub-lists it links to.
-5. Task 1.2's spec/quality reviews were dispatched but their results never landed;
-   the code was independently verified working, so this is cosmetic only.
+5. Task 1.2 reviews both came back clean: spec PASS (all 9 requirements verified
+   line-by-line, no scope creep) and quality APPROVED (no critical/important
+   issues). Optional polish only: add `logging.info(summary)` when wiring
+   harvesters into a runner, and consider a TypedDict return. Both harvesters now
+   exist, so a shared upsert helper could be revisited — the reviewer advised
+   waiting until the duplication was concrete, which it now is.
 6. **Per-row commits in db.py** (flagged by the Task 1.1 quality review, not yet
    actioned). Every mutating function calls `conn.commit()` individually; SQLite
    fsyncs per commit, so bulk inserts are far slower than one wrapping transaction.
