@@ -47,9 +47,18 @@ this passes.
    model quality directly affects the product.
 3. **Pool only 60/741 screened.** Screening the rest takes ~1hr at current speed.
    Run: `.venv/bin/python -m humorhist.cli --db data/humorhist.sqlite screen`
-4. **Wikipedia source breadth.** Currently 5 list pages. `Lists_of_unusual_deaths`
-   only yields 27 items (it is an index page) — could be replaced with the individual
-   sub-lists it links to.
+4. **Wikipedia source breadth.** Currently 5 list pages, per-page yields:
+       List_of_wars_of_succession        229 items, 213 with year
+       List_of_hoaxes                    217 items,  29 with year
+       List_of_Ig_Nobel_Prize_winners    110 items, 105 with year
+       List_of_April_Fools'_Day_jokes     68 items,  49 with year
+       Lists_of_unusual_deaths            27 items,   0 with year
+   Note `Lists_of_unusual_deaths` is an index page (a list OF lists), hence only 27
+   items and no years — could be replaced by the individual sub-lists it links to.
+   AGENT DECISION TO REVIEW: `List_of_practical_joke_topics` was dropped during the
+   1.3 fixup (only 19 items) and swapped for `List_of_April_Fools'_Day_jokes`.
+   Reasonable, but it was an automated content-sourcing choice — override if you
+   disagree. Adding more pages is the cheapest way to grow the pool.
 5. Task 1.2 reviews both came back clean: spec PASS (all 9 requirements verified
    line-by-line, no scope creep) and quality APPROVED (no critical/important
    issues). Optional polish only: add `logging.info(summary)` when wiring
