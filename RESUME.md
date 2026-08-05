@@ -23,7 +23,17 @@ story — is **not supported** by the source and is disputed lore. That is exact
 failure mode that would get the account fact-checked into oblivion, caught automatically.
 
 ## THE DECISION FOR TOMORROW
-Read the three drafts and answer one question: **are the comic angles genuinely
+
+**Caveat on the three existing drafts:** they were generated BEFORE the source-URL
+bug fix (commit 55f2bf7). `_row_to_item()` emitted `source_url` but
+`build_factcheck_prompt()` reads `url`, so the `SOURCE URL:` line was silently
+missing from every fact-check prompt — no error, just less context. Now fixed and
+regression-tested. The existing drafts are still worth reading, but if the angles
+feel borderline, regenerate one before judging:
+    systemd-run --user --unit=humorhist-redraft --same-dir \
+      /home/stevie/projects/humorhist/.venv/bin/python scripts/run_drafts.py --count 1
+
+Read the drafts and answer one question: **are the comic angles genuinely
 useful to you as a writer?**
 
     cd ~/projects/humorhist
