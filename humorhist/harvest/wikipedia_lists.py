@@ -156,21 +156,40 @@ def _fetch_raw(
 # --------------------------------------------------------------------------- #
 
 
-def _clean_markup(text: str) -> str:
-    """Strip common wiki/markup noise from a single line of wikitext."""
-    # HTML comments <!-- ... -->
+def _strip_noise(text: str) -> str:
+    """Remove comments, refs, HTML tags, templates and bold/italic markers.
+
+    Wiki links are deliberately left intact so title derivation can still find
+    the first link. Template removal is innermost-first and repeated until the
+    text stops changing, so nested ``{{a|{{b}}|c}}`` and multi-pipe templates
+    are fully removed (including unterminated/truncated residue).
+    """
+    text = text or ""
+    # HTML comments <!-- ... --> (also tolerate an unterminated one)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"<!--.*$", "", text, flags=re.DOTALL)
     # <ref>...</ref> and <ref .../> (self-closing and paired)
     text = re.sub(r"<ref\b[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
     text = re.sub(r"<ref\b[^>]*?/?>", "", text)
     # Other stray HTML tags (e.g. <br>, <nowiki>) -- drop the tag, keep content
     text = re.sub(r"</?[a-zA-Z][^>]*?>", "", text)
-    # Templates {{...}}, iteratively to handle one level of nesting
-    for _ in range(5):
+    # Templates {{...}}: innermost-first until stable.
+    while True:
         new = re.sub(r"\{\{[^{}]*\}\}", "", text)
         if new == text:
             break
         text = new
+    # Unbalanced / truncated template residue.
+    text = re.sub(r"\{\{.*?(?:\}\}|$)", "", text, flags=re.DOTALL)
+    text = text.replace("{{", "").replace("}}", "")
+    # Italic/bold markers
+    text = text.replace("'''", "").replace("''", "")
+    return text
+
+
+def _clean_markup(text: str) -> str:
+    """Strip common wiki/markup noise from a single line of wikitext."""
+    text = _strip_noise(text)
     # Wiki links: [[Target|Display]] -> Display, [[Target]] -> Target.
     # Drop file/image/category style links entirely.
     def _link(m: re.Match) -> str:
@@ -189,8 +208,6 @@ def _clean_markup(text: str) -> str:
         lambda m: m.group(1) or "",
         text,
     )
-    # Italic/bold markers
-    text = text.replace("'''", "").replace("''", "")
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -249,6 +266,9 @@ def _derive_title(content: str) -> str:
     Uses the first wiki link's display text if present; otherwise the first
     clause up to the first comma/dash/full-stop/colon, truncated to 120 chars.
     """
+    # Strip all non-link markup FIRST so clause splitting can never land
+    # inside a template or an HTML comment.
+    content = _strip_noise(content)
     link = _extract_first_link(content)
     if link:
         title = _clean_markup(link)

@@ -363,3 +363,61 @@ def test_non_year_heading_ignored():
     items = parse_list_items(wt, "List_of_foo")
     assert len(items) == 1
     assert items[0]["year"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Markup residue regression tests (nested templates, HTML comments)
+# --------------------------------------------------------------------------- #
+
+
+def test_title_strips_nested_templates():
+    line = (
+        "* [[Ancient Egyptian wars of succession]]{{sfn|Gillespie|2013|pp=114}} "
+        "were a recurring feature of dynastic politics in the Nile valley."
+    )
+    items = parse_list_items(line, "P")
+    assert len(items) == 1
+    title = items[0]["title"]
+    assert "{{" not in title and "}}" not in title
+    assert "sfn" not in title.lower()
+    assert title == "Ancient Egyptian wars of succession"
+
+
+def test_title_strips_html_comments():
+    line = (
+        "* Something with <!-- a comment --> inside it that is definitely "
+        "long enough to keep"
+    )
+    items = parse_list_items(line, "P")
+    assert len(items) == 1
+    title = items[0]["title"]
+    assert "<!" not in title
+    assert title.startswith("Something with")
+    assert "inside it" in title
+
+
+def test_nested_template_removal():
+    line = (
+        "* {{outer|{{inner}}|x}}The Great Fire of Nowhere burned down a very "
+        "large and quite unusual building."
+    )
+    items = parse_list_items(line, "P")
+    assert len(items) == 1
+    for field in ("title", "summary"):
+        val = items[field] if False else items[0][field]
+        assert "{{" not in val and "}}" not in val
+        assert "outer" not in val and "inner" not in val
+
+
+def test_no_markup_residue_in_any_field():
+    line = (
+        "* [[Link|Display]] \'\'\'bold\'\'\' \'\'italic\'\' <ref>x</ref> "
+        "<ref name=\"y\"/> {{tmpl|a|b}} <!-- c --> and a good deal of extra "
+        "text so the entry is long enough to survive filtering."
+    )
+    items = parse_list_items(line, "P")
+    assert len(items) == 1
+    for field in ("title", "summary"):
+        val = items[0][field]
+        for bad in ("{{", "}}", "<ref", "<!--", "\'\'\'"):
+            assert bad not in val, (field, bad, val)
