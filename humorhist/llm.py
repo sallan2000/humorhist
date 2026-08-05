@@ -22,7 +22,7 @@ from typing import Any, Protocol
 import httpx
 
 DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
-DEFAULT_MODEL = "Hermes-4-405B"
+DEFAULT_MODEL = "tencent/hy3:free"
 
 
 class LLMError(RuntimeError):
