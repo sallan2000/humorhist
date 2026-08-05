@@ -52,6 +52,14 @@ this passes.
    sub-lists it links to.
 5. Task 1.2's spec/quality reviews were dispatched but their results never landed;
    the code was independently verified working, so this is cosmetic only.
+6. **Per-row commits in db.py** (flagged by the Task 1.1 quality review, not yet
+   actioned). Every mutating function calls `conn.commit()` individually; SQLite
+   fsyncs per commit, so bulk inserts are far slower than one wrapping transaction.
+   Not urgent — the 636-row Wikipedia harvest still ran in ~7s — but worth fixing
+   before the pool grows to thousands, or if a harvester ever feels sluggish.
+   Fix: add an optional `commit=True` param to the mutating helpers, or expose a
+   context manager so callers can batch. Reviewer found NO critical issues or
+   security holes; the whitelist validation in set_status is sound.
 
 ## Durable background jobs
 `Linger=yes` is set, so systemd user services survive logout:
