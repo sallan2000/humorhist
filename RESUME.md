@@ -1,88 +1,95 @@
-# humorhist — resume notes (2026-08-05)
+# humorhist — resume notes
+
+_Last updated: 2026-08-06 (Phase 3 landed on GitHub)_
 
 ## Where we got to
-Phases 1 and 2 of the plan are **built, tested and committed**. 123 tests passing.
-Plan: `/home/stevie/.hermes/plans/2026-08-05_213000-humorous-history-human-voiced.md`
-Code: `/home/stevie/projects/humorhist` (git, 7 commits, all work committed)
+Phases 1, 2 and the Phase 3 review gate are **built, tested and committed**,
+and the code is **pushed to GitHub**. Local `master` tracks `origin/main`.
+
+- Repo: `https://github.com/sallan2000/humorhist` (public, default branch `main`)
+- Local code: `/home/stevie/projects/humorhist` (git, 23 commits on `main`)
+- Tests: **137 passing** (no network; `pytest tests/ -q`)
+- Plan file: `/home/stevie/.hermes/plans/2026-08-05_213000-humorous-history-human-voiced.md`
+
+## Git / remote setup (how to push)
+- `origin` → `https://github.com/sallan2000/humorhist.git` (plain URL, no token in `.git/config`)
+- Local branch `master` tracks `origin/main` (upstream set).
+- Push: `git push` (maps `master → origin/main` via tracking).
+- GitHub fine-grained PAT is stored in `~/.git-credentials` (mode 600, repo-scoped,
+  NOT in `.git/config`, NOT committed). Re-auth happens automatically on push.
+- NOTE: the PAT string was pasted into an earlier chat turn, so it is exposed in
+  transcript history. Recommend rotating it at GitHub → Settings → Developer
+  settings even though the repo is already up to date.
+- If the remote has a commit you don't have (e.g. an edit made on github.com),
+  `git push` is rejected — do `git pull --rebase origin main` then push again.
+  Never force-push `main` unless you intend to clobber a commit.
 
 ## Working end-to-end, verified live
 - `harvest` → **741 pool candidates** (105 curated seed + 636 from 5 Wikipedia list pages)
-- `screen`  → **60 scored live** by the LLM, 0 failures, avg 5.85
-- `draft`   → **3 real drafts generated** (Acoustic Kitty, Napoleon's rabbits, Cadaver Synod)
-- `status` / `show` CLI commands working
+- `screen`  → **all 741 scored** by the LLM (whole-pool re-screen under the new
+  prompt; 109 ≥7, 145 ≥5, pool avg 3.93). 0 failures.
+- `draft`   → **9 drafts** total (4 regenerated from the original 3 + 5 fresh from
+  the ≥7 pool). All `pending`.
+- `status` / `show` / `review` CLI commands working.
+- **Phase 3 review gate proven live**: a draft was approved via
+  `python -m humorhist.cli --db data/humorhist.sqlite review` against the real DB.
+
+## Editorial decision that changed the product
+The mass-death / suffering **taste filter was deliberately removed** (your call).
+- `SCREEN_SYSTEM_PROMPT` no longer penalises death/suffering; it now rewards
+  absurd bureaucracy and rates purely on absurdity.
+- `sensitivity_flags` dropped entirely from `factcheck.py` (it was never persisted
+  to the DB, only emitted in the brief and printed by the CLI).
+- Regression tests guard both removals (`test_screen_prompt_no_death_taste_penalty`,
+  `test_system_prompt_has_no_sensitivity_flagging`).
+- Result: formerly 0.0 items now score 5–9 (Sparrow Campaign 7.0, Liston 8.0,
+  Pastry War 8.0, Karansebes 9.0). Grim-but-absurd events are now draftable.
+- To re-introduce taste controls, edit those two prompts; the schema has no blocklist.
 
 ## Quality signals (the bit that matters)
-Taste filter is genuinely working — it scored the Great Sparrow Campaign (famine),
-Vlad's envoys, and a fatal surgery at **0.0**, correctly refusing to treat mass death
-as comedy. Molasses Flood and Dancing Plague at 1.0 (both killed people).
-Top scorers were Emu War, Kettle War, Acoustic Kitty, Wojtek the bear — all 9.0.
+The fact-check layer is the real value: on Acoustic Kitty it correctly flagged
+that the famous "cat run over by a taxi" detail is **not supported** by the
+source and is disputed lore — exactly the failure mode that would get the account
+fact-checked into oblivion, caught automatically.
 
-The fact-check layer proved its worth immediately: on Acoustic Kitty it correctly
-flagged that the famous "cat run over by a taxi" detail — the funniest part of the
-story — is **not supported** by the source and is disputed lore. That is exactly the
-failure mode that would get the account fact-checked into oblivion, caught automatically.
+## Phase 3 — human review gate (built, committed, pushed)
+- `humorhist/review.py` — transport-agnostic state machine:
+  - `pending_drafts(conn)` → all `status='pending'` drafts, oldest first.
+  - `apply_review(conn, draft_id, decision, editor_line, notes)` → validates
+    decision (approve/reject), guards unknown id and non-reviewable status,
+    writes `status`, stamps `reviewed_at`, stores optional `editor_line` +
+    `editor_notes`. Idempotent; allows approve↔reject flips.
+- `humorhist/cli.py` → `review` subcommand: walks pending drafts, renders each
+  (shared `render_draft()`), prompts `[a/r/s]` then optional editor line + notes.
+  'skip' leaves a draft `pending`.
+- No schema migration needed — `drafts` already had `editor_line`, `editor_notes`,
+  `reviewed_at`.
+- 14 new tests (9 unit on `review.py`, 5 CLI on `cmd_review` via simulated stdin).
 
-## THE DECISION FOR TOMORROW
-
-**Caveat on the three existing drafts:** they were generated BEFORE the source-URL
-bug fix (commit 55f2bf7). `_row_to_item()` emitted `source_url` but
-`build_factcheck_prompt()` reads `url`, so the `SOURCE URL:` line was silently
-missing from every fact-check prompt — no error, just less context. Now fixed and
-regression-tested. The existing drafts are still worth reading, but if the angles
-feel borderline, regenerate one before judging:
-    systemd-run --user --unit=humorhist-redraft --same-dir \
-      /home/stevie/projects/humorhist/.venv/bin/python scripts/run_drafts.py --count 1
-
-Read the drafts and answer one question: **are the comic angles genuinely
-useful to you as a writer?**
-
-    cd ~/projects/humorhist
-    .venv/bin/python -m humorhist.cli --db data/humorhist.sqlite show 8e07a219377a9273  # Acoustic Kitty
-    .venv/bin/python -m humorhist.cli --db data/humorhist.sqlite show c2da55abb768d140  # Napoleon's rabbits
-    .venv/bin/python -m humorhist.cli --db data/humorhist.sqlite show f90d305bb73309ef  # Cadaver Synod
-
-If yes → build Phase 3 (Telegram review loop) and Phase 4 (publishing).
-If no  → tune `ANGLES_SYSTEM_PROMPT` in `humorhist/brief.py` first. Everything
-downstream is plumbing; that prompt is the product. Do not build further until
-this passes.
+## What's left (Phases 3.3 → 4)
+- **3.3 / 3.4 Telegram transport + notifications** (NOT built). Decision made:
+  CLI-first, Telegram drops on top later. When built, use long-poll (`getUpdates`),
+  NOT a webhook — this host is behind Cloudflare/NAT and does not expose ports.
+  Needs a bot token from @BotFather. `render_draft()` is already shared so the
+  Telegram presentation matches the CLI.
+- **3.5 / Phase 4 — queue handoff + publisher** (NOT built). `queue` and `posts`
+  tables already exist in the schema (stubbed). `enqueue_approved(conn)` and the
+  actual publisher are the remaining work. Deliberately deferred from Phase 3.
 
 ## Known issues / decisions deferred
-1. **API key.** Currently borrowing the Nous OAuth token from `~/.hermes/auth.json`,
-   which expires hourly and only refreshes while Hermes runs. `scripts/run_drafts.py`
-   re-reads it per item as a workaround. For unattended operation this needs a real
-   API key in `HUMORHIST_LLM_API_KEY`.
-2. **Model.** `DEFAULT_MODEL = "tencent/hy3:free"` in `humorhist/llm.py`. It works but
-   is slow (~50-130s per draft). Hermes-4-70B / 405B return 404 on this endpoint.
-   Worth trying a stronger model for angle quality — this is the one place where
-   model quality directly affects the product.
-3. **Pool only 60/741 screened.** Screening the rest takes ~1hr at current speed.
-   Run: `.venv/bin/python -m humorhist.cli --db data/humorhist.sqlite screen`
-4. **Wikipedia source breadth.** Currently 5 list pages, per-page yields:
-       List_of_wars_of_succession        229 items, 213 with year
-       List_of_hoaxes                    217 items,  29 with year
-       List_of_Ig_Nobel_Prize_winners    110 items, 105 with year
-       List_of_April_Fools'_Day_jokes     68 items,  49 with year
-       Lists_of_unusual_deaths            27 items,   0 with year
-   Note `Lists_of_unusual_deaths` is an index page (a list OF lists), hence only 27
-   items and no years — could be replaced by the individual sub-lists it links to.
-   AGENT DECISION TO REVIEW: `List_of_practical_joke_topics` was dropped during the
-   1.3 fixup (only 19 items) and swapped for `List_of_April_Fools'_Day_jokes`.
-   Reasonable, but it was an automated content-sourcing choice — override if you
-   disagree. Adding more pages is the cheapest way to grow the pool.
-5. Task 1.2 reviews both came back clean: spec PASS (all 9 requirements verified
-   line-by-line, no scope creep) and quality APPROVED (no critical/important
-   issues). Optional polish only: add `logging.info(summary)` when wiring
-   harvesters into a runner, and consider a TypedDict return. Both harvesters now
-   exist, so a shared upsert helper could be revisited — the reviewer advised
-   waiting until the duplication was concrete, which it now is.
-6. **Per-row commits in db.py** (flagged by the Task 1.1 quality review, not yet
-   actioned). Every mutating function calls `conn.commit()` individually; SQLite
-   fsyncs per commit, so bulk inserts are far slower than one wrapping transaction.
-   Not urgent — the 636-row Wikipedia harvest still ran in ~7s — but worth fixing
-   before the pool grows to thousands, or if a harvester ever feels sluggish.
-   Fix: add an optional `commit=True` param to the mutating helpers, or expose a
-   context manager so callers can batch. Reviewer found NO critical issues or
-   security holes; the whitelist validation in set_status is sound.
+1. **API key.** Borrows the Nous OAuth token from `~/.hermes/auth.json` (expires
+   hourly, refreshes only while Hermes runs). `scripts/run_drafts.py` re-reads it
+   per item. For unattended operation this needs a real key in `HUMORHIST_LLM_API_KEY`.
+2. **Model.** `DEFAULT_MODEL = "tencent/hy3:free"` in `humorhist/llm.py`. Works but
+   slow (~50-130s per draft). Hermes-4 returns 404 on this endpoint.
+3. **Per-row commits in db.py** (flagged by an earlier quality review, not yet
+   actioned). Every mutating fn commits individually; SQLite fsyncs per commit.
+   Not urgent — 636-row harvest ran in ~7s — but worth a batching helper before
+   the pool grows to thousands. Reviewer found NO critical issues or security holes.
+4. **Wikipedia source breadth.** 5 list pages harvested. `Lists_of_unusual_deaths`
+   is an index page (27 items, 0 years) and could be swapped for its sub-lists.
+   `List_of_practical_joke_topics` was dropped during a fixup (19 items) in favour
+   of `List_of_April_Fools'_Day_jokes` — an agent content-sourcing choice to review.
 
 ## Durable background jobs
 `Linger=yes` is set, so systemd user services survive logout:
@@ -91,11 +98,10 @@ this passes.
     journalctl --user -u humorhist-X -f
 Note: Hermes subagents do NOT survive session end. Only systemd units do.
 
-## Commits
-    7f9bf69 feat: CLI, durable drafting worker, model default fix
-    55f2bf7 feat: draft assembly orchestration and CLI, with tests
-    52f4bdd feat: comic angle generation
-    7db761f feat: fact-check pass with brief validation
-    96d7721 fix: strip nested templates and comments before title derivation
-    b62fa0d feat: LLM funny pre-screen for pool candidates
-    a650c7e feat: wikipedia list harvester with redirect following and section-year fallback
+## Recent commits (top of log)
+    e099ba1 feat(phase3): add CLI review gate (approve/reject drafts) + tests
+    c2f1f55 Correct project name from 'humorhist' to 'HumorHist'   (made on github.com)
+    a42eb84 docs: add user guide README
+    4cf3d1e chore: stop tracking runtime logs; ignore data/*.log
+    5e0b3a0 feat: regenerate 4 drafts + draft 5 fresh (no sensitivity flags)
+    ... (full 23-commit history on origin/main)
