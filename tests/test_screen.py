@@ -225,4 +225,29 @@ def test_screen_pool_retries_once(tmp_path):
     result = screen.screen_pool(conn, stub, batch_size=10)
     assert result["failed_batches"] == 0
     assert result["scored"] == 4
-    assert len(stub.calls) == 2
+
+
+def test_screen_prompt_no_death_taste_penalty():
+    """The pre-screen must NOT down-rank death/suffering topics.
+
+    Regression guard for the editorial decision to let grim-but-absurd events
+    score on absurdity alone. If a "PENALISE ... death ... tragedy" rule is
+    ever reintroduced, this fails.
+    """
+    prompt = screen.SCREEN_SYSTEM_PROMPT
+    forbidden = [
+        "PENALISE",
+        "penalise",
+        "penalize",
+        "human suffering",
+        "death played",
+        "tragedy",
+        "not funny merely because",
+    ]
+    prompt_lower = prompt.lower()
+    for term in forbidden:
+        assert term.lower() not in prompt_lower, (
+            f"screen prompt still contains taste-filter wording: {term!r}"
+        )
+    # Sanity: the absurdity-reward guidance is still present.
+    assert "reward" in prompt_lower

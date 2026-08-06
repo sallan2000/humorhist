@@ -34,14 +34,11 @@ Scoring scale (return a single number per item):
 - 10 = laugh-out-loud absurd
 
 Rules:
-- PENALISE heavily (give a LOW score, near 0) to anything whose humour would \
-depend on human suffering, death played for laughs, bigotry, racism, or \
-tragedy. Such events are NOT funny; do not reward them for being strange.
-- REWARD: absurd bureaucracy, the gap between intention and outcome, a \
-ridiculous specific detail, cosmic irony, and dignified institutions behaving \
+- REWARD: absurd bureaucracy, the gap between intention and outcome, a
+ridiculous specific detail, cosmic irony, and dignified institutions behaving
 stupidly.
-- Be honest and unsentimental. A gruesome event is not funny merely because \
-it is unusual.
+- Be honest and unsentimental. Rate purely on how absurd or funny the event
+is to a modern audience.
 
 Output STRICT JSON only: an array of objects, one per numbered item, in the \
 same order as listed:
