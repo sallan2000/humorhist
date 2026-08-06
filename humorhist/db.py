@@ -58,7 +58,20 @@ def connect(path: str) -> sqlite3.Connection:
 def migrate(conn: sqlite3.Connection) -> None:
     """Create all tables if they do not exist. Idempotent."""
     conn.executescript(_SCHEMA)
+    # Phase 4 (B+): editable post copy lives on the queue row. Added after the
+    # original schema shipped, so guard with PRAGMA checks to make the migration
+    # safe to re-run on already-migrated databases.
+    _ensure_queue_copy_columns(conn)
     conn.commit()
+
+
+def _ensure_queue_copy_columns(conn: sqlite3.Connection) -> None:
+    """Add post_copy / post_copy_at to queue if absent (no-op if present)."""
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(queue)")}
+    if "post_copy" not in existing:
+        conn.execute("ALTER TABLE queue ADD COLUMN post_copy TEXT")
+    if "post_copy_at" not in existing:
+        conn.execute("ALTER TABLE queue ADD COLUMN post_copy_at TEXT")
 
 
 def make_id(*parts: str) -> str:

@@ -203,7 +203,22 @@ def cmd_review(args: argparse.Namespace) -> int:
             notes=notes or None,
         )
         acted += 1
-        print(f"  -> {decision}ed\n")
+        print(f"  -> {decision}ed")
+
+        # B+ handoff: on approve, generate initial post copy onto the queue row
+        # so the editor can open + revise it before any publishing step. Skipped
+        # silently when no LLM key is available (manual run, no Hermes session).
+        if decision == "approve":
+            from humorhist.copywriter import fill_post_copy
+            from humorhist.llm import default_client
+
+            try:
+                n = fill_post_copy(conn, default_client(), draft_id=row["id"])
+                if n:
+                    print("  generated initial post copy (editable via `humorhist copy`)")
+            except Exception as exc:  # noqa: BLE001 - don't fail the review on copy gen
+                print(f"  (post copy not generated: {exc})")
+        print()
 
     print(f"Review session done. {acted} draft(s) decided.")
     return 0
@@ -284,6 +299,146 @@ def cmd_telegram_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _copy_get_row(conn, draft_id: str):
+    """Return (draft_row, queue_row) for a queued draft, or (None, None)."""
+    draft = conn.execute(
+        "SELECT d.*, p.title AS title, p.year AS year FROM drafts d "
+        "LEFT JOIN pool p ON p.id = d.pool_id WHERE d.id = ?",
+        (draft_id,),
+    ).fetchone()
+    if draft is None:
+        return None, None
+    q = conn.execute(
+        "SELECT post_copy, post_copy_at FROM queue WHERE draft_id = ?", (draft_id,)
+    ).fetchone()
+    return dict(draft), dict(q) if q else None
+
+
+def cmd_copy_show(args: argparse.Namespace) -> int:
+    """B+ : show a queued draft's editable post copy + char count."""
+    import humorhist.copywriter as cw
+
+    conn = _open_db(args.db)
+    draft, q = _copy_get_row(conn, args.draft_id)
+    if draft is None:
+        print(f"No such draft: {args.draft_id}")
+        return 1
+    if draft["status"] != "approved":
+        print(f"Draft {args.draft_id} is '{draft['status']}', not approved/queued.")
+        return 1
+    copy = (q or {}).get("post_copy")
+    limit = cw.char_limit()
+    if not copy:
+        print(f"{args.draft_id} — no post copy yet (generate with `copy regen`).")
+        print(f"Limit: {limit} chars")
+        return 0
+    print(f"{args.draft_id} — {len(copy)}/{limit} chars")
+    print("-" * 60)
+    print(copy)
+    print("-" * 60)
+    return 0
+
+
+def _launch_editor(initial: str) -> str | None:
+    """Open $EDITOR (VISUAL/EDITOR, fallback nano) with `initial`; return edited text.
+
+    Returns None if no usable editor is available (caller falls back to prompt).
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
+    if not editor.strip():
+        return None
+    with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as tf:
+        tf.write(initial)
+        path = tf.name
+    try:
+        rc = subprocess.run([editor, path], check=False).returncode
+        if rc != 0:
+            return None
+        with open(path) as fh:
+            return fh.read()
+    finally:
+        os.unlink(path)
+
+
+def cmd_copy_edit(args: argparse.Namespace) -> int:
+    """B+ : edit a queued draft's post copy in $EDITOR (or a typed prompt)."""
+    import humorhist.copywriter as cw
+
+    conn = _open_db(args.db)
+    draft, q = _copy_get_row(conn, args.draft_id)
+    if draft is None:
+        print(f"No such draft: {args.draft_id}")
+        return 1
+    if draft["status"] != "approved":
+        print(f"Draft {args.draft_id} is '{draft['status']}', not approved/queued.")
+        return 1
+
+    current = (q or {}).get("post_copy") or ""
+    edited = _launch_editor(current)
+    if edited is None:
+        # no editor available: fall back to a typed prompt
+        print("No $EDITOR available; enter the new copy (blank line to finish):")
+        lines = []
+        while True:
+            line = input()
+            if line == "":
+                break
+            lines.append(line)
+        edited = "\n".join(lines)
+
+    # confirm the result is within the active char limit (warn, don't block)
+    limit = cw.char_limit()
+    if len(edited) > limit:
+        print(f"WARNING: copy is {len(edited)} chars, over the {limit} limit.")
+    cw.set_post_copy(conn, args.draft_id, edited)
+    print(f"Saved {len(edited)}/{limit} chars for {args.draft_id}.")
+    return 0
+
+
+def cmd_copy_regen(args: argparse.Namespace) -> int:
+    """B+ : regenerate a queued draft's post copy via the LLM."""
+    from humorhist.copywriter import fill_post_copy
+    from humorhist.llm import default_client
+
+    conn = _open_db(args.db)
+    draft, q = _copy_get_row(conn, args.draft_id)
+    if draft is None:
+        print(f"No such draft: {args.draft_id}")
+        return 1
+    if draft["status"] != "approved":
+        print(f"Draft {args.draft_id} is '{draft['status']}', not approved/queued.")
+        return 1
+
+    try:
+        n = fill_post_copy(conn, default_client(), draft_id=args.draft_id, force=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Regeneration failed: {exc}")
+        return 2
+    if n == 0:
+        print(
+            "Nothing generated. (If the draft already has copy, this is a no-op; "
+            "edit it with `copy edit` or delete the copy first.)"
+        )
+        return 0
+    row = conn.execute(
+        "SELECT post_copy FROM queue WHERE draft_id = ?", (args.draft_id,)
+    ).fetchone()
+    limit = _char_limit()
+    print(f"Regenerated ({len(row['post_copy'])}/{limit} chars):")
+    print(row["post_copy"])
+    return 0
+
+
+def _char_limit() -> int:
+    import humorhist.copywriter as cw
+
+    return cw.char_limit()
+
+
 def cmd_queue(args: argparse.Namespace) -> int:
     """Phase 4 handoff: list queued drafts, or move approved -> queue with --enqueue."""
     import humorhist.review as review
@@ -292,6 +447,17 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if args.enqueue:
         n = review.enqueue_approved(conn, scheduled_for=args.scheduled_for)
         print(f"Enqueued {n} approved draft(s) into queue.")
+        # B+ handoff: generate initial post copy for anything that just entered
+        # the queue (and any other approved+queued row still lacking it).
+        from humorhist.copywriter import fill_post_copy
+        from humorhist.llm import default_client
+
+        try:
+            filled = fill_post_copy(conn, default_client())
+            if filled:
+                print(f"Generated post copy for {filled} draft(s) (editable via `humorhist copy`).")
+        except Exception as exc:  # noqa: BLE001
+            print(f"(post copy not generated: {exc})")
     rows = review.queued_drafts(conn)
     if not rows:
         print("Queue is empty.")
@@ -351,6 +517,18 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--enqueue", action="store_true", help="move approved drafts into queue")
     q.add_argument("--scheduled-for", default=None, help="ISO timestamp to schedule under")
     q.set_defaults(func=cmd_queue)
+
+    cp = sub.add_parser("copy", help="B+ : view/edit/regenerate a draft's post copy")
+    cp_sub = cp.add_subparsers(dest="copy_command", required=True)
+    cps = cp_sub.add_parser("show", help="print the post copy + char count")
+    cps.add_argument("draft_id")
+    cps.set_defaults(func=cmd_copy_show)
+    cpe = cp_sub.add_parser("edit", help="edit the post copy in $EDITOR")
+    cpe.add_argument("draft_id")
+    cpe.set_defaults(func=cmd_copy_edit)
+    cpr = cp_sub.add_parser("regen", help="regenerate post copy via the LLM")
+    cpr.add_argument("draft_id")
+    cpr.set_defaults(func=cmd_copy_regen)
 
     return p
 

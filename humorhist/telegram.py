@@ -238,6 +238,8 @@ def handle_callback(
       optional notes (reply or /skip).
     - ``notes:<id>``: from /listapproved -- prompt for notes on an already
       approved draft (re-applying approve is idempotent and keeps its queue row).
+    - ``view:<id>``: from /listapproved -- open the draft's full content (with an
+      inline 'Add notes' button on the last chunk).
 
     Returns a dict describing the action so the caller can track note state.
     """
@@ -260,6 +262,17 @@ def handle_callback(
             f"Draft `{draft_id}` {decision}d. Reply here with optional notes "
             f"(or send /skip to leave blank):",
         )
+        # B+ handoff: on approve, generate initial post copy onto the queue row
+        # so the editor can revise it (via /viewcopy) before any publishing step.
+        # Best-effort: a missing LLM key just skips copy generation.
+        if decision == "approve":
+            from humorhist.copywriter import fill_post_copy
+            from humorhist.llm import default_client
+
+            try:
+                fill_post_copy(conn, default_client(), draft_id=draft_id)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[telegram] post copy not generated for {draft_id}: {exc}")
         return {"draft_id": draft_id, "decision": decision, "note_message_id": note["message_id"]}
     if data.startswith("notes:"):
         _, _, draft_id = data.partition(":")
@@ -270,6 +283,44 @@ def handle_callback(
             f"(or send /skip to leave the existing notes untouched):",
         )
         return {"draft_id": draft_id, "note_message_id": note["message_id"]}
+    if data.startswith("view:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="opened")
+        send_draft_content(conn, client, chat_id, draft_id)
+        return None
+    if data.startswith("copy:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="opened copy")
+        send_copy_content(conn, client, chat_id, draft_id)
+        return None
+    if data.startswith("editcopy:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="editing copy")
+        prompt = client.send_message(
+            chat_id,
+            f"Reply with the new post copy for `{draft_id}` "
+            f"(or send /cancel to keep the current version):",
+        )
+        return {"draft_id": draft_id, "editcopy_message_id": prompt["message_id"]}
+    if data.startswith("regencopy:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="regenerating")
+        from humorhist.copywriter import fill_post_copy
+        from humorhist.llm import default_client
+
+        try:
+            n = fill_post_copy(conn, default_client(), draft_id=draft_id, force=True)
+        except Exception as exc:  # noqa: BLE001
+            client.send_message(chat_id, f"Regeneration failed: {exc}")
+            return None
+        if n == 0:
+            client.send_message(
+                chat_id,
+                "Nothing generated (no LLM key available?). The copy is unchanged.",
+            )
+            return None
+        send_copy_content(conn, client, chat_id, draft_id)
+        return None
     return None
 
 
@@ -294,15 +345,38 @@ def handle_text(
     reply_to = (msg.get("reply_to_message") or {}).get("message_id")
     text = msg["text"].strip()
 
+    # Resolve which draft (and which kind of prompt) this reply answers.
     draft_id = None
+    prompt_kind = None  # "note" or "editcopy"
     for did, st in awaiting.items():
-        if st.get("note_message_id") == reply_to:
-            draft_id = did
+        if reply_to is not None and st.get("note_message_id") == reply_to:
+            draft_id, prompt_kind = did, "note"
             break
-    if draft_id is None and len(awaiting) == 1 and text != "/skip":
-        draft_id = next(iter(awaiting))
+        if reply_to is not None and st.get("editcopy_message_id") == reply_to:
+            draft_id, prompt_kind = did, "editcopy"
+            break
+    # Fallback: a single open prompt the user typed at rather than replied to.
+    if draft_id is None and len(awaiting) == 1 and text not in ("/skip", "/cancel"):
+        did = next(iter(awaiting))
+        draft_id, prompt_kind = did, (
+            "editcopy" if "editcopy_message_id" in awaiting[did] else "note"
+        )
     if draft_id is None:
         return None
+
+    if prompt_kind == "editcopy":
+        if text == "/cancel":
+            awaiting.pop(draft_id, None)
+            client.send_message(chat_id, f"Kept the existing copy for `{draft_id}`.")
+            return {"editcopy_cancelled": draft_id}
+        from humorhist.copywriter import set_post_copy
+
+        set_post_copy(conn, draft_id, text)
+        awaiting.pop(draft_id, None)
+        client.send_message(chat_id, f"Post copy saved for `{draft_id}`.")
+        return {"editcopy_saved": draft_id}
+
+    # note prompt (existing behaviour)
     if text == "/skip":
         awaiting.pop(draft_id, None)
         client.send_message(chat_id, f"Notes left blank for `{draft_id}`.")
@@ -318,33 +392,147 @@ def handle_text(
 HELP_TEXT = (
     "HumorHist review bot\n\n"
     "/reviewdraft - review pending drafts one by one (Approve/Reject + notes)\n"
-    "/listapproved - list drafts you've greenlit; tap one to add notes\n"
+    "/listapproved - list drafts you've greenlit; tap one to open it\n"
+    "/listqueue - list approved+queued drafts and their post copy\n"
+    "/viewcopy <id> - open a queued draft's post copy (edit / regenerate)\n"
     "/status - approved / rejected / pending breakdown\n"
     "/help - this message"
 )
 
 
 def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str) -> int:
-    """DM a list of approved drafts, each with an inline 'add notes' button.
+    """DM a list of approved drafts, each with an inline 'view' button.
 
-    Returns the number of approved drafts listed.
+    Tapping a draft opens its full content (see ``send_draft_content``), from
+    which the reviewer can optionally add notes. Returns the count listed.
     """
     rows = review.approved_drafts(conn)
     if not rows:
         client.send_message(chat_id, "No approved drafts yet.")
         return 0
-    lines = ["✅ Approved drafts (tap to add notes):"]
+    lines = ["✅ Approved drafts (tap to open):"]
     keyboard = []
     for r in rows:
         title = r["title"] or "(unknown)"
         lines.append(f"  • {title}")
         keyboard.append(
-            [{"text": f"📝 {title[:32]}", "callback_data": f"notes:{r['draft_id']}"}]
+            [{"text": f"👁 {title[:30]}", "callback_data": f"view:{r['draft_id']}"}]
         )
     client.send_message(
         chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
     )
     return len(rows)
+
+
+def send_draft_content(
+    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str
+) -> list[dict]:
+    """Send a single draft's full content (chunked), with an 'Add notes' button.
+
+    Used when the reviewer opens an approved draft from /listapproved. The last
+    chunk carries an inline 'Add notes' button (callback ``notes:<id>``) so they
+    can annotate it without leaving Telegram.
+    """
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if row is None:
+        client.send_message(chat_id, f"No such draft: {draft_id}")
+        return []
+    pool = db.get_pool_item(conn, row["pool_id"])
+    text = render.render_draft(row, pool)
+    notes_btn = {
+        "inline_keyboard": [
+            [{"text": "✏️ Add notes", "callback_data": f"notes:{draft_id}"}]
+        ]
+    }
+    try:
+        return _send_long(client, chat_id, text, reply_markup=notes_btn)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[telegram] failed to send draft content {draft_id}: {exc}")
+        return []
+
+
+# --------------------------------------------------------------------------- #
+# B+ post-copy editing (edit/regenerate the eventual post before publishing)  #
+# --------------------------------------------------------------------------- #
+
+
+def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str) -> int:
+    """DM the reviewer the approved+queued drafts with their post-copy status.
+
+    Each row shows the topic, the current copy (or 'no copy yet'), and a char
+    count against the active limit. Tapping a row opens its copy with edit +
+    regenerate buttons (see ``send_copy_content``). Returns the count listed.
+    """
+    from humorhist.copywriter import char_limit
+
+    limit = char_limit()
+    rows = review.queued_drafts(conn)
+    # only show rows that are still queued (unpublished)
+    rows = [r for r in rows if not r["published"]]
+    if not rows:
+        client.send_message(chat_id, "Queue is empty (nothing approved + queued).")
+        return 0
+    lines = [f"📋 Queued drafts ({len(rows)}) — edit copy before publishing:"]
+    keyboard: list[list[dict]] = []
+    for r in rows:
+        title = r["title"] or "(unknown)"
+        copy = r.get("post_copy")
+        if copy:
+            snippet = copy if len(copy) <= 80 else copy[:77] + "..."
+            status = f"{len(copy)}/{limit}"
+        else:
+            snippet = "(no copy yet)"
+            status = f"0/{limit}"
+        lines.append(f"  • {title}\n    {snippet}  [{status}]")
+        keyboard.append(
+            [{"text": f"✏️ {title[:28]}", "callback_data": f"copy:{r['draft_id']}"}]
+        )
+    client.send_message(
+        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
+    )
+    return len(rows)
+
+
+def send_copy_content(
+    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str
+) -> list[dict]:
+    """Send a queued draft's post copy with inline Edit + Regenerate buttons.
+
+    Tapping 'Edit' (callback ``editcopy:<id>``) prompts the reviewer to reply
+    with new copy (handled by ``handle_text`` via the awaited map). Tapping
+    'Regenerate' (callback ``regencopy:<id>``) asks the LLM for fresh copy and
+    re-sends. The copy is read from ``queue.post_copy``; if absent, a hint to
+    regenerate is shown.
+    """
+    from humorhist.copywriter import char_limit
+
+    row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if row is None:
+        client.send_message(chat_id, f"No such draft: {draft_id}")
+        return []
+    q = conn.execute(
+        "SELECT post_copy, post_copy_at FROM queue WHERE draft_id = ?", (draft_id,)
+    ).fetchone()
+    limit = char_limit()
+    copy = (dict(q) if q else {}).get("post_copy") if q else None
+
+    pool = db.get_pool_item(conn, row["pool_id"])
+    title = pool["title"] if pool else "(unknown)"
+    header = f"✏️ POST COPY — {title}\n({len(copy) if copy else 0}/{limit} chars)\n"
+    body = copy or "(no copy yet — tap 🔄 Regenerate)"
+    markup = {
+        "inline_keyboard": [
+            [
+                {"text": "✏️ Edit", "callback_data": f"editcopy:{draft_id}"},
+                {"text": "🔄 Regenerate", "callback_data": f"regencopy:{draft_id}"},
+            ]
+        ]
+    }
+    try:
+        return _send_long(client, chat_id, header + "\n" + body, reply_markup=markup)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[telegram] failed to send copy content {draft_id}: {exc}")
+        return []
 
 
 def run_review_session(
@@ -374,6 +562,10 @@ def run_review_session(
                 decided += 1
                 awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
                 return res["draft_id"]
+            elif res and "editcopy_message_id" in res:
+                awaiting[res["draft_id"]] = {
+                    "editcopy_message_id": res["editcopy_message_id"]
+                }
         elif "message" in upd:
             handle_text(conn, client, chat_id, awaiting, upd)
         return None
@@ -430,7 +622,7 @@ def run_review_bot(
     Idles and reacts to ``/commands`` instead of pushing drafts on startup:
 
       /reviewdraft  -> start the one-by-one review flow (run_review_session)
-      /listapproved -> list approved drafts with 'add notes' buttons
+      /listapproved -> list approved drafts; tap one to open its content
       /status       -> reviewed/pending breakdown
       /help, /start -> this message
 
@@ -452,6 +644,11 @@ def run_review_bot(
             elif res and "note_message_id" in res:
                 # notes: button from /listapproved
                 awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
+            elif res and "editcopy_message_id" in res:
+                # post-copy edit prompt: register so the next reply is captured
+                awaiting[res["draft_id"]] = {
+                    "editcopy_message_id": res["editcopy_message_id"]
+                }
             return
         msg = upd.get("message")
         if not msg:
@@ -472,6 +669,14 @@ def run_review_bot(
             )
         elif cmd == "/listapproved":
             send_approved_list(conn, client, chat_id)
+        elif cmd == "/listqueue":
+            send_queue_list(conn, client, chat_id)
+        elif cmd == "/viewcopy":
+            target = text.split()
+            if len(target) < 2:
+                client.send_message(chat_id, "Usage: /viewcopy <draft_id>")
+            else:
+                send_copy_content(conn, client, chat_id, target[1])
         elif cmd == "/status":
             send_reviewed_summary(conn, client, chat_id)
         elif cmd in ("/help", "/start"):

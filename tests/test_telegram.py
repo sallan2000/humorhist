@@ -391,9 +391,9 @@ def test_listapproved_lists_greenlit_drafts_with_buttons(tmp_path):
     assert n == 1
     msg = stub.sent[0]
     assert "Emu War" in msg["text"]
-    # the approved draft has an inline 'add notes' button
+    # the approved draft has an inline 'view' button (opens content + add notes)
     btns = msg["reply_markup"]["inline_keyboard"]
-    assert btns[0][0]["callback_data"] == "notes:d1"
+    assert btns[0][0]["callback_data"] == "view:d1"
 
 
 def test_listapproved_add_notes_via_button(tmp_path):
@@ -439,6 +439,36 @@ def test_unknown_command_is_rejected(tmp_path):
     assert any("Unknown command" in m["text"] for m in stub.sent)
 
 
+def test_listapproved_opens_draft_content_with_add_notes_button(tmp_path):
+    conn = _seed_with_statuses(tmp_path)  # d1 approved
+    stub = tg.StubTelegram()
+    # 1) tap the 'view' button from /listapproved
+    view_upd = {
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1", "data": "view:d1", "message": {"message_id": 100},
+        },
+    }
+    res = tg.handle_callback(conn, stub, "chat", view_upd)
+    assert res is None  # view just opens content, no note prompt yet
+    # the draft content was sent (rendered), chunked, last chunk has Add notes btn
+    content_msgs = [m for m in stub.sent if "reply_markup" in m]
+    assert content_msgs, "draft content should have been sent"
+    last = content_msgs[-1]
+    assert last["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "notes:d1"
+    # the rendered body should actually contain the topic
+    full = "\n".join(m["text"] for m in stub.sent)
+    assert "Emu War" in full
+
+
+def test_send_draft_content_missing_draft_is_safe(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    sent = tg.send_draft_content(conn, stub, "chat", "does-not-exist")
+    assert sent == []
+    assert any("No such draft" in m["text"] for m in stub.sent)
+
+
 def test_chunk_text_respects_limit():
     text = "\n".join(f"line {i}" for i in range(5000))
     chunks = tg._chunk_text(text, limit=1000)
@@ -453,3 +483,154 @@ def test_send_long_puts_buttons_on_last_chunk():
     assert len(sent) > 1
     assert all("reply_markup" not in m for m in sent[:-1])
     assert sent[-1]["reply_markup"] == {"k": 1}
+
+
+# --- B+ post-copy editing (Telegram) ---------------------------------------
+
+
+def _seed_approved_queued(conn, draft_id="d1", with_copy=True):
+    conn.execute(
+        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')"
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES (?, 'pool-x', '{}', '{}', 'approved', '2026-01-01T00:00:00+00:00')",
+        (draft_id,),
+    )
+    copy = "'France invaded Mexico over a pastry shop.'" if with_copy else "NULL"
+    conn.execute(
+        f"INSERT INTO queue (draft_id, scheduled_for, published, post_copy) "
+        f"VALUES ('{draft_id}', NULL, 0, {copy})"
+    )
+    conn.commit()
+
+
+def test_send_queue_list_shows_copy_and_char_count(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    n = tg.send_queue_list(conn, stub, "chat")
+    assert n == 1
+    text = stub.sent[-1]["text"]
+    assert "Pastry War" in text
+    assert "France invaded" in text
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0][0]
+    assert kb["callback_data"] == "copy:d1"
+
+
+def test_send_queue_list_empty_when_no_queue(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    n = tg.send_queue_list(conn, stub, "chat")
+    assert n == 0
+    assert "empty" in stub.sent[-1]["text"].lower()
+
+
+def test_send_copy_content_carries_edit_regen_buttons(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    tg.send_copy_content(conn, stub, "chat", "d1")
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0]
+    cbs = {b["callback_data"] for b in kb}
+    assert "editcopy:d1" in cbs
+    assert "regencopy:d1" in cbs
+    assert "France invaded" in stub.sent[-1]["text"]
+
+
+def test_callback_copy_opens_copy_content(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "copy:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None
+    assert any("POST COPY" in m["text"] for m in stub.sent)
+
+
+def test_callback_editcopy_prompts_and_handle_text_saves(tmp_path):
+    from humorhist.copywriter import set_post_copy
+
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "editcopy:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res["editcopy_message_id"] is not None
+    prompt_id = res["editcopy_message_id"]
+    awaiting = {"d1": {"editcopy_message_id": prompt_id}}
+
+    out = tg.handle_text(
+        conn, stub, "chat", awaiting,
+        _text_update(2, "My hand-edited version.", prompt_id),
+    )
+    assert out.get("editcopy_saved") == "d1"
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    assert row["post_copy"] == "My hand-edited version."
+    assert "d1" not in awaiting
+
+
+def test_callback_editcopy_cancel_keeps_copy(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "editcopy:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    awaiting = {"d1": {"editcopy_message_id": res["editcopy_message_id"]}}
+    out = tg.handle_text(
+        conn, stub, "chat", awaiting,
+        _text_update(2, "/cancel", res["editcopy_message_id"]),
+    )
+    assert out.get("editcopy_cancelled") == "d1"
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    assert row["post_copy"] == "France invaded Mexico over a pastry shop."
+
+
+def test_callback_regencopy_regenerates(tmp_path, monkeypatch):
+    from humorhist.copywriter import fill_post_copy
+    from humorhist.llm import StubClient
+
+    real_fill = fill_post_copy
+
+    def fake_fill(conn, client, draft_id=None, limit=None, **kwargs):
+        return real_fill(
+            conn, StubClient([{"post": "A regenerated pastry-war quip."}]),
+            draft_id=draft_id, **kwargs,
+        )
+
+    monkeypatch.setattr("humorhist.copywriter.fill_post_copy", fake_fill)
+    import humorhist.llm as llm
+
+    monkeypatch.setattr(llm, "default_client", lambda: StubClient([{"post": "x"}]))
+
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    assert row["post_copy"] == "A regenerated pastry-war quip."
+
+
+def test_dispatch_listqueue_and_viewcopy(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    tg.send_queue_list(conn, stub, "chat")
+    assert any("Pastry War" in m["text"] for m in stub.sent)
+    stub.sent.clear()
+    tg.send_copy_content(conn, stub, "chat", "d1")
+    assert any("POST COPY" in m["text"] for m in stub.sent)

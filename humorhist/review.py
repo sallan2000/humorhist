@@ -167,7 +167,7 @@ def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
         for r in conn.execute(
             """
             SELECT q.id AS queue_id, q.draft_id, q.scheduled_for, q.published,
-                   p.title AS title
+                   q.post_copy, p.title AS title
             FROM queue q
             LEFT JOIN drafts d ON d.id = q.draft_id
             LEFT JOIN pool p ON p.id = d.pool_id

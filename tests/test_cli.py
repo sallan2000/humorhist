@@ -306,3 +306,124 @@ def test_queue_enqueue_moves_approved(dbpath, monkeypatch, capsys):
     rc = main(["--db", dbpath, "queue", "--enqueue"])
     out = capsys.readouterr().out
     assert "Enqueued 0" in out
+
+
+# --- B+ copy subcommand (view / edit / regen) -------------------------------
+
+
+def _seed_approved_with_queue(dbpath):
+    conn = db.connect(dbpath)
+    db.upsert_pool_item(
+        conn,
+        id="p1",
+        title="The Emu War",
+        year=1932,
+        date_hint=None,
+        summary=None,
+        source_url=None,
+        source_name=None,
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1',?,?,'approved','2026-01-01T00:00:00+00:00')",
+        (json.dumps(BRIEF), json.dumps(ANGLES)),
+    )
+    conn.execute(
+        "INSERT INTO queue (draft_id, scheduled_for, published, post_copy) "
+        "VALUES ('d1', NULL, 0, 'France invaded Mexico over a pastry shop.')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_copy_show_prints_copy_and_count(dbpath, capsys):
+    from humorhist.cli import cmd_copy_show
+
+    _seed_approved_with_queue(dbpath)
+    rc = cmd_copy_show(argparse.Namespace(db=dbpath, draft_id="d1"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "France invaded Mexico over a pastry shop." in out
+    assert "280" in out  # char limit shown
+
+
+def test_copy_show_rejects_non_approved(dbpath, capsys):
+    from humorhist.cli import cmd_copy_show
+
+    _seed_pending_draft(dbpath)  # pending, not approved
+    rc = cmd_copy_show(argparse.Namespace(db=dbpath, draft_id="d1"))
+    assert rc == 1
+    assert "pending" in capsys.readouterr().out
+
+
+def test_copy_edit_launches_editor_and_saves(dbpath, monkeypatch, capsys):
+    from humorhist import cli as cli_mod
+
+    _seed_approved_with_queue(dbpath)
+
+    def fake_editor(initial):
+        return "My hand-edited, funnier version."
+
+    monkeypatch.setattr(cli_mod, "_launch_editor", fake_editor)
+    rc = cli_mod.cmd_copy_edit(argparse.Namespace(db=dbpath, draft_id="d1"))
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    conn.close()
+    assert row["post_copy"] == "My hand-edited, funnier version."
+
+
+def test_copy_edit_falls_back_to_prompt_without_editor(dbpath, monkeypatch, capsys):
+    from humorhist import cli as cli_mod
+
+    _seed_approved_with_queue(dbpath)
+    monkeypatch.setattr(cli_mod, "_launch_editor", lambda initial: None)
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("Typed-in replacement.\n\n"))
+    rc = cli_mod.cmd_copy_edit(argparse.Namespace(db=dbpath, draft_id="d1"))
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    conn.close()
+    assert row["post_copy"] == "Typed-in replacement."
+
+
+def test_copy_regen_regenerates(dbpath, monkeypatch, capsys):
+    from humorhist import cli as cli_mod
+    from humorhist.copywriter import fill_post_copy
+    from humorhist.llm import StubClient
+
+    _seed_approved_with_queue(dbpath)
+    real_fill = fill_post_copy
+
+    def fake_fill(conn, client, draft_id=None, limit=None, **kwargs):
+        return real_fill(
+            conn,
+            StubClient([{"post": "A fresh regeneration from the model."}]),
+            draft_id=draft_id,
+            **kwargs,
+        )
+
+    monkeypatch.setattr("humorhist.copywriter.fill_post_copy", fake_fill)
+    import humorhist.llm as llm
+
+    monkeypatch.setattr(llm, "default_client", lambda: StubClient([{"post": "x"}]))
+
+    rc = cli_mod.cmd_copy_regen(argparse.Namespace(db=dbpath, draft_id="d1"))
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    conn.close()
+    assert row["post_copy"] == "A fresh regeneration from the model."
+
+
+def test_copy_parser_registered():
+    from humorhist.cli import build_parser
+
+    parser = build_parser()
+    # 'copy show d1' parses into the show subcommand
+    args = parser.parse_args(["copy", "show", "d1"])
+    assert args.copy_command == "show"
+    assert args.draft_id == "d1"
+    assert callable(args.func)
