@@ -175,3 +175,24 @@ def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
             """
         )
     ]
+
+
+def approved_drafts(conn: sqlite3.Connection) -> list[dict]:
+    """Return approved drafts (greenlit), oldest first, joined to pool title.
+
+    Used by the Telegram /listapproved command so the editor can browse what
+    they've greenlit and add more notes to any of them.
+    """
+    return [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT d.id AS draft_id, d.editor_line, d.editor_notes, d.reviewed_at,
+                   p.title AS title
+            FROM drafts d
+            LEFT JOIN pool p ON p.id = d.pool_id
+            WHERE d.status = 'approved'
+            ORDER BY d.reviewed_at ASC, d.id ASC
+            """
+        )
+    ]

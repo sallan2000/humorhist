@@ -141,7 +141,8 @@ def test_handle_text_stores_notes(tmp_path):
     cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
     note_msg_id = cb_res["note_message_id"]
 
-    res = tg.handle_text(conn, stub, "chat", {note_msg_id: "d1"}, _text_update(2, "tighten the third angle", note_msg_id))
+    awaiting = {"d1": {"note_message_id": note_msg_id}}
+    res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "tighten the third angle", note_msg_id))
 
     assert res is not None and res.get("noted") == "d1"
     row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
@@ -155,11 +156,11 @@ def test_handle_text_skip_clears_awaiting(tmp_path):
     cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
     note_msg_id = cb_res["note_message_id"]
 
-    awaiting = {note_msg_id: "d1"}
+    awaiting = {"d1": {"note_message_id": note_msg_id}}
     res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", note_msg_id))
 
     assert res.get("skipped") == "d1"
-    assert note_msg_id not in awaiting
+    assert "d1" not in awaiting
     # notes left empty
     assert conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()["editor_notes"] is None
 
@@ -324,7 +325,7 @@ def test_handle_text_fallback_when_single_awaiting(tmp_path):
     )
     conn.commit()
     stub = tg.StubTelegram()
-    awaiting = {"note1": "d1"}
+    awaiting = {"d1": {"note_message_id": "note1"}}
     upd = {"update_id": 5, "message": {"message_id": 10, "chat": {"id": "chat"},
                                        "text": "tighten the third angle"}}
     res = tg.handle_text(conn, stub, "chat", awaiting, upd)
@@ -355,13 +356,24 @@ def _callback_batch(draft_id, update_id=1):
     }]
 
 
+def _message_batch(text, update_id=1):
+    return [{
+        "update_id": update_id,
+        "message": {"message_id": 100 + update_id, "chat": {"id": "chat"}, "text": text},
+    }]
+
+
 def test_run_review_bot_one_by_one(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     _seed_pending(conn, "d2")
-    # serve: tap d1, then tap d2, then nothing (idle -> max_iterations ends)
-    stub = _SeqStub([_callback_batch("d1", 1), _callback_batch("d2", 2)])
-    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=20)
+    # serve: /reviewdraft command, then tap d1, then tap d2, then nothing
+    stub = _SeqStub([
+        _message_batch("/reviewdraft", 1),
+        _callback_batch("d1", 2),
+        _callback_batch("d2", 3),
+    ])
+    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
     assert decided == 2
     # both drafts persisted as approved, in decision order
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
@@ -370,6 +382,61 @@ def test_run_review_bot_one_by_one(tmp_path):
     # count messages that carry a reply_markup (the button messages)
     button_msgs = [m for m in stub.sent if "reply_markup" in m]
     assert len(button_msgs) == 2  # one per draft, not 8 simultaneously
+
+
+def test_listapproved_lists_greenlit_drafts_with_buttons(tmp_path):
+    conn = _seed_with_statuses(tmp_path)  # d1 approved, d2 rejected, d3 pending
+    stub = tg.StubTelegram()
+    n = tg.send_approved_list(conn, stub, "chat")
+    assert n == 1
+    msg = stub.sent[0]
+    assert "Emu War" in msg["text"]
+    # the approved draft has an inline 'add notes' button
+    btns = msg["reply_markup"]["inline_keyboard"]
+    assert btns[0][0]["callback_data"] == "notes:d1"
+
+
+def test_listapproved_add_notes_via_button(tmp_path):
+    conn = _fresh_db(tmp_path)
+    conn.execute("INSERT OR IGNORE INTO pool (id, title) VALUES ('p1','Emu War')")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1','{}','{}','approved','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    stub = tg.StubTelegram()
+    # 1) user taps the 'add notes' button on the /listapproved list
+    cb_upd = {
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1",
+            "data": "notes:d1",
+            "message": {"message_id": 100},
+        },
+    }
+    res = tg.handle_callback(conn, stub, "chat", cb_upd)
+    assert res and res["draft_id"] == "d1"
+    awaiting = {"d1": {"note_message_id": res["note_message_id"]}}
+    # 2) user replies with the note
+    note_upd = {"update_id": 2, "message": {"message_id": 101, "chat": {"id": "chat"}, "text": "lead with the emus"}}
+    r = tg.handle_text(conn, stub, "chat", awaiting, note_upd)
+    assert r == {"noted": "d1"}
+    row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_notes"] == "lead with the emus"
+    # still approved + still in queue (idempotent re-approve)
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+
+
+def test_unknown_command_is_rejected(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    stub.get_updates = lambda offset=0, timeout=0: [
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/bogus"}}
+    ]
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    # the bot replied with the unknown-command message
+    assert any("Unknown command" in m["text"] for m in stub.sent)
 
 
 def test_chunk_text_respects_limit():

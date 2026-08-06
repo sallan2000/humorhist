@@ -232,35 +232,45 @@ def send_pending_drafts(
 def handle_callback(
     conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, update: dict
 ) -> dict | None:
-    """Process a callback_query (button tap). Returns a result dict or None.
+    """Process an inline-button tap.
 
-    On a valid approve/reject the decision is persisted via review.apply_review
-    and a follow-up message is sent inviting optional editor notes; the returned
-    dict carries ``note_message_id`` so the loop can map a later text reply.
+    - ``approve:<id>`` / ``reject:<id>``: record the decision, then prompt for
+      optional notes (reply or /skip).
+    - ``notes:<id>``: from /listapproved -- prompt for notes on an already
+      approved draft (re-applying approve is idempotent and keeps its queue row).
+
+    Returns a dict describing the action so the caller can track note state.
     """
     cq = update.get("callback_query")
     if not cq:
         return None
     data = (cq.get("data") or "").strip()
-    if ":" not in data:
-        return None
-    decision, _, draft_id = data.partition(":")
-    if decision not in ("approve", "reject"):
-        return None
-
-    try:
-        review.apply_review(conn, draft_id, decision=decision)
-    except ValueError:
-        client.answer_callback_query(cq["id"], text="already handled")
-        return None
-
-    client.answer_callback_query(cq["id"], text=f"{decision}d")
-    note = client.send_message(
-        chat_id,
-        f"Draft `{draft_id}` {decision}d. Reply here with optional notes "
-        f"(or send /skip to leave blank):",
-    )
-    return {"draft_id": draft_id, "decision": decision, "note_message_id": note["message_id"]}
+    if data.startswith("approve:") or data.startswith("reject:"):
+        decision, _, draft_id = data.partition(":")
+        if decision not in ("approve", "reject"):
+            return None
+        try:
+            review.apply_review(conn, draft_id, decision=decision)
+        except ValueError:
+            client.answer_callback_query(cq["id"], text="already handled")
+            return None
+        client.answer_callback_query(cq["id"], text=f"{decision}d")
+        note = client.send_message(
+            chat_id,
+            f"Draft `{draft_id}` {decision}d. Reply here with optional notes "
+            f"(or send /skip to leave blank):",
+        )
+        return {"draft_id": draft_id, "decision": decision, "note_message_id": note["message_id"]}
+    if data.startswith("notes:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="add notes")
+        note = client.send_message(
+            chat_id,
+            f"Notes for already-approved draft `{draft_id}`. Reply here "
+            f"(or send /skip to leave the existing notes untouched):",
+        )
+        return {"draft_id": draft_id, "note_message_id": note["message_id"]}
+    return None
 
 
 def handle_text(
@@ -272,79 +282,103 @@ def handle_text(
 ) -> dict | None:
     """Process a text message as optional editor notes.
 
-    ``awaiting`` maps note_message_id -> draft_id (populated by handle_callback).
-    A reply whose reply_to_message_id is a tracked note prompt stores the text as
-    editor notes on the already-approved draft. ``/skip`` clears the prompt
-    without storing notes.
+    ``awaiting`` maps draft_id -> {"note_message_id": <id>}. A reply whose
+    reply_to_message_id matches a tracked note prompt stores the text as editor
+    notes on that draft (re-applying approve, which is idempotent). ``/skip``
+    clears the prompt without storing notes. Falls back to the single open note
+    prompt when the user just types instead of replying to the prompt.
     """
     msg = update.get("message")
     if not msg or "text" not in msg:
         return None
     reply_to = (msg.get("reply_to_message") or {}).get("message_id")
     text = msg["text"].strip()
-    # Match by explicit reply first; fall back to the single open note prompt
-    # (people usually just type, rather than reply to the bot's prompt).
+
     draft_id = None
-    if reply_to in awaiting:
-        draft_id = awaiting.pop(reply_to)
-    elif len(awaiting) == 1 and text != "/skip":
-        draft_id = awaiting.pop(next(iter(awaiting)))
+    for did, st in awaiting.items():
+        if st.get("note_message_id") == reply_to:
+            draft_id = did
+            break
+    if draft_id is None and len(awaiting) == 1 and text != "/skip":
+        draft_id = next(iter(awaiting))
     if draft_id is None:
         return None
     if text == "/skip":
+        awaiting.pop(draft_id, None)
+        client.send_message(chat_id, f"Notes left blank for `{draft_id}`.")
         return {"skipped": draft_id}
-    # re-apply with the same (approve) decision so notes persist idempotently
+    # re-apply with the same (approve) decision so notes persist idempotently;
+    # an already-approved draft stays approved and keeps its queue row.
     review.apply_review(conn, draft_id, decision="approve", notes=text)
+    awaiting.pop(draft_id, None)
     client.send_message(chat_id, f"Notes saved for `{draft_id}`.")
     return {"noted": draft_id}
 
 
-def run_review_bot(
+HELP_TEXT = (
+    "HumorHist review bot\n\n"
+    "/reviewdraft - review pending drafts one by one (Approve/Reject + notes)\n"
+    "/listapproved - list drafts you've greenlit; tap one to add notes\n"
+    "/status - approved / rejected / pending breakdown\n"
+    "/help - this message"
+)
+
+
+def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str) -> int:
+    """DM a list of approved drafts, each with an inline 'add notes' button.
+
+    Returns the number of approved drafts listed.
+    """
+    rows = review.approved_drafts(conn)
+    if not rows:
+        client.send_message(chat_id, "No approved drafts yet.")
+        return 0
+    lines = ["✅ Approved drafts (tap to add notes):"]
+    keyboard = []
+    for r in rows:
+        title = r["title"] or "(unknown)"
+        lines.append(f"  • {title}")
+        keyboard.append(
+            [{"text": f"📝 {title[:32]}", "callback_data": f"notes:{r['draft_id']}"}]
+        )
+    client.send_message(
+        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
+    )
+    return len(rows)
+
+
+def run_review_session(
     conn: sqlite3.Connection,
     client: TelegramTransport,
     chat_id: str,
+    awaiting: dict,
+    offset_ref: list[int],
     *,
-    once: bool = False,
     poll_timeout: int = 30,
     max_iterations: int = 1_000_000,
 ) -> int:
-    """Run the review loop. Returns the number of decisions processed.
+    """The one-draft-at-a-time review flow, triggered by /reviewdraft.
 
-    Default (``once=False``): **one draft at a time**. Sends the 📊 progress
-    block, then sends a single pending draft with its Approve/Reject buttons,
-    waits for the tap (and optional note), then moves to the next draft. This
-    avoids dumping every draft at once. When none are left it idles, polling for
-    late notes/taps and for newly-generated pending drafts.
-
-    ``once=True``: the old "send everything, then process queued updates once"
-    dump mode (used by one-shot CLI runs and tests).
+    Sends the 📊 progress block, then one pending draft with Approve/Reject
+    buttons, waits for the tap (and optional note), then the next. When none are
+    left it idles, polling for late notes/taps and newly-generated drafts.
     """
-    send_reviewed_summary(conn, client, chat_id)
-    offset = 0
-    awaiting: dict[int, str] = {}
     decided = 0
 
     def _handle(upd: dict) -> str | None:
-        nonlocal offset
-        offset = max(offset, upd.get("update_id", 0) + 1)
+        offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
         if "callback_query" in upd:
             res = handle_callback(conn, client, chat_id, upd)
-            if res:
+            if res and "decision" in res:
                 nonlocal decided
                 decided += 1
-                awaiting[res["note_message_id"]] = res["draft_id"]
+                awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
                 return res["draft_id"]
         elif "message" in upd:
             handle_text(conn, client, chat_id, awaiting, upd)
         return None
 
-    if once:
-        for row in review.pending_drafts(conn):
-            _send_one(conn, client, chat_id, row)
-        for upd in client.get_updates(offset=offset, timeout=0):
-            _handle(upd)
-        return decided
-
+    send_reviewed_summary(conn, client, chat_id)
     sent: set[str] = set()
     caught_up = False
     iters = 0
@@ -358,22 +392,19 @@ def run_review_bot(
             if not caught_up:
                 client.send_message(chat_id, "✅ All caught up — no drafts pending.")
                 caught_up = True
-            # idle: process any late notes/taps, then re-check for new drafts
             try:
-                for upd in client.get_updates(offset=offset, timeout=poll_timeout):
+                for upd in client.get_updates(offset=offset_ref[0], timeout=poll_timeout):
                     _handle(upd)
             except TelegramError as exc:
                 print(f"[telegram] {exc}; retrying in 5s")
                 time.sleep(5)
             continue
-
-        # send exactly this one draft, then wait for its decision
         _send_one(conn, client, chat_id, draft)
         sent.add(draft["id"])
         caught_up = False
         while draft["id"] in _pending_ids(conn):
             try:
-                upds = client.get_updates(offset=offset, timeout=poll_timeout)
+                upds = client.get_updates(offset=offset_ref[0], timeout=poll_timeout)
             except TelegramError as exc:
                 print(f"[telegram] {exc}; retrying in 5s")
                 time.sleep(5)
@@ -382,7 +413,96 @@ def run_review_bot(
                 rid = _handle(upd)
                 if rid == draft["id"]:
                     break
-        # loop continues to the next pending draft
+    return decided
+
+
+def run_review_bot(
+    conn: sqlite3.Connection,
+    client: TelegramTransport,
+    chat_id: str,
+    *,
+    once: bool = False,
+    poll_timeout: int = 30,
+    max_iterations: int = 1_000_000,
+) -> int:
+    """Command-driven Telegram review bot (long-poll).
+
+    Idles and reacts to ``/commands`` instead of pushing drafts on startup:
+
+      /reviewdraft  -> start the one-by-one review flow (run_review_session)
+      /listapproved -> list approved drafts with 'add notes' buttons
+      /status       -> reviewed/pending breakdown
+      /help, /start -> this message
+
+    ``once=True`` keeps the legacy dump behaviour (send summary + all pending,
+    process queued updates once) for one-shot CLI runs and tests.
+    """
+    offset_ref = [0]
+    awaiting: dict[str, dict] = {}
+    decided = 0
+
+    def _handle(upd: dict) -> None:
+        offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
+        if "callback_query" in upd:
+            res = handle_callback(conn, client, chat_id, upd)
+            if res and "decision" in res:
+                nonlocal decided
+                decided += 1
+                awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
+            elif res and "note_message_id" in res:
+                # notes: button from /listapproved
+                awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
+            return
+        msg = upd.get("message")
+        if not msg:
+            return
+        text = (msg.get("text") or "").strip()
+        if text.startswith("/"):
+            _dispatch(text)
+            return
+        handle_text(conn, client, chat_id, awaiting, upd)
+
+    def _dispatch(text: str) -> None:
+        nonlocal decided
+        cmd = text.split()[0].lower()
+        if cmd == "/reviewdraft":
+            decided += run_review_session(
+                conn, client, chat_id, awaiting, offset_ref,
+                poll_timeout=poll_timeout, max_iterations=max_iterations,
+            )
+        elif cmd == "/listapproved":
+            send_approved_list(conn, client, chat_id)
+        elif cmd == "/status":
+            send_reviewed_summary(conn, client, chat_id)
+        elif cmd in ("/help", "/start"):
+            client.send_message(chat_id, HELP_TEXT)
+        else:
+            client.send_message(chat_id, "Unknown command. Send /help.")
+
+    if once:
+        send_reviewed_summary(conn, client, chat_id)
+        for row in review.pending_drafts(conn):
+            _send_one(conn, client, chat_id, row)
+        for upd in client.get_updates(offset=offset_ref[0], timeout=0):
+            _handle(upd)
+        return decided
+
+    client.send_message(
+        chat_id,
+        "HumorHist review bot ready. Send /reviewdraft to review, "
+        "/listapproved to browse greenlit drafts, /help for commands.",
+    )
+    iters = 0
+    while True:
+        iters += 1
+        if iters > max_iterations:
+            return decided
+        try:
+            for upd in client.get_updates(offset=offset_ref[0], timeout=poll_timeout):
+                _handle(upd)
+        except TelegramError as exc:
+            print(f"[telegram] {exc}; retrying in 5s")
+            time.sleep(5)
 
 
 
