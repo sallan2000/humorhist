@@ -284,6 +284,26 @@ def cmd_telegram_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Phase 4 handoff: list queued drafts, or move approved -> queue with --enqueue."""
+    import humorhist.review as review
+
+    conn = _open_db(args.db)
+    if args.enqueue:
+        n = review.enqueue_approved(conn, scheduled_for=args.scheduled_for)
+        print(f"Enqueued {n} approved draft(s) into queue.")
+    rows = review.queued_drafts(conn)
+    if not rows:
+        print("Queue is empty.")
+        return 0
+    print(f"{len(rows)} draft(s) in queue:")
+    for r in rows:
+        sched = r["scheduled_for"] or "(unscheduled)"
+        flag = " [published]" if r["published"] else ""
+        print(f"  {r['draft_id']} — {r['title']} — scheduled {sched}{flag}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="humorhist", description=__doc__)
     p.add_argument("--db", default=DEFAULT_DB, help="path to the sqlite database")
@@ -326,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
     ts = sub.add_parser("telegram-status", help="DM reviewed/pending topic breakdown")
     ts.add_argument("--chat-id", default=None, help="Telegram chat id to DM")
     ts.set_defaults(func=cmd_telegram_status)
+
+    q = sub.add_parser("queue", help="Phase 4: list queued drafts (--enqueue to fill)")
+    q.add_argument("--enqueue", action="store_true", help="move approved drafts into queue")
+    q.add_argument("--scheduled-for", default=None, help="ISO timestamp to schedule under")
+    q.set_defaults(func=cmd_queue)
 
     return p
 

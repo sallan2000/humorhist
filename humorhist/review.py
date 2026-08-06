@@ -112,3 +112,51 @@ def apply_review(
         ),
     )
     conn.commit()
+
+
+def enqueue_approved(conn: sqlite3.Connection, scheduled_for: str | None = None) -> int:
+    """Move every `approved` draft into `queue` (Phase 4 handoff).
+
+    Idempotent: drafts already in `queue` are skipped, so this is safe to run
+    repeatedly. Returns the number of *new* rows inserted into `queue`.
+
+    `scheduled_for` is an optional ISO timestamp; when omitted the row is left
+    unscheduled (published = 0) for the publisher to pick up in arrival order.
+    """
+    approved = conn.execute(
+        "SELECT id FROM drafts WHERE status = 'approved'"
+    ).fetchall()
+    already = {
+        r["draft_id"]
+        for r in conn.execute("SELECT draft_id FROM queue")
+    }
+    inserted = 0
+    for r in approved:
+        draft_id = r["id"]
+        if draft_id in already:
+            continue
+        conn.execute(
+            "INSERT INTO queue (draft_id, scheduled_for, published) VALUES (?, ?, 0)",
+            (draft_id, scheduled_for),
+        )
+        inserted += 1
+    if inserted:
+        conn.commit()
+    return inserted
+
+
+def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
+    """Return queued (unpublished) drafts, oldest first, joined to pool title."""
+    return [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT q.id AS queue_id, q.draft_id, q.scheduled_for, q.published,
+                   p.title AS title
+            FROM queue q
+            LEFT JOIN drafts d ON d.id = q.draft_id
+            LEFT JOIN pool p ON p.id = d.pool_id
+            ORDER BY q.id ASC
+            """
+        )
+    ]

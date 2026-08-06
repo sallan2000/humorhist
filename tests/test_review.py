@@ -160,3 +160,39 @@ def test_apply_review_rejects_unreviewable_status(tmp_path):
     _make_draft(conn, "d1", "used")
     with pytest.raises(ValueError):
         review.apply_review(conn, "d1", decision="approve")
+
+
+# --- enqueue_approved / queued_drafts (Phase 4 handoff) ----------------------
+
+
+def test_enqueue_approved_moves_only_approved(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "approved")
+    _make_draft(conn, "d2", "approved")
+    _make_draft(conn, "d3", "pending")
+    _make_draft(conn, "d4", "rejected")
+
+    n = review.enqueue_approved(conn)
+    assert n == 2
+    q = {r["draft_id"] for r in conn.execute("SELECT draft_id FROM queue")}
+    assert q == {"d1", "d2"}
+
+
+def test_enqueue_approved_is_idempotent(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "approved")
+    assert review.enqueue_approved(conn) == 1
+    # running again must not insert a second row
+    assert review.enqueue_approved(conn) == 0
+    assert len(list(conn.execute("SELECT * FROM queue"))) == 1
+
+
+def test_queued_drafts_lists_unpublished_oldest_first(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "approved")
+    _make_draft(conn, "d2", "approved")
+    review.enqueue_approved(conn)
+    rows = review.queued_drafts(conn)
+    assert [r["draft_id"] for r in rows] == ["d1", "d2"]
+    assert rows[0]["title"] == "Pool X"
+    assert rows[0]["published"] == 0

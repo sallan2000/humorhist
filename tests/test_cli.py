@@ -277,3 +277,32 @@ def test_telegram_status_errors_without_token(dbpath, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 2
     assert "HUMORHIST_TELEGRAM_BOT_TOKEN" in out
+
+
+def test_queue_enqueue_moves_approved(dbpath, monkeypatch, capsys):
+    import humorhist.db as db
+
+    conn = db.connect(dbpath)
+    conn.execute("INSERT OR IGNORE INTO pool (id, title) VALUES ('p1','X')")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1','{}','{}','approved','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    # list (empty)
+    rc = main(["--db", dbpath, "queue"])
+    assert rc == 0
+    assert "Queue is empty" in capsys.readouterr().out
+    # enqueue
+    rc = main(["--db", dbpath, "queue", "--enqueue"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Enqueued 1" in out
+    # now listed
+    rc = main(["--db", dbpath, "queue"])
+    out = capsys.readouterr().out
+    assert "d1" in out
+    # idempotent: second enqueue adds nothing
+    rc = main(["--db", dbpath, "queue", "--enqueue"])
+    out = capsys.readouterr().out
+    assert "Enqueued 0" in out
