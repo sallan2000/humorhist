@@ -123,6 +123,63 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def render_draft(row, pool=None) -> str:
+    """Render a draft (brief + angles) as plain text for the terminal/transport.
+
+    Transport-agnostic: the CLI review loop and any future Telegram transport
+    both call this so the presentation stays identical everywhere. ``pool`` is
+    optional; cmd_show passes it to avoid a second lookup.
+    """
+    return _render_draft_with_pool(row, pool)
+
+
+def _render_draft_with_pool(row, pool) -> str:
+    title = pool["title"] if pool else "(unknown)"
+    year = pool["year"] if pool else ""
+    brief = json.loads(row["brief_json"] or "{}")
+    angles = json.loads(row["angles_json"] or "{}")
+
+    out: list[str] = []
+    out.append("=" * 70)
+    out.append(f"DRAFT {row['id']} — {title} ({year})")
+    out.append(f"status: {row['status']}")
+    out.append("=" * 70)
+
+    out.append("\n--- VERIFIED FACTS ---")
+    for f in brief.get("verified_facts", []):
+        out.append(f"  • {f}")
+
+    if brief.get("misconceptions"):
+        out.append("\n--- MISCONCEPTIONS (popular version vs record) ---")
+        for m in brief["misconceptions"]:
+            out.append(f"  ! {m}")
+
+    if brief.get("caveats"):
+        out.append("\n--- CAVEATS ---")
+        for c in brief["caveats"]:
+            out.append(f"  ? {c}")
+
+    out.append("\n--- COMIC ANGLES ---")
+    for i, a in enumerate(angles.get("angles", []), 1):
+        out.append(f"\n  {i}. {a.get('angle_name', '?')}")
+        out.append(f"     setup   : {a.get('setup', '')}")
+        out.append(f"     lands   : {a.get('why_it_lands', '')}")
+        out.append(f"     pitfalls: {a.get('pitfalls', '')}")
+        for rm in a.get("raw_material", []):
+            out.append(f"     raw     : {rm}")
+
+    if angles.get("strongest_single_detail"):
+        out.append(f"\n--- STRONGEST DETAIL ---\n  {angles['strongest_single_detail']}")
+    if angles.get("suggested_hook"):
+        out.append(f"\n--- SUGGESTED HOOK (factual, not a joke) ---\n  {angles['suggested_hook']}")
+
+    out.append("\n--- SOURCES ---")
+    for s in brief.get("sources", []):
+        out.append(f"  {s.get('title', '')} — {s.get('url', '')}")
+    out.append("")
+    return "\n".join(out)
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     conn = _open_db(args.db)
     if args.draft_id:
@@ -139,49 +196,66 @@ def cmd_show(args: argparse.Namespace) -> int:
         return 1
 
     pool = db.get_pool_item(conn, row["pool_id"])
-    brief = json.loads(row["brief_json"] or "{}")
-    angles = json.loads(row["angles_json"] or "{}")
-
-    title = pool["title"] if pool else "(unknown)"
-    year = pool["year"] if pool else ""
-    print("=" * 70)
-    print(f"DRAFT {row['id']} — {title} ({year})")
-    print(f"status: {row['status']}")
-    print("=" * 70)
-
-    print("\n--- VERIFIED FACTS ---")
-    for f in brief.get("verified_facts", []):
-        print(f"  • {f}")
-
-    if brief.get("misconceptions"):
-        print("\n--- MISCONCEPTIONS (popular version vs record) ---")
-        for m in brief["misconceptions"]:
-            print(f"  ! {m}")
-
-    if brief.get("caveats"):
-        print("\n--- CAVEATS ---")
-        for c in brief["caveats"]:
-            print(f"  ? {c}")
-
-    print("\n--- COMIC ANGLES ---")
-    for i, a in enumerate(angles.get("angles", []), 1):
-        print(f"\n  {i}. {a.get('angle_name', '?')}")
-        print(f"     setup   : {a.get('setup', '')}")
-        print(f"     lands   : {a.get('why_it_lands', '')}")
-        print(f"     pitfalls: {a.get('pitfalls', '')}")
-        for rm in a.get("raw_material", []):
-            print(f"     raw     : {rm}")
-
-    if angles.get("strongest_single_detail"):
-        print(f"\n--- STRONGEST DETAIL ---\n  {angles['strongest_single_detail']}")
-    if angles.get("suggested_hook"):
-        print(f"\n--- SUGGESTED HOOK (factual, not a joke) ---\n  {angles['suggested_hook']}")
-
-    print("\n--- SOURCES ---")
-    for s in brief.get("sources", []):
-        print(f"  {s.get('title', '')} — {s.get('url', '')}")
-    print()
+    print(_render_draft_with_pool(row, pool))
     return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """Interactive Phase 3 review loop over pending drafts.
+
+    For each pending draft: render it, then prompt for a decision
+    (approve/reject/skip) and optional editor line + notes. Decisions are
+    persisted via ``humorhist.review.apply_review``. 'skip' leaves the draft
+    pending and moves on.
+    """
+    import humorhist.review as review
+
+    conn = _open_db(args.db)
+    pending = review.pending_drafts(conn)
+
+    if not pending:
+        print("Nothing to review — no pending drafts.")
+        return 0
+
+    print(f"{len(pending)} pending draft(s) to review.\n")
+
+    acted = 0
+    for row in pending:
+        pool = db.get_pool_item(conn, row["pool_id"])
+        print(_render_draft_with_pool(row, pool))
+        print("-" * 70)
+
+        decision = _prompt_choice(
+            "Decision [a/r/s] (approve/reject/skip)", {"a": "approve", "r": "reject", "s": "skip"}
+        )
+        if decision == "skip":
+            print("  skipped\n")
+            continue
+
+        editor_line = input("  Editor line (optional, Enter to skip): ").strip()
+        notes = input("  Notes (optional, Enter to skip): ").strip()
+
+        review.apply_review(
+            conn,
+            row["id"],
+            decision=decision,
+            editor_line=editor_line or None,
+            notes=notes or None,
+        )
+        acted += 1
+        print(f"  -> {decision}ed\n")
+
+    print(f"Review session done. {acted} draft(s) decided.")
+    return 0
+
+
+def _prompt_choice(prompt: str, mapping: dict[str, str]) -> str:
+    """Loop until the user enters a key present in ``mapping``."""
+    while True:
+        ans = input(f"{prompt}: ").strip().lower()
+        if ans in mapping:
+            return mapping[ans]
+        print(f"  enter one of: {', '.join(mapping)}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -210,6 +284,9 @@ def build_parser() -> argparse.ArgumentParser:
     sh = sub.add_parser("show", help="print a draft in full")
     sh.add_argument("draft_id", nargs="?", default=None)
     sh.set_defaults(func=cmd_show)
+
+    rv = sub.add_parser("review", help="Phase 3: approve/reject pending drafts")
+    rv.set_defaults(func=cmd_review)
 
     return p
 

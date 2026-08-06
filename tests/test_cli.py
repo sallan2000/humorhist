@@ -6,12 +6,13 @@ touch the network and are covered by their own modules' tests.
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import pytest
 
 import humorhist.db as db
-from humorhist.cli import build_parser, main
+from humorhist.cli import build_parser, cmd_review, main
 
 
 @pytest.fixture()
@@ -162,3 +163,87 @@ def test_show_renders_a_draft(dbpath, capsys):
     assert BRIEF["verified_facts"][0] in out
     assert BRIEF["misconceptions"][0] in out
     assert BRIEF["caveats"][0] in out
+
+
+# --- review (Phase 3) --------------------------------------------------------
+
+
+def _seed_pending_draft(dbpath, draft_id="d1", pool_id="emu"):
+    conn = db.connect(dbpath)
+    db.upsert_pool_item(
+        conn,
+        id=pool_id,
+        title="The Emu War",
+        year=1932,
+        date_hint=None,
+        summary="Australia lost to emus.",
+        source_url="https://en.wikipedia.org/wiki/Emu_War",
+        source_name="wikipedia",
+    )
+    conn.execute(
+        """
+        INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at)
+        VALUES (?, ?, ?, ?, 'pending', '2026-01-01T00:00:00+00:00')
+        """,
+        (draft_id, pool_id, json.dumps(BRIEF), json.dumps(ANGLES)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _run_review(dbpath, inputs, monkeypatch, capsys):
+    """Drive cmd_review with a sequence of simulated stdin lines."""
+    import io
+
+    from humorhist.cli import cmd_review
+
+    conn = db.connect(dbpath)
+    # cmd_review builds its own connection via _open_db; feed stdin instead.
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n".join(inputs) + "\n"))
+    # argparse Namespace with the db path
+    args = argparse.Namespace(db=dbpath)
+    rc = cmd_review(args)
+    out = capsys.readouterr().out
+    conn.close()
+    return rc, out
+
+
+def test_review_approve_writes_status(dbpath, monkeypatch, capsys):
+    _seed_pending_draft(dbpath)
+    rc, out = _run_review(dbpath, ["a", "", ""], monkeypatch, capsys)
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT status, reviewed_at FROM drafts WHERE id='d1'").fetchone()
+    conn.close()
+    assert row["status"] == "approved"
+    assert row["reviewed_at"] is not None
+
+
+def test_review_reject_writes_status(dbpath, monkeypatch, capsys):
+    _seed_pending_draft(dbpath)
+    rc, out = _run_review(dbpath, ["r", "", "too dark"], monkeypatch, capsys)
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute(
+        "SELECT status, editor_line, editor_notes FROM drafts WHERE id='d1'"
+    ).fetchone()
+    conn.close()
+    assert row["status"] == "rejected"
+    assert row["editor_line"] is None
+    assert row["editor_notes"] == "too dark"
+
+
+def test_review_skip_leaves_pending(dbpath, monkeypatch, capsys):
+    _seed_pending_draft(dbpath)
+    rc, out = _run_review(dbpath, ["s"], monkeypatch, capsys)
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
+    conn.close()
+    assert row["status"] == "pending"
+
+
+def test_review_empty_queue_exits_clean(dbpath, monkeypatch, capsys):
+    rc, out = _run_review(dbpath, [], monkeypatch, capsys)
+    assert rc == 0
+    assert "no pending" in out.lower() or "nothing to review" in out.lower()
