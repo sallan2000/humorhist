@@ -89,6 +89,12 @@ def draft_one(
     """
     item = _row_to_item(row)
 
+    # Non-destructive: never overwrite an existing draft for this pool item
+    # (the editor may have reviewed/edited/approved it). Callers select only
+    # status='new' items, but a re-run or scheduled pass must still be safe.
+    if db.draft_exists_for_pool(conn, item["id"]):
+        return db.make_id("draft", item["id"])
+
     extract = fetch_wikipedia_extract(
         item["source_url"] or item["title"], client=http_client
     )
@@ -99,7 +105,7 @@ def draft_one(
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
-        INSERT OR REPLACE INTO drafts
+        INSERT INTO drafts
           (id, pool_id, brief_json, angles_json, status, created_at)
         VALUES (?, ?, ?, ?, 'pending', ?)
         """,

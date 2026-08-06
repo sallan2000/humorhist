@@ -183,12 +183,24 @@ def test_draft_one_is_idempotent_by_pool_id(conn, monkeypatch):
     _add(conn, "emu", score=9)
     row = db.get_pool_item(conn, "emu")
 
-    id1 = drafting.draft_one(conn, StubClient([_brief(), _angles()]), row)
-    id2 = drafting.draft_one(conn, StubClient([_brief(), _angles()]), row)
+    client1 = StubClient([_brief(), _angles()])
+    id1 = drafting.draft_one(conn, client1, row)
+    # second call must SKIP (not overwrite) — LLM/factcheck must not run again
+    client2 = StubClient([_brief(), _angles()])
+    id2 = drafting.draft_one(conn, client2, row)
 
     assert id1 == id2
     n = conn.execute("SELECT count(*) AS n FROM drafts").fetchone()["n"]
     assert n == 1
+    # proof of non-destructive skip: no second factcheck/angles call happened
+    assert len(client2.calls) == 0
+
+
+def test_draft_exists_for_pool(conn):
+    _add(conn, "emu", score=9)
+    assert db.draft_exists_for_pool(conn, "emu") is False
+    drafting.draft_one(conn, StubClient([_brief(), _angles()]), db.get_pool_item(conn, "emu"))
+    assert db.draft_exists_for_pool(conn, "emu") is True
 
 
 # --- draft_candidates -------------------------------------------------------

@@ -131,6 +131,17 @@ def get_pool_item(conn: sqlite3.Connection, pool_id: str) -> sqlite3.Row | None:
     return cur.fetchone()
 
 
+def draft_exists_for_pool(conn: sqlite3.Connection, pool_id: str) -> bool:
+    """True if a drafts row already exists for this pool item.
+
+    Used to make the drafting step non-destructive: a re-run (e.g. on a weekly
+    schedule) must not overwrite an existing draft — including one the editor
+    has already reviewed, edited, or approved.
+    """
+    cur = conn.execute("SELECT 1 FROM drafts WHERE pool_id = ? LIMIT 1", (pool_id,))
+    return cur.fetchone() is not None
+
+
 def counts(conn: sqlite3.Connection) -> dict:
     """Return a dict of row counts for pool, drafts, queue, posts."""
     result: dict[str, int] = {}
