@@ -170,7 +170,7 @@ startup.
 **Commands**
 
     /reviewdraft   start reviewing pending drafts one by one (Approve/Reject + notes)
-    /listapproved  list every draft you've greenlit, each with an "add notes" button
+    /listapproved  list every draft you've greenlit; tap one to open its content
     /status        approved / rejected / pending breakdown
     /help          this list
 
@@ -194,9 +194,10 @@ startup.
 **Browse and annotate approved drafts**
 
 Send **/listapproved** to see every draft you've greenlit. Tap a draft's
-**📝** button to add more notes later — the bot prompts, you reply (or `/skip`),
-and the note is saved on the draft. Re-saving notes is idempotent and keeps the
-draft in the publish queue.
+**👁** button to open its full content (rendered just like the review view). The
+content message ends with an **✏️ Add notes** button — tap it to add more notes
+later: the bot prompts, you reply (or `/skip`), and the note is saved on the
+draft. Re-saving notes is idempotent and keeps the draft in the publish queue.
 
 To just see the reviewed/pending breakdown without sending drafts:
 
