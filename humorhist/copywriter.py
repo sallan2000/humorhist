@@ -117,12 +117,35 @@ def generate_post_copy(
     user = _build_user_prompt(draft, pool, limit)
     system = POST_COPY_SYSTEM_PROMPT.format(limit=limit)
 
-    result = client.complete_json(system, user, max_tokens=max(limit + 64, 512))
-    if not isinstance(result, dict) or not result.get("post"):
-        from humorhist.llm import LLMError
+    # hy3:free spends tokens "reasoning" before it emits content, so a small
+    # budget truncates (finish_reason:"length", content:null) and the fallback
+    # can surface a degenerate stub. Disable reasoning for clean direct output,
+    # and retry a few times if the model still returns something unusable.
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            result = client.complete_json(
+                system, user, max_tokens=2048, reasoning_off=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            continue
+        if isinstance(result, dict) and result.get("post"):
+            text = result["post"].strip()
+        elif isinstance(result, str) and result.strip():
+            text = result.strip()
+        else:
+            last_err = ValueError(f"model returned no post copy: {result!r}")
+            continue
+        # reject degenerate output (truncated stubs, ellipsis-only, too short)
+        if len(text) < 12 or set(text) <= {"."}:
+            last_err = ValueError(f"degenerate copy rejected: {text!r}")
+            continue
+        return _trim_to_limit(text, limit)[0]
 
-        raise LLMError(f"model returned no post copy: {result!r}")
-    return _trim_to_limit(result["post"].strip(), limit)[0]
+    from humorhist.llm import LLMError
+
+    raise LLMError(f"post copy generation failed: {last_err}")
 
 
 def fill_post_copy(

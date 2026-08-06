@@ -48,9 +48,10 @@ def test_extract_json_raises_on_empty():
         extract_json("   ")
 
 
-def test_extract_json_raises_on_garbage():
-    with pytest.raises(LLMError):
-        extract_json("there is no json here at all")
+def test_extract_json_returns_raw_text_on_garbage():
+    # No JSON present: return the stripped prose so reasoning-off models that
+    # reply with plain text (not a JSON wrapper) are still consumable.
+    assert extract_json("there is no json here at all") == "there is no json here at all"
 
 
 # --- StubClient -------------------------------------------------------------

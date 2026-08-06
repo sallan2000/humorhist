@@ -48,8 +48,12 @@ def extract_json(text: str) -> Any:
     """Best-effort extraction of a JSON value from model output.
 
     Handles bare JSON, ```json fenced blocks, and leading/trailing prose.
-    Raises LLMError if nothing parseable is found.
+    If no JSON object/array is found, returns the stripped raw text (this lets
+    reasoning-off models that reply with plain prose be consumed by callers
+    that accept a string). Raises LLMError only on empty input.
     """
+    if not text:
+        raise LLMError("empty response from model")
     text = text.strip()
     if not text:
         raise LLMError("empty response from model")
@@ -74,7 +78,8 @@ def extract_json(text: str) -> Any:
             except json.JSONDecodeError:
                 continue
 
-    raise LLMError(f"could not parse JSON from response: {text[:300]!r}")
+    # No JSON found: return the raw prose (callers may accept a string).
+    return text
 
 
 class NousClient:
@@ -103,6 +108,7 @@ class NousClient:
         *,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_off: bool = False,
     ) -> Any:
         if not self.api_key:
             raise LLMError(
@@ -118,6 +124,14 @@ class NousClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        # Opt-in: disable the model's "reasoning" mode. tencent/hy3:free defaults
+        # to reasoning, which burns the token budget before emitting `content`
+        # (returns content:null, finish_reason:"length", truncated reasoning in
+        # the `reasoning` field). For short, direct-output tasks this both fixes
+        # that crash and yields cleaner copy. Off by default to leave the
+        # drafting/screen stages' behaviour unchanged.
+        if reasoning_off:
+            payload["reasoning"] = {"enabled": False}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -134,7 +148,9 @@ class NousClient:
                     )
                     resp.raise_for_status()
                     body = resp.json()
-                content = body["choices"][0]["message"]["content"]
+                msg = body["choices"][0]["message"]
+                # Fall back to the reasoning field if content is empty/None.
+                content = msg.get("content") or msg.get("reasoning")
                 return extract_json(content)
             except Exception as exc:  # noqa: BLE001 - retry on any transient failure
                 last_error = exc
@@ -163,6 +179,7 @@ class StubClient:
         *,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning_off: bool = False,
     ) -> Any:
         self.calls.append(
             {
@@ -170,6 +187,7 @@ class StubClient:
                 "user": user,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                "reasoning_off": reasoning_off,
             }
         )
         if not self.responses:
