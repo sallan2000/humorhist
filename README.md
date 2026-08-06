@@ -1,4 +1,4 @@
-# humorhist
+# HumorHist
 
 A pipeline that turns historical oddities into fully fact-checked "comic angle"
 briefs for a humorous-history social account. A human still writes the actual
