@@ -230,23 +230,45 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-165 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
+172 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
 
 -------------------------------------------------------------------------------
 ## Project status
 -------------------------------------------------------------------------------
 
 Built and working: Phases 1-3 — harvest, screen, draft, the review/show
-commands, and a Telegram review loop (approve/reject drafts from your phone via
-inline buttons, plus an optional notify nudge). The pipeline produces
-fact-checked briefs and you decide what to publish.
+commands, a Telegram review loop (approve/reject drafts from your phone via
+inline buttons, plus a notify nudge), and the **Phase 4 handoff**: approving a
+draft auto-enqueues it (`queue`), and a weekly `systemd` timer discovers new
+topics (harvest → screen → draft net-new) without creating duplicates.
 
 Not yet built:
-- Phase 4: publishing to the social account (the `queue`/`posts` tables exist as
-  stubs; moving approved drafts into `queue` and the actual publisher remain).
+- Phase 4 publisher: turning a `queue` row into an actual posted item and
+  writing `posts` (auto-post to Mastodon/X vs generate post text for you to
+  paste — the `queue`/`posts` schema is ready for either).
+- Cross-source topic dedup: dedup is by source page id, not by topic, so the
+  same event appearing on two Wikipedia lists yields two pool rows.
 
-Until then, "publishing" means: read the draft with `show`, write the post
-yourself, and mark the draft approved in the DB.
+Until the publisher exists, "publishing" means: read the approved draft with
+`show`, write the post yourself, and it's already in `queue`.
+
+-------------------------------------------------------------------------------
+## Scheduling (weekly discovery)
+-------------------------------------------------------------------------------
+
+A `systemd --user` timer runs the discovery pipeline automatically:
+
+    systemctl --user status humorhist-weekly.timer      # next run time
+    systemctl --user start humorhist-weekly.service     # force a run now
+    systemctl --user cat humorhist-weekly.timer         # view the schedule
+
+It fires **weekly** (default Monday 00:00 local; edit `OnCalendar` in
+`~/.config/systemd/user/humorhist-weekly.timer` to change). The job
+(`scripts/weekly_pipeline.py`) does harvest → screen → draft net-new → best-effort
+Telegram nudge. Every phase is idempotent, so re-running never duplicates:
+harvest upserts by stable page id, screen scores only unscored rows, and the
+draft step skips any pool item that already has a draft (so your reviewed/
+approved work is never overwritten). `Linger=yes` keeps it alive after logout.
 
 -------------------------------------------------------------------------------
 ## Layout
@@ -274,4 +296,5 @@ yourself, and mark the draft approved in the DB.
         rescreen_60.py      one-off: re-score the originally-screened rows
         regen_drafts.py     regenerate existing drafts + draft fresh ones
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
-    tests/                  pytest suite (165 tests)
+        weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
+    tests/                  pytest suite (172 tests)
