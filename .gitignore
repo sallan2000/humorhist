@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 data/*.sqlite
+
+# runtime logs (no secrets, but not code)
+data/*.log
