@@ -198,23 +198,34 @@ def _send_long(
 # --------------------------------------------------------------------------- #
 
 
+def _pending_ids(conn: sqlite3.Connection) -> set[str]:
+    return {d["id"] for d in review.pending_drafts(conn)}
+
+
+def _send_one(
+    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, row: dict
+) -> list[dict]:
+    """Send a single draft (chunked) with Approve/Reject buttons on the last chunk."""
+    pool = db.get_pool_item(conn, row["pool_id"])
+    text = render.render_draft(row, pool)
+    try:
+        return _send_long(client, chat_id, text, reply_markup=_keyboard(row["id"]))
+    except Exception as exc:  # noqa: BLE001 - one bad draft must not kill the loop
+        print(f"[telegram] failed to send draft {row['id']}: {exc}")
+        return []
+
+
 def send_pending_drafts(
     conn: sqlite3.Connection, client: TelegramTransport, chat_id: str
 ) -> list[dict]:
-    """Send one Telegram message per pending draft with Approve/Reject buttons.
+    """Send every pending draft (one message series each) with Approve/Reject buttons.
 
-    Returns the list of sent message dicts (each carrying its reply_markup).
+    Used by the ``--once`` dump mode. The default review loop sends drafts
+    one-at-a-time instead (see ``run_review_bot``). Returns all sent messages.
     """
     sent: list[dict] = []
     for row in review.pending_drafts(conn):
-        pool = db.get_pool_item(conn, row["pool_id"])
-        text = render.render_draft(row, pool)
-        try:
-            sent.extend(
-                _send_long(client, chat_id, text, reply_markup=_keyboard(row["id"]))
-            )
-        except Exception as exc:  # noqa: BLE001 - one bad draft must not kill the loop
-            print(f"[telegram] failed to send draft {row['id']}: {exc}")
+        sent.extend(_send_one(conn, client, chat_id, row))
     return sent
 
 
@@ -289,47 +300,90 @@ def handle_text(
 
 
 def run_review_bot(
-    conn: db.Connection,
+    conn: sqlite3.Connection,
     client: TelegramTransport,
     chat_id: str,
     *,
     once: bool = False,
     poll_timeout: int = 30,
+    max_iterations: int = 1_000_000,
 ) -> int:
     """Run the review loop. Returns the number of decisions processed.
 
-    ``once=True`` processes the currently-queued updates once and returns (used
-    by tests and one-shot CLI runs). ``once=False`` long-polls forever for the
-    durable systemd runner (interrupt the process to stop).
+    Default (``once=False``): **one draft at a time**. Sends the 📊 progress
+    block, then sends a single pending draft with its Approve/Reject buttons,
+    waits for the tap (and optional note), then moves to the next draft. This
+    avoids dumping every draft at once. When none are left it idles, polling for
+    late notes/taps and for newly-generated pending drafts.
+
+    ``once=True``: the old "send everything, then process queued updates once"
+    dump mode (used by one-shot CLI runs and tests).
     """
     send_reviewed_summary(conn, client, chat_id)
-    send_pending_drafts(conn, client, chat_id)
+    offset = 0
     awaiting: dict[int, str] = {}
     decided = 0
-    offset = 0
 
-    def _process(updates: list[dict]) -> None:
-        nonlocal offset, decided
-        for upd in updates:
-            offset = max(offset, upd.get("update_id", 0) + 1)
-            if "callback_query" in upd:
-                res = handle_callback(conn, client, chat_id, upd)
-                if res:
-                    decided += 1
-                    awaiting[res["note_message_id"]] = res["draft_id"]
-            elif "message" in upd:
-                handle_text(conn, client, chat_id, awaiting, upd)
+    def _handle(upd: dict) -> str | None:
+        nonlocal offset
+        offset = max(offset, upd.get("update_id", 0) + 1)
+        if "callback_query" in upd:
+            res = handle_callback(conn, client, chat_id, upd)
+            if res:
+                nonlocal decided
+                decided += 1
+                awaiting[res["note_message_id"]] = res["draft_id"]
+                return res["draft_id"]
+        elif "message" in upd:
+            handle_text(conn, client, chat_id, awaiting, upd)
+        return None
 
     if once:
-        _process(client.get_updates(offset=offset, timeout=0))
+        for row in review.pending_drafts(conn):
+            _send_one(conn, client, chat_id, row)
+        for upd in client.get_updates(offset=offset, timeout=0):
+            _handle(upd)
         return decided
 
+    sent: set[str] = set()
+    caught_up = False
+    iters = 0
     while True:
-        try:
-            _process(client.get_updates(offset=offset, timeout=poll_timeout))
-        except TelegramError as exc:
-            print(f"[telegram] {exc}; retrying in 5s")
-            time.sleep(5)
+        iters += 1
+        if iters > max_iterations:
+            return decided
+        pending = review.pending_drafts(conn)
+        draft = next((d for d in pending if d["id"] not in sent), None)
+        if draft is None:
+            if not caught_up:
+                client.send_message(chat_id, "✅ All caught up — no drafts pending.")
+                caught_up = True
+            # idle: process any late notes/taps, then re-check for new drafts
+            try:
+                for upd in client.get_updates(offset=offset, timeout=poll_timeout):
+                    _handle(upd)
+            except TelegramError as exc:
+                print(f"[telegram] {exc}; retrying in 5s")
+                time.sleep(5)
+            continue
+
+        # send exactly this one draft, then wait for its decision
+        _send_one(conn, client, chat_id, draft)
+        sent.add(draft["id"])
+        caught_up = False
+        while draft["id"] in _pending_ids(conn):
+            try:
+                upds = client.get_updates(offset=offset, timeout=poll_timeout)
+            except TelegramError as exc:
+                print(f"[telegram] {exc}; retrying in 5s")
+                time.sleep(5)
+                continue
+            for upd in upds:
+                rid = _handle(upd)
+                if rid == draft["id"]:
+                    break
+        # loop continues to the next pending draft
+
 
 
 def notify_new_drafts(conn: db.Connection, client: TelegramTransport, chat_id: str) -> int:

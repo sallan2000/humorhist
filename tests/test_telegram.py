@@ -333,6 +333,45 @@ def test_handle_text_fallback_when_single_awaiting(tmp_path):
     assert row["editor_notes"] == "tighten the third angle"
 
 
+class _SeqStub(tg.StubTelegram):
+    """Returns a scripted sequence of update batches, then empty."""
+
+    def __init__(self, batches):
+        super().__init__(updates=[])
+        self._batches = list(batches)
+
+    def get_updates(self, offset=0, timeout=0):
+        return self._batches.pop(0) if self._batches else []
+
+
+def _callback_batch(draft_id, update_id=1):
+    return [{
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb{update_id}",
+            "data": f"approve:{draft_id}",
+            "message": {"message_id": 100 + update_id},
+        },
+    }]
+
+
+def test_run_review_bot_one_by_one(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    _seed_pending(conn, "d2")
+    # serve: tap d1, then tap d2, then nothing (idle -> max_iterations ends)
+    stub = _SeqStub([_callback_batch("d1", 1), _callback_batch("d2", 2)])
+    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=20)
+    assert decided == 2
+    # both drafts persisted as approved, in decision order
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert conn.execute("SELECT status FROM drafts WHERE id='d2'").fetchone()["status"] == "approved"
+    # only TWO drafts were sent (one at a time), not dumped all at once up front:
+    # count messages that carry a reply_markup (the button messages)
+    button_msgs = [m for m in stub.sent if "reply_markup" in m]
+    assert len(button_msgs) == 2  # one per draft, not 8 simultaneously
+
+
 def test_chunk_text_respects_limit():
     text = "\n".join(f"line {i}" for i in range(5000))
     chunks = tg._chunk_text(text, limit=1000)
