@@ -7,7 +7,7 @@ jokes — humorhist does the research and hands you angles, source links, and th
 
 It is a command-line tool, not a service. You run stages in order:
 
-    harvest  ->  screen  ->  draft  ->  (you review)  ->  publish*
+    harvest  ->  screen  ->  draft  ->  (you review)  ->  copy  ->  publish*
 
     * publishing is not built yet (see "Project status" below).
 
@@ -25,6 +25,10 @@ It is a command-line tool, not a service. You run stages in order:
            "why it lands", pitfalls, and raw material you can use.
 - show     Print a single draft in full so you can read and judge the angles.
 - status   Pool/draft health at a glance.
+- copy     Once you approve a draft it lands in the `queue` with a first-draft
+           post already generated (≤280 chars by default). `copy show/edit/regen`
+           let you read, rewrite, or regenerate that copy in place before any
+           destination posting. (See "Phase 4: post copy" below.)
 
 The output of `draft` is a structured brief: verified facts, dates, key
 figures, caveats, misconceptions, sources, and 3-5 comic angles. You read it
@@ -55,6 +59,9 @@ repo):
     HUMORHIST_LLM_API_KEY     REQUIRED. Your API key for a chat-completions API.
     HUMORHIST_LLM_BASE_URL    Optional. Default: https://inference-api.nousresearch.com/v1
     HUMORHIST_LLM_MODEL       Optional. Default: tencent/hy3:free
+    HUMORHIST_CHAR_LIMIT      Optional. Max length of generated post copy
+                              (default 280). Raise it (e.g. 280 -> 400) if you
+                              later post to a platform with a larger limit.
 
 The client speaks the OpenAI-compatible /chat/completions schema, so any
 provider that exposes that endpoint works — point BASE_URL at it and set the
@@ -199,6 +206,43 @@ content message ends with an **✏️ Add notes** button — tap it to add more 
 later: the bot prompts, you reply (or `/skip`), and the note is saved on the
 draft. Re-saving notes is idempotent and keeps the draft in the publish queue.
 
+### 4c. Post copy (generate + edit before posting)
+
+When you **approve** a draft (in the terminal review loop *or* from Telegram),
+humorhist immediately generates a first-draft post — a short, on-brief caption
+sized to `HUMORHIST_CHAR_LIMIT` (default 280) — and stores it on the `queue`
+row. You then refine that copy in place; nothing is posted anywhere until the
+(deferred) publisher exists.
+
+**CLI**
+
+    python -m humorhist.cli --db data/humorhist.sqlite copy show <id>     # copy + N/280
+    python -m humorhist.cli --db data/humorhist.sqlite copy edit <id>     # $EDITOR, or typed prompt
+    python -m humorhist.cli --db data/humorhist.sqlite copy regen <id>    # regenerate via LLM
+
+`edit` opens your `$EDITOR` (falls back to a typed prompt if none is
+available); it warns (does not block) if your edit exceeds the active limit.
+`regen` overwrites the stored copy with a fresh LLM draft.
+
+**Telegram**
+
+    /listqueue     list queued drafts, each with its copy + char count + open button
+    /viewcopy <id> open a draft's post copy with inline ✏️ Edit / 🔄 Regenerate
+
+Tap **✏️ Edit** and reply with new copy (or `/cancel` to keep the current);
+tap **🔄 Regenerate** to overwrite it with a fresh LLM draft. The stored copy is
+updated on `queue.post_copy`.
+
+**One-shot generation**
+
+    python scripts/fill_approved_copy.py
+
+Generates (or, with `--force`, regenerates) post copy for every approved,
+unpublished queue row that lacks it. Borrows the Nous OAuth token like the
+other scripts. Handy for backfilling copy on existing approved drafts.
+
+-------------------------------------------------------------------------------
+
 To just see the reviewed/pending breakdown without sending drafts:
 
     python -m humorhist.cli --db data/humorhist.sqlite telegram-status
@@ -248,7 +292,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-175 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
+209 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -256,14 +300,21 @@ The comic-angle prompt that most affects output quality lives in:
 
 Built and working: Phases 1-3 — harvest, screen, draft, the review/show
 commands, a Telegram review loop (approve/reject drafts from your phone via
-inline buttons, plus a notify nudge), and the **Phase 4 handoff**: approving a
-draft auto-enqueues it (`queue`), and a weekly `systemd` timer discovers new
+inline buttons, plus a notify nudge), the **Phase 4 handoff**: approving a
+draft auto-enqueues it (`queue`) **and generates a first-draft post (`queue.post_copy`)**
+you can edit in place, and a weekly `systemd` timer discovers new
 topics (harvest → screen → draft net-new) without creating duplicates.
+
+The **B+ copy loop** is done (2026-08-06): on approve, post copy is generated
+(≤280 chars, `HUMORHIST_CHAR_LIMIT`-driven) and is editable via the CLI
+`copy show/edit/regen` commands and Telegram `/listqueue` + `/viewcopy`
+(inline ✏️ Edit / 🔄 Regenerate). See "Phase 4: post copy" above.
 
 Not yet built:
 - Phase 4 publisher: turning a `queue` row into an actual posted item and
-  writing `posts` (auto-post to Mastodon/X vs generate post text for you to
-  paste — the `queue`/`posts` schema is ready for either).
+  writing `posts` (auto-post to Mastodon/X vs. just holding copy for you to
+  paste — the `queue`/`posts` schema is ready for either). The copy-generation
+  half is complete; only the destination is deferred.
 - Cross-source topic dedup: dedup is by source page id, not by topic, so the
   same event appearing on two Wikipedia lists yields two pool rows.
 
@@ -299,6 +350,7 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         render.py           shared plain-text draft renderer
         review.py           Phase 3 review state machine (transport-agnostic)
         telegram.py         Phase 3.3/3.4 Telegram transport (long-poll)
+        copywriter.py       post-copy generation + in-place edit (B+ copy loop)
         harvest/
             seed.py         curated CSV loader
             wikipedia_lists.py   Wikipedia list-page harvester
@@ -315,4 +367,5 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         regen_drafts.py     regenerate existing drafts + draft fresh ones
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
         weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
-    tests/                  pytest suite (172 tests)
+        fill_approved_copy.py  one-shot: generate post copy for approved+queued drafts
+    tests/                  pytest suite (209 tests)
