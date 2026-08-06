@@ -201,10 +201,16 @@ startup.
 **Browse and annotate approved drafts**
 
 Send **/listapproved** to see every draft you've greenlit. Tap a draft's
-**👁** button to open its full content (rendered just like the review view). The
-content message ends with an **✏️ Add notes** button — tap it to add more notes
+**👁** button to open its full content (rendered just like the review view).
+The content message ends with an **✏️ Add notes** button — tap it to add more notes
 later: the bot prompts, you reply (or `/skip`), and the note is saved on the
 draft. Re-saving notes is idempotent and keeps the draft in the publish queue.
+
+Opening an approved draft also shows its **post copy** with a live **N/280**
+char count, plus a **📝 Copy** button that jumps straight to the edit/regenerate
+view (see below) — so you can read and tweak the caption right from the draft
+view without switching to `/listqueue`. If the draft has no copy yet it shows
+`0/280` and a hint to generate one.
 
 ### 4c. Post copy (generate + edit before posting)
 
