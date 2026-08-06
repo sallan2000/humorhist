@@ -293,3 +293,57 @@ def test_telegram_review_sends_summary_first(tmp_path):
     assert len(stub.sent) == 2
     assert "Review progress" in stub.sent[0]["text"]
     assert "approve:d1" in str(stub.sent[1])
+
+
+class _RaisingOnDraftStub(tg.StubTelegram):
+    """Stub that fails to send one specific draft (simulates a Telegram 400)."""
+
+    def send_message(self, chat_id, text, reply_markup=None):
+        if "d1" in text:
+            raise RuntimeError("simulated 400")
+        return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+
+def test_send_pending_drafts_skips_failing_draft(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    _seed_pending(conn, "d2")
+    stub = _RaisingOnDraftStub(updates=[])
+    sent = tg.send_pending_drafts(conn, stub, "chat")
+    # d1 failed, d2 still sent; loop must not crash
+    assert len(sent) == 1
+    assert "approve:d2" in str(sent[0])
+
+
+def test_handle_text_fallback_when_single_awaiting(tmp_path):
+    conn = _fresh_db(tmp_path)
+    conn.execute("INSERT OR IGNORE INTO pool (id, title) VALUES ('p1','X')")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1','{}','{}','approved','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    stub = tg.StubTelegram()
+    awaiting = {"note1": "d1"}
+    upd = {"update_id": 5, "message": {"message_id": 10, "chat": {"id": "chat"},
+                                       "text": "tighten the third angle"}}
+    res = tg.handle_text(conn, stub, "chat", awaiting, upd)
+    assert res == {"noted": "d1"}
+    row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_notes"] == "tighten the third angle"
+
+
+def test_chunk_text_respects_limit():
+    text = "\n".join(f"line {i}" for i in range(5000))
+    chunks = tg._chunk_text(text, limit=1000)
+    assert all(len(c) <= 1000 for c in chunks)
+    assert "\n".join(chunks) == text  # no data lost across chunk boundaries
+    assert len(chunks) > 1
+
+
+def test_send_long_puts_buttons_on_last_chunk():
+    stub = tg.StubTelegram()
+    sent = tg._send_long(stub, "chat", "a\n" * 9000, reply_markup={"k": 1})
+    assert len(sent) > 1
+    assert all("reply_markup" not in m for m in sent[:-1])
+    assert sent[-1]["reply_markup"] == {"k": 1}

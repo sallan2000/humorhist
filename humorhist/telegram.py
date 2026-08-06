@@ -138,7 +138,7 @@ class TelegramClient:
     def send_message(
         self, chat_id: str, text: str, reply_markup: dict | None = None
     ) -> dict:
-        params: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        params: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         return self._call("sendMessage", params)
@@ -160,6 +160,39 @@ def _keyboard(draft_id: str) -> dict:
     }
 
 
+def _chunk_text(text: str, limit: int = 4000) -> list[str]:
+    """Split long text into <=limit-char chunks on line boundaries.
+
+    Telegram caps a message at 4096 chars; drafts can be far longer, so we send
+    the draft as several messages. Buttons go only on the final chunk.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = (current + "\n" + line) if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _send_long(
+    client: TelegramTransport, chat_id: str, text: str, reply_markup: dict | None = None
+) -> list[dict]:
+    """Send `text` as one or more messages; attach `reply_markup` to the last."""
+    chunks = _chunk_text(text)
+    sent: list[dict] = []
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if (i == len(chunks) - 1) else None
+        sent.append(client.send_message(chat_id, chunk, reply_markup=markup))
+    return sent
+
+
 # --------------------------------------------------------------------------- #
 # Review transport logic (transport-agnostic)                                 #
 # --------------------------------------------------------------------------- #
@@ -176,7 +209,12 @@ def send_pending_drafts(
     for row in review.pending_drafts(conn):
         pool = db.get_pool_item(conn, row["pool_id"])
         text = render.render_draft(row, pool)
-        sent.append(client.send_message(chat_id, text, reply_markup=_keyboard(row["id"])))
+        try:
+            sent.extend(
+                _send_long(client, chat_id, text, reply_markup=_keyboard(row["id"]))
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad draft must not kill the loop
+            print(f"[telegram] failed to send draft {row['id']}: {exc}")
     return sent
 
 
@@ -232,10 +270,16 @@ def handle_text(
     if not msg or "text" not in msg:
         return None
     reply_to = (msg.get("reply_to_message") or {}).get("message_id")
-    if reply_to not in awaiting:
-        return None
-    draft_id = awaiting.pop(reply_to)
     text = msg["text"].strip()
+    # Match by explicit reply first; fall back to the single open note prompt
+    # (people usually just type, rather than reply to the bot's prompt).
+    draft_id = None
+    if reply_to in awaiting:
+        draft_id = awaiting.pop(reply_to)
+    elif len(awaiting) == 1 and text != "/skip":
+        draft_id = awaiting.pop(next(iter(awaiting)))
+    if draft_id is None:
+        return None
     if text == "/skip":
         return {"skipped": draft_id}
     # re-apply with the same (approve) decision so notes persist idempotently
@@ -309,7 +353,7 @@ def format_reviewed_summary(summary: dict) -> str:
     Lists approved and rejected topics (the "reviewed" ones) plus the pending
     count, so the reviewer can see what's already been decided.
     """
-    lines = ["\U0001F4CA *Review progress*"]
+    lines = ["📊 Review progress"]
 
     approved = summary.get("approved", {})
     rejected = summary.get("rejected", {})
