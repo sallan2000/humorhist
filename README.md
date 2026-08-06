@@ -156,16 +156,29 @@ decided on.
 
 **Run it**
 
-    python -m humorhist.cli --db data/humorhist.sqlite telegram-review --once
+    python -m humorhist.cli --db data/humorhist.sqlite telegram-review
 
-Without `--once` it long-polls forever — run that as a durable `systemd --user`
-unit (see `scripts/telegram_review.py`) so it survives logout.
+It long-polls forever — run it as a durable `systemd --user` unit (see
+`scripts/telegram_review.py`) so it survives logout:
+
+    systemctl --user status humorhist-telegram-review.service
+    journalctl --user -u humorhist-telegram-review.service -f
+
+The bot **idles** until you send a command; it does **not** push drafts on
+startup.
+
+**Commands**
+
+    /reviewdraft   start reviewing pending drafts one by one (Approve/Reject + notes)
+    /listapproved  list every draft you've greenlit, each with an "add notes" button
+    /status        approved / rejected / pending breakdown
+    /help          this list
 
 **What you do in Telegram**
 
-1. The bot DM's a **📊 Review progress** block first: ✅ approved topics,
-   ❌ rejected topics, and ⏳ how many are still pending — so you can see at a
-   glance what's already been decided.
+1. Send **/reviewdraft** to begin. The bot DM's a **📊 Review progress** block
+   first: ✅ approved topics, ❌ rejected topics, and ⏳ how many are still
+   pending — so you can see at a glance what's already been decided.
 2. Then it sends **one draft at a time**. A draft may arrive as a few short
    messages (Telegram caps a message at 4096 chars, so long drafts are split);
    the **✅ Approve** / **❌ Reject** buttons are on the last message of that
@@ -176,15 +189,16 @@ unit (see `scripts/telegram_review.py`) so it survives logout.
    `editor_notes`; it does not change the decision.)
 4. **Only after you've decided that draft does the next one arrive.** One at a
    time — no wall of drafts. When all are done you get "✅ All caught up". If new
-   drafts are generated later, the loop picks them up automatically.
+   drafts are generated later, start another /reviewdraft to pick them up.
 
-To dump every pending draft at once instead (the old behaviour), add `--once`:
+**Browse and annotate approved drafts**
 
-    python -m humorhist.cli --db data/humorhist.sqlite telegram-review --once
+Send **/listapproved** to see every draft you've greenlit. Tap a draft's
+**📝** button to add more notes later — the bot prompts, you reply (or `/skip`),
+and the note is saved on the draft. Re-saving notes is idempotent and keeps the
+draft in the publish queue.
 
-**Quick status check from your phone**
-
-To just see the reviewed/pending breakdown without sending the drafts:
+To just see the reviewed/pending breakdown without sending drafts:
 
     python -m humorhist.cli --db data/humorhist.sqlite telegram-status
 
@@ -194,11 +208,14 @@ This DM's the same 📊 Review progress block on demand.
 
     python -m humorhist.cli --db data/humorhist.sqlite notify
 
-`scripts/regen_drafts.py` already calls this automatically when it finishes
-drafting, so you get pinged whenever fresh drafts are ready to review.
+`scripts/weekly_pipeline.py` and `scripts/regen_drafts.py` already call this
+automatically when they finish drafting, so you get pinged whenever fresh drafts
+are ready to review.
 
-No webhook is used — the loop long-polls `getUpdates`, which matters because the
-host sits behind Cloudflare/NAT and does not expose ports.
+No webhook is used — the bot long-polls `getUpdates`, which matters because the
+host sits behind Cloudflare/NAT and does not expose ports. (Only one process may
+poll `getUpdates` at a time — don't run the `getUpdates` curl while the review
+loop is running, or it will show empty.)
 
 ### 5. Health check
 
@@ -230,7 +247,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-172 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
+175 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
 
 -------------------------------------------------------------------------------
 ## Project status
