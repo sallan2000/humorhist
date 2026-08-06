@@ -268,3 +268,12 @@ def test_notify_errors_without_token(dbpath, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 2
     assert "HUMORHIST_TELEGRAM_BOT_TOKEN" in out
+
+
+def test_telegram_status_errors_without_token(dbpath, monkeypatch, capsys):
+    monkeypatch.delenv("HUMORHIST_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("HUMORHIST_TELEGRAM_CHAT_ID", raising=False)
+    rc = main(["--db", dbpath, "telegram-status"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "HUMORHIST_TELEGRAM_BOT_TOKEN" in out

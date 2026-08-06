@@ -265,6 +265,25 @@ def cmd_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_telegram_status(args: argparse.Namespace) -> int:
+    """Send a Telegram message listing approved/rejected/pending topics."""
+    import humorhist.telegram as tg
+
+    chat_id = args.chat_id or os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
+    if not os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
+        print("error: HUMORHIST_TELEGRAM_BOT_TOKEN is not set")
+        return 2
+    if not chat_id:
+        print("error: need --chat-id or HUMORHIST_TELEGRAM_CHAT_ID")
+        return 2
+
+    conn = _open_db(args.db)
+    client = tg.TelegramClient()
+    text = tg.send_reviewed_summary(conn, client, chat_id)
+    print(text)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="humorhist", description=__doc__)
     p.add_argument("--db", default=DEFAULT_DB, help="path to the sqlite database")
@@ -303,6 +322,10 @@ def build_parser() -> argparse.ArgumentParser:
     nt = sub.add_parser("notify", help="Phase 3.4: Telegram nudge with pending count")
     nt.add_argument("--chat-id", default=None, help="Telegram chat id to DM")
     nt.set_defaults(func=cmd_notify)
+
+    ts = sub.add_parser("telegram-status", help="DM reviewed/pending topic breakdown")
+    ts.add_argument("--chat-id", default=None, help="Telegram chat id to DM")
+    ts.set_defaults(func=cmd_telegram_status)
 
     return p
 

@@ -258,6 +258,7 @@ def run_review_bot(
     by tests and one-shot CLI runs). ``once=False`` long-polls forever for the
     durable systemd runner (interrupt the process to stop).
     """
+    send_reviewed_summary(conn, client, chat_id)
     send_pending_drafts(conn, client, chat_id)
     awaiting: dict[int, str] = {}
     decided = 0
@@ -297,6 +298,43 @@ def notify_new_drafts(conn: db.Connection, client: TelegramTransport, chat_id: s
         return 0
     client.send_message(
         chat_id,
-        f"📝 {n} draft(s) awaiting review. Run `review` or check Telegram to decide.",
+        f"\U0001F4DD {n} draft(s) awaiting review. Run `review` or check Telegram to decide.",
     )
     return n
+
+
+def format_reviewed_summary(summary: dict) -> str:
+    """Render the reviewed/pending breakdown as a Telegram-friendly text block.
+
+    Lists approved and rejected topics (the "reviewed" ones) plus the pending
+    count, so the reviewer can see what's already been decided.
+    """
+    lines = ["\U0001F4CA *Review progress*"]
+
+    approved = summary.get("approved", {})
+    rejected = summary.get("rejected", {})
+    pending = summary.get("pending", {})
+
+    if approved["titles"]:
+        lines.append(f"\n✅ Approved ({approved['count']}):")
+        lines.extend(f"  • {t}" for t in approved["titles"])
+    else:
+        lines.append(f"\n✅ Approved: 0")
+
+    if rejected["titles"]:
+        lines.append(f"\n❌ Rejected ({rejected['count']}):")
+        lines.extend(f"  • {t}" for t in rejected["titles"])
+    else:
+        lines.append(f"\n❌ Rejected: 0")
+
+    lines.append(f"\n⏳ Pending: {pending['count']}")
+    return "\n".join(lines)
+
+
+def send_reviewed_summary(
+    conn: db.Connection, client: TelegramTransport, chat_id: str
+) -> str:
+    """DM the reviewer the approved/rejected/pending breakdown. Returns the text."""
+    text = format_reviewed_summary(review.reviewed_summary(conn))
+    client.send_message(chat_id, text)
+    return text

@@ -32,6 +32,36 @@ def pending_drafts(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def reviewed_summary(conn: sqlite3.Connection) -> dict:
+    """Return a review-progress snapshot keyed by status.
+
+    For each of pending/approved/rejected, gives a count and the list of topic
+    titles (pool.title) so a reviewer can see what's been decided. Approved and
+    rejected rows are the "reviewed" topics; pending are still open.
+    """
+    rows = conn.execute(
+        """
+        SELECT d.status AS status, p.title AS title
+        FROM drafts d
+        LEFT JOIN pool p ON p.id = d.pool_id
+        ORDER BY d.status, p.title
+        """
+    ).fetchall()
+
+    summary: dict[str, dict] = {
+        "pending": {"count": 0, "titles": []},
+        "approved": {"count": 0, "titles": []},
+        "rejected": {"count": 0, "titles": []},
+    }
+    for r in rows:
+        status = r["status"]
+        if status not in summary:
+            continue
+        summary[status]["count"] += 1
+        summary[status]["titles"].append(r["title"] or "(unknown)")
+    return summary
+
+
 def apply_review(
     conn: sqlite3.Connection,
     draft_id: str,

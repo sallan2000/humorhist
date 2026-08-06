@@ -193,9 +193,11 @@ def test_run_review_bot_no_pending_sends_notice(tmp_path):
 
     decided = tg.run_review_bot(conn, stub, "chat", once=True)
 
-    # no pending drafts, no updates -> nothing decided, nothing sent
+    # no pending drafts, no updates -> nothing decided; but the loop now opens
+    # with a (silent-when-empty) reviewed-summary message.
     assert decided == 0
-    assert stub.sent == []
+    assert len(stub.sent) == 1
+    assert "Review progress" in stub.sent[0]["text"]
 
 
 def test_notify_new_drafts_used_for_nudge(tmp_path):
@@ -235,3 +237,59 @@ def test_notify_new_drafts_silent_when_empty(tmp_path):
     n = tg.notify_new_drafts(conn, stub, "chat")
     assert n == 0
     assert stub.sent == []
+
+
+# --- reviewed_summary --------------------------------------------------------
+
+
+def _seed_with_statuses(tmp_path):
+    conn = _fresh_db(tmp_path)
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p1', 'Emu War', 'drafted')")
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p2', 'Acoustic Kitty', 'drafted')")
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p3', 'Napoleons Rabbits', 'drafted')")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) VALUES ('d1','p1','{}','{}','approved','2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) VALUES ('d2','p2','{}','{}','rejected','2026-01-02T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) VALUES ('d3','p3','{}','{}','pending','2026-01-03T00:00:00+00:00')"
+    )
+    conn.commit()
+    return conn
+
+
+def test_reviewed_summary_counts_and_titles(tmp_path):
+    conn = _seed_with_statuses(tmp_path)
+    s = review.reviewed_summary(conn)
+    assert s["approved"]["count"] == 1 and s["approved"]["titles"] == ["Emu War"]
+    assert s["rejected"]["count"] == 1 and s["rejected"]["titles"] == ["Acoustic Kitty"]
+    assert s["pending"]["count"] == 1 and s["pending"]["titles"] == ["Napoleons Rabbits"]
+
+
+def test_format_reviewed_summary_includes_all_sections(tmp_path):
+    conn = _seed_with_statuses(tmp_path)
+    text = tg.format_reviewed_summary(review.reviewed_summary(conn))
+    assert "Emu War" in text
+    assert "Acoustic Kitty" in text
+    assert "Approved" in text and "Rejected" in text and "Pending: 1" in text
+
+
+def test_send_reviewed_summary_dms_breakdown(tmp_path):
+    conn = _seed_with_statuses(tmp_path)
+    stub = tg.StubTelegram()
+    text = tg.send_reviewed_summary(conn, stub, "chat")
+    assert len(stub.sent) == 1
+    assert "Emu War" in text and "Acoustic Kitty" in text
+
+
+def test_telegram_review_sends_summary_first(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram(updates=[])
+    tg.run_review_bot(conn, stub, "chat", once=True)
+    # first message is the summary, second is the pending draft
+    assert len(stub.sent) == 2
+    assert "Review progress" in stub.sent[0]["text"]
+    assert "approve:d1" in str(stub.sent[1])
