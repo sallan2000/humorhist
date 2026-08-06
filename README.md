@@ -166,14 +166,21 @@ unit (see `scripts/telegram_review.py`) so it survives logout.
 1. The bot DM's a **📊 Review progress** block first: ✅ approved topics,
    ❌ rejected topics, and ⏳ how many are still pending — so you can see at a
    glance what's already been decided.
-2. Then it sends each pending draft as its own message, with two inline buttons:
-   **✅ Approve** and **❌ Reject**. Tap one.
+2. Then it sends **one draft at a time**. A draft may arrive as a few short
+   messages (Telegram caps a message at 4096 chars, so long drafts are split);
+   the **✅ Approve** / **❌ Reject** buttons are on the last message of that
+   draft. Tap one.
 3. Tapping a button saves the decision to the database immediately. The bot then
-   replies asking for **optional notes** — type a short edit note and send it, or
-   reply `/skip` to leave no note. (The note is attached to the draft as
+   asks for **optional notes** — type a short edit note and send it, or reply
+   `/skip` to leave no note. (The note is attached to the draft as
    `editor_notes`; it does not change the decision.)
-4. Repeat for each draft. When you're done, the pending count in the progress
-   block drops.
+4. **Only after you've decided that draft does the next one arrive.** One at a
+   time — no wall of drafts. When all are done you get "✅ All caught up". If new
+   drafts are generated later, the loop picks them up automatically.
+
+To dump every pending draft at once instead (the old behaviour), add `--once`:
+
+    python -m humorhist.cli --db data/humorhist.sqlite telegram-review --once
 
 **Quick status check from your phone**
 
@@ -223,7 +230,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-150 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
+165 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -267,4 +274,4 @@ yourself, and mark the draft approved in the DB.
         rescreen_60.py      one-off: re-score the originally-screened rows
         regen_drafts.py     regenerate existing drafts + draft fresh ones
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
-    tests/                  pytest suite (150 tests)
+    tests/                  pytest suite (165 tests)
