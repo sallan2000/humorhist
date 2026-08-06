@@ -18,6 +18,9 @@ from pathlib import Path
 
 import humorhist.db as db
 import humorhist.render as render
+import humorhist.env as env  # noqa: F401  (loads local .env into os.environ)
+
+env.load_env()
 
 DEFAULT_DB = os.environ.get(
     "HUMORHIST_DB", str(Path.home() / "projects" / "humorhist" / "data" / "humorhist.sqlite")

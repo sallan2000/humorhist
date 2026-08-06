@@ -29,6 +29,12 @@ LOG = REPO / "data" / "regen_drafts.log"
 
 sys.path.insert(0, str(REPO))
 
+# Load a local .env (gitignored) into os.environ so HUMORHIST_TELEGRAM_* work
+# without manual exports.
+import humorhist.env as env  # noqa: E402
+
+env.load_env()
+
 os.environ.setdefault("HUMORHIST_LLM_MODEL", "tencent/hy3:free")
 
 

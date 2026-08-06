@@ -23,6 +23,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+# Load a local .env (gitignored) into os.environ before anything reads config.
+import humorhist.env as env  # noqa: E402
+
+env.load_env()
+
 os.environ.setdefault("HUMORHIST_LLM_MODEL", "tencent/hy3:free")
 
 
