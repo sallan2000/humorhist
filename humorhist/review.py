@@ -112,6 +112,21 @@ def apply_review(
         ),
     )
     conn.commit()
+    # Keep the Phase 4 queue consistent with the decision: an approval is
+    # immediately ready to publish; a rejection (or an approve->reject flip)
+    # must not linger in the queue.
+    if decision == APPROVE:
+        enqueue_approved(conn)
+    else:
+        remove_from_queue(conn, draft_id)
+
+
+def remove_from_queue(conn: sqlite3.Connection, draft_id: str) -> int:
+    """Delete any queue row for `draft_id` (e.g. after a reject/flip). Returns count removed."""
+    cur = conn.execute("DELETE FROM queue WHERE draft_id = ?", (draft_id,))
+    if cur.rowcount:
+        conn.commit()
+    return cur.rowcount
 
 
 def enqueue_approved(conn: sqlite3.Connection, scheduled_for: str | None = None) -> int:

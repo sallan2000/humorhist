@@ -196,3 +196,21 @@ def test_queued_drafts_lists_unpublished_oldest_first(tmp_path):
     assert [r["draft_id"] for r in rows] == ["d1", "d2"]
     assert rows[0]["title"] == "Pool X"
     assert rows[0]["published"] == 0
+
+
+def test_apply_review_approve_auto_enqueues(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    review.apply_review(conn, "d1", decision="approve")
+    q = {r["draft_id"] for r in conn.execute("SELECT draft_id FROM queue")}
+    assert q == {"d1"}
+
+
+def test_apply_review_reject_removes_from_queue(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    review.apply_review(conn, "d1", decision="approve")
+    assert {r["draft_id"] for r in conn.execute("SELECT draft_id FROM queue")} == {"d1"}
+    # flip to reject -> queue row must be cleaned up
+    review.apply_review(conn, "d1", decision="reject")
+    assert list(conn.execute("SELECT * FROM queue")) == []
