@@ -134,30 +134,61 @@ It walks every `pending` draft, shows it, and prompts `[a/r/s]`
 ### 4b. Review from Telegram (optional)
 
 Instead of the terminal, run a Telegram review loop and approve/reject from
-your phone with inline buttons.
+your phone with inline buttons, and see at a glance which topics you've already
+decided on.
 
-1. Create a bot via @BotFather and copy the token.
-2. Message the bot once; your chat id is the numeric id (you can get it from
-   the bot's `getUpdates`, or set it directly).
-3. Put both in a local `.env` (gitignored — never commit it):
+**One-time setup**
+
+1. Create a bot via @BotFather and copy the token it gives you.
+2. Find its username (also from @BotFather) and **open that bot in Telegram /
+   send it any message** — this registers your chat so the bot can DM you.
+3. Get your numeric chat id. After messaging the bot, run:
+
+       curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" \
+         | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['result'][0]['message']['chat']['id'] if r.get('result') else 'message the bot first')"
+
+   (Only one process may poll `getUpdates` at a time — don't run this curl while
+   the review loop is running, or it will show empty.)
+4. Put the token and chat id in a local `.env` (gitignored — never commit it):
 
        HUMORHIST_TELEGRAM_BOT_TOKEN=123456:ABC...
        HUMORHIST_TELEGRAM_CHAT_ID=987654321
 
-4. Run it:
+**Run it**
 
-       python -m humorhist.cli --db data/humorhist.sqlite telegram-review --once
+    python -m humorhist.cli --db data/humorhist.sqlite telegram-review --once
 
-   Without `--once` it long-polls forever — run that as a durable
-   `systemd --user` unit (see `scripts/telegram_review.py`) so it survives
-   logout. Each pending draft is sent with Approve/Reject buttons; tapping one
-   persists the decision, then you can reply with optional notes (or `/skip`).
+Without `--once` it long-polls forever — run that as a durable `systemd --user`
+unit (see `scripts/telegram_review.py`) so it survives logout.
 
-5. Nudge yourself when new drafts are generated:
+**What you do in Telegram**
 
-       python -m humorhist.cli --db data/humorhist.sqlite notify
+1. The bot DM's a **📊 Review progress** block first: ✅ approved topics,
+   ❌ rejected topics, and ⏳ how many are still pending — so you can see at a
+   glance what's already been decided.
+2. Then it sends each pending draft as its own message, with two inline buttons:
+   **✅ Approve** and **❌ Reject**. Tap one.
+3. Tapping a button saves the decision to the database immediately. The bot then
+   replies asking for **optional notes** — type a short edit note and send it, or
+   reply `/skip` to leave no note. (The note is attached to the draft as
+   `editor_notes`; it does not change the decision.)
+4. Repeat for each draft. When you're done, the pending count in the progress
+   block drops.
 
-   `scripts/regen_drafts.py` already calls this automatically when it finishes.
+**Quick status check from your phone**
+
+To just see the reviewed/pending breakdown without sending the drafts:
+
+    python -m humorhist.cli --db data/humorhist.sqlite telegram-status
+
+This DM's the same 📊 Review progress block on demand.
+
+**Nudge when new drafts are generated**
+
+    python -m humorhist.cli --db data/humorhist.sqlite notify
+
+`scripts/regen_drafts.py` already calls this automatically when it finishes
+drafting, so you get pinged whenever fresh drafts are ready to review.
 
 No webhook is used — the loop long-polls `getUpdates`, which matters because the
 host sits behind Cloudflare/NAT and does not expose ports.
