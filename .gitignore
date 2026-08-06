@@ -8,3 +8,7 @@ data/*.log
 
 # internal agent scratch notes (not for the repo)
 RESUME.md
+
+# local secrets / env (NEVER commit tokens)
+.env
+.env.*

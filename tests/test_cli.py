@@ -247,3 +247,24 @@ def test_review_empty_queue_exits_clean(dbpath, monkeypatch, capsys):
     rc, out = _run_review(dbpath, [], monkeypatch, capsys)
     assert rc == 0
     assert "no pending" in out.lower() or "nothing to review" in out.lower()
+
+
+# --- telegram commands (Phase 3.3/3.4) ---------------------------------------
+
+
+def test_telegram_review_errors_without_token(dbpath, monkeypatch, capsys):
+    monkeypatch.delenv("HUMORHIST_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("HUMORHIST_TELEGRAM_CHAT_ID", raising=False)
+    rc = main(["--db", dbpath, "telegram-review", "--once"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "HUMORHIST_TELEGRAM_BOT_TOKEN" in out
+
+
+def test_notify_errors_without_token(dbpath, monkeypatch, capsys):
+    monkeypatch.delenv("HUMORHIST_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("HUMORHIST_TELEGRAM_CHAT_ID", raising=False)
+    rc = main(["--db", dbpath, "notify"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "HUMORHIST_TELEGRAM_BOT_TOKEN" in out

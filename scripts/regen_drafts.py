@@ -113,6 +113,17 @@ def main() -> int:
         "SELECT COUNT(*) n FROM drafts WHERE status='pending'"
     ).fetchone()["n"]
     log(f"DONE. total drafts={total} pending={pending}")
+
+    # --- Phase 3.4 nudge: tell the reviewer new drafts await (best effort) ---
+    chat_id = os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
+    if pending and chat_id and os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
+        try:
+            from humorhist import telegram as tg
+
+            n = tg.notify_new_drafts(conn, tg.TelegramClient(), chat_id)
+            log(f"NOTIFY: nudged Telegram with {n} pending draft(s)")
+        except Exception as exc:  # noqa: BLE001 - nudge must never break the run
+            log(f"NOTIFY: skipped ({str(exc)[:120]})")
     return 0
 
 

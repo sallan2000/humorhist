@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import humorhist.db as db
+import humorhist.render as render
 
 DEFAULT_DB = os.environ.get(
     "HUMORHIST_DB", str(Path.home() / "projects" / "humorhist" / "data" / "humorhist.sqlite")
@@ -124,60 +125,16 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def render_draft(row, pool=None) -> str:
-    """Render a draft (brief + angles) as plain text for the terminal/transport.
+    """Back-compat alias for humorhist.render.render_draft.
 
-    Transport-agnostic: the CLI review loop and any future Telegram transport
-    both call this so the presentation stays identical everywhere. ``pool`` is
-    optional; cmd_show passes it to avoid a second lookup.
+    Kept so external callers (and the Telegram transport) can import the
+    renderer from either module.
     """
-    return _render_draft_with_pool(row, pool)
+    return render.render_draft(row, pool)
 
 
 def _render_draft_with_pool(row, pool) -> str:
-    title = pool["title"] if pool else "(unknown)"
-    year = pool["year"] if pool else ""
-    brief = json.loads(row["brief_json"] or "{}")
-    angles = json.loads(row["angles_json"] or "{}")
-
-    out: list[str] = []
-    out.append("=" * 70)
-    out.append(f"DRAFT {row['id']} — {title} ({year})")
-    out.append(f"status: {row['status']}")
-    out.append("=" * 70)
-
-    out.append("\n--- VERIFIED FACTS ---")
-    for f in brief.get("verified_facts", []):
-        out.append(f"  • {f}")
-
-    if brief.get("misconceptions"):
-        out.append("\n--- MISCONCEPTIONS (popular version vs record) ---")
-        for m in brief["misconceptions"]:
-            out.append(f"  ! {m}")
-
-    if brief.get("caveats"):
-        out.append("\n--- CAVEATS ---")
-        for c in brief["caveats"]:
-            out.append(f"  ? {c}")
-
-    out.append("\n--- COMIC ANGLES ---")
-    for i, a in enumerate(angles.get("angles", []), 1):
-        out.append(f"\n  {i}. {a.get('angle_name', '?')}")
-        out.append(f"     setup   : {a.get('setup', '')}")
-        out.append(f"     lands   : {a.get('why_it_lands', '')}")
-        out.append(f"     pitfalls: {a.get('pitfalls', '')}")
-        for rm in a.get("raw_material", []):
-            out.append(f"     raw     : {rm}")
-
-    if angles.get("strongest_single_detail"):
-        out.append(f"\n--- STRONGEST DETAIL ---\n  {angles['strongest_single_detail']}")
-    if angles.get("suggested_hook"):
-        out.append(f"\n--- SUGGESTED HOOK (factual, not a joke) ---\n  {angles['suggested_hook']}")
-
-    out.append("\n--- SOURCES ---")
-    for s in brief.get("sources", []):
-        out.append(f"  {s.get('title', '')} — {s.get('url', '')}")
-    out.append("")
-    return "\n".join(out)
+    return render.render_draft(row, pool)
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -258,6 +215,53 @@ def _prompt_choice(prompt: str, mapping: dict[str, str]) -> str:
         print(f"  enter one of: {', '.join(mapping)}")
 
 
+def cmd_telegram_review(args: argparse.Namespace) -> int:
+    """Run the Telegram review loop (Phase 3.3).
+
+    Sends pending drafts to Telegram with Approve/Reject buttons and processes
+    taps. With --once it processes queued updates and exits (one-shot); without
+    it, it long-polls forever (run as a durable systemd --user unit).
+    """
+    import humorhist.telegram as tg
+
+    chat_id = args.chat_id or os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
+    if not os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
+        print("error: HUMORHIST_TELEGRAM_BOT_TOKEN is not set")
+        return 2
+    if not chat_id:
+        print("error: need --chat-id or HUMORHIST_TELEGRAM_CHAT_ID")
+        return 2
+
+    conn = _open_db(args.db)
+    client = tg.TelegramClient()
+    if args.once:
+        decided = tg.run_review_bot(conn, client, chat_id, once=True)
+        print(f"Telegram review (once): {decided} decision(s) processed.")
+        return 0
+    print("Telegram review loop started (Ctrl-C to stop)...")
+    tg.run_review_bot(conn, client, chat_id)
+    return 0
+
+
+def cmd_notify(args: argparse.Namespace) -> int:
+    """Send a Telegram nudge with the current pending-draft count (Phase 3.4)."""
+    import humorhist.telegram as tg
+
+    chat_id = args.chat_id or os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
+    if not os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
+        print("error: HUMORHIST_TELEGRAM_BOT_TOKEN is not set")
+        return 2
+    if not chat_id:
+        print("error: need --chat-id or HUMORHIST_TELEGRAM_CHAT_ID")
+        return 2
+
+    conn = _open_db(args.db)
+    client = tg.TelegramClient()
+    n = tg.notify_new_drafts(conn, client, chat_id)
+    print(f"Notified: {n} draft(s) awaiting review.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="humorhist", description=__doc__)
     p.add_argument("--db", default=DEFAULT_DB, help="path to the sqlite database")
@@ -287,6 +291,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     rv = sub.add_parser("review", help="Phase 3: approve/reject pending drafts")
     rv.set_defaults(func=cmd_review)
+
+    tr = sub.add_parser("telegram-review", help="Phase 3.3: Telegram review loop")
+    tr.add_argument("--chat-id", default=None, help="Telegram chat id to DM")
+    tr.add_argument("--once", action="store_true", help="process queued updates and exit")
+    tr.set_defaults(func=cmd_telegram_review)
+
+    nt = sub.add_parser("notify", help="Phase 3.4: Telegram nudge with pending count")
+    nt.add_argument("--chat-id", default=None, help="Telegram chat id to DM")
+    nt.set_defaults(func=cmd_notify)
 
     return p
 
