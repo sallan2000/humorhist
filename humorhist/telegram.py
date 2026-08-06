@@ -431,17 +431,42 @@ def send_draft_content(
 
     Used when the reviewer opens an approved draft from /listapproved. The last
     chunk carries an inline 'Add notes' button (callback ``notes:<id>``) so they
-    can annotate it without leaving Telegram.
+    can annotate it without leaving Telegram. It also appends the current post
+    copy (with its ``N/limit`` char count) and a '📝 Copy' button that opens the
+    edit/regenerate view — so opening an approved draft shows the caption too.
     """
+    from humorhist.copywriter import char_limit
+
     row = conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
     if row is None:
         client.send_message(chat_id, f"No such draft: {draft_id}")
         return []
     pool = db.get_pool_item(conn, row["pool_id"])
     text = render.render_draft(row, pool)
+
+    q = conn.execute(
+        "SELECT post_copy FROM queue WHERE draft_id = ?", (draft_id,)
+    ).fetchone()
+    limit = char_limit()
+    copy = (dict(q) if q else {}).get("post_copy") if q else None
+    if copy:
+        copy_block = (
+            f"\n\n📝 POST COPY ({len(copy)}/{limit} chars):\n{copy}\n"
+            "(tap 📝 Copy to edit or regenerate)"
+        )
+    else:
+        copy_block = (
+            f"\n\n📝 POST COPY: (none yet — 0/{limit} chars)\n"
+            "(tap 📝 Copy to generate / edit)"
+        )
+    text = text + copy_block
+
     notes_btn = {
         "inline_keyboard": [
-            [{"text": "✏️ Add notes", "callback_data": f"notes:{draft_id}"}]
+            [
+                {"text": "✏️ Add notes", "callback_data": f"notes:{draft_id}"},
+                {"text": "📝 Copy", "callback_data": f"copy:{draft_id}"},
+            ]
         ]
     }
     try:

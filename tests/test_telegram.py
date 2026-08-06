@@ -461,6 +461,35 @@ def test_listapproved_opens_draft_content_with_add_notes_button(tmp_path):
     assert "Emu War" in full
 
 
+def test_send_draft_content_shows_post_copy_and_copy_button(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, draft_id="d1", with_copy=True)
+    stub = tg.StubTelegram()
+    tg.send_draft_content(conn, stub, "chat", "d1")
+    full = "\n".join(m["text"] for m in stub.sent)
+    # post copy + char count visible when opening an approved draft
+    assert "POST COPY" in full
+    assert "France invaded" in full  # the seeded copy text
+    assert "/280" in full  # char count against the limit
+    # a button to open the edit/regenerate copy view
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0]
+    cbs = {b["callback_data"] for b in kb}
+    assert "copy:d1" in cbs  # opens send_copy_content (edit/regen)
+    assert "notes:d1" in cbs  # existing add-notes button preserved
+
+
+def test_send_draft_content_copy_absent_shows_zero_count(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, draft_id="d1", with_copy=False)
+    stub = tg.StubTelegram()
+    tg.send_draft_content(conn, stub, "chat", "d1")
+    full = "\n".join(m["text"] for m in stub.sent)
+    assert "POST COPY" in full
+    assert "0/280" in full  # no copy yet, counts as zero against the limit
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0]
+    assert any(b["callback_data"] == "copy:d1" for b in kb)
+
+
 def test_send_draft_content_missing_draft_is_safe(tmp_path):
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram()
