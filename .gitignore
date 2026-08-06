@@ -5,3 +5,6 @@ data/*.sqlite
 
 # runtime logs (no secrets, but not code)
 data/*.log
+
+# internal agent scratch notes (not for the repo)
+RESUME.md
