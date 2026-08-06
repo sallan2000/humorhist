@@ -31,7 +31,6 @@ GOOD_BRIEF = {
     "caveats": ["Kill counts were self-reported and are disputed."],
     "misconceptions": ["Popularly told as 'the emus won a war'; no war was declared."],
     "sources": [{"title": "Emu War", "url": "https://en.wikipedia.org/wiki/Emu_War"}],
-    "sensitivity_flags": ["animal death"],
 }
 
 ITEM = {
@@ -112,7 +111,6 @@ def test_validate_brief_missing_sources_raises():
         "caveats",
         "misconceptions",
         "sources",
-        "sensitivity_flags",
     ],
 )
 def test_validate_brief_missing_key_raises(key):
@@ -133,12 +131,6 @@ def test_validate_brief_coerces_string_to_list():
     brief = good_brief()
     brief["caveats"] = "Kill counts are disputed."
     assert validate_brief(brief)["caveats"] == ["Kill counts are disputed."]
-
-
-def test_validate_brief_normalises_empty_sensitivity_flags():
-    brief = good_brief()
-    brief["sensitivity_flags"] = []
-    assert validate_brief(brief)["sensitivity_flags"] == ["none"]
 
 
 def test_validate_brief_rejects_empty_verified_facts():
@@ -193,3 +185,11 @@ def test_factcheck_raises_after_two_failures():
 def test_system_prompt_mentions_misconceptions_and_caveats():
     assert "misconceptions" in FACTCHECK_SYSTEM_PROMPT
     assert "caveats" in FACTCHECK_SYSTEM_PROMPT
+
+
+def test_system_prompt_has_no_sensitivity_flagging():
+    """Regression: the fact-check prompt must not ask for sensitivity flags."""
+    p = FACTCHECK_SYSTEM_PROMPT.lower()
+    assert "sensitivity_flags" not in p
+    assert "requiring care" not in p
+    assert "colonial violence" not in p

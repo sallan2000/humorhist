@@ -32,7 +32,6 @@ BRIEF = {
     "sources": [
         {"title": "Wikipedia: Emu War", "url": "https://en.wikipedia.org/wiki/Emu_War"}
     ],
-    "sensitivity_flags": ["none"],
 }
 
 ANGLES = {

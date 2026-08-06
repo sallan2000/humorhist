@@ -163,10 +163,6 @@ def cmd_show(args: argparse.Namespace) -> int:
         for c in brief["caveats"]:
             print(f"  ? {c}")
 
-    flags = brief.get("sensitivity_flags", [])
-    if flags and flags != ["none"]:
-        print(f"\n--- SENSITIVITY: {', '.join(flags)} ---")
-
     print("\n--- COMIC ANGLES ---")
     for i, a in enumerate(angles.get("angles", []), 1):
         print(f"\n  {i}. {a.get('angle_name', '?')}")

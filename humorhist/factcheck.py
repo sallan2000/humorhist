@@ -33,7 +33,6 @@ REQUIRED_KEYS = (
     "caveats",
     "misconceptions",
     "sources",
-    "sensitivity_flags",
 )
 
 _LIST_KEYS = (
@@ -41,7 +40,6 @@ _LIST_KEYS = (
     "key_figures",
     "caveats",
     "misconceptions",
-    "sensitivity_flags",
 )
 
 # Maximum complete_json attempts (initial attempt + one corrective retry).
@@ -78,9 +76,6 @@ conflict. If the single most entertaining element of the story is the part \
 that is NOT well documented, say so EXPLICITLY here. This is the most \
 important field in the whole brief.
 - "sources": at least one {"title": ..., "url": ...} entry.
-- "sensitivity_flags": note if the event involves death, colonial violence, \
-mental illness, or other material requiring care. Use ["none"] if genuinely \
-nothing applies.
 
 Output STRICT JSON only, matching exactly this schema, with no commentary:
 {
@@ -89,8 +84,7 @@ Output STRICT JSON only, matching exactly this schema, with no commentary:
   "key_figures": ["..."],
   "caveats": ["..."],
   "misconceptions": ["..."],
-  "sources": [{"title": "...", "url": "..."}],
-  "sensitivity_flags": ["..."]
+  "sources": [{"title": "...", "url": "..."}]
 }
 """
 
@@ -255,9 +249,6 @@ def validate_brief(brief: Any) -> dict:
             raise FactCheckError("each sources entry needs a non-empty url")
         clean_sources.append({"title": title.strip(), "url": url.strip()})
     out["sources"] = clean_sources
-
-    flags = _as_list_of_str(brief["sensitivity_flags"], "sensitivity_flags")
-    out["sensitivity_flags"] = flags or ["none"]
 
     return out
 

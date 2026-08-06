@@ -60,9 +60,6 @@ EMU_BRIEF = {
         "Wikipedia: Emu War",
         "The Sydney Morning Herald archival reports, 1932",
     ],
-    "sensitivity_flags": [
-        "None significant; afford the farmers' crop losses a little sympathy.",
-    ],
 }
 
 
