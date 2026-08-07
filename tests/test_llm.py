@@ -11,9 +11,12 @@ import respx
 from humorhist.llm import (
     DEFAULT_BASE_URL,
     LLMError,
+    LLMUnavailable,
     NousClient,
     StubClient,
     extract_json,
+    nous_auth_token,
+    resilient_client,
 )
 
 
@@ -154,3 +157,50 @@ def test_nous_client_reads_env(monkeypatch):
     client = NousClient()
     assert client.api_key == "env-key"
     assert client.model == "env-model"
+
+
+# --- resilient_client (unattended credential resolution) -------------------
+
+
+def test_resilient_client_prefers_static_api_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "static-key")
+    # with a static key set, a missing/garbage auth.json must not break resolution
+    monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
+    client = resilient_client()
+    assert isinstance(client, NousClient)
+    assert client.api_key == "static-key"
+
+
+def test_resilient_client_falls_back_to_nous_auth_token(monkeypatch, tmp_path):
+    monkeypatch.delenv("HUMORHIST_LLM_API_KEY", raising=False)
+    hermes = tmp_path / ".hermes"
+    hermes.mkdir()
+    (hermes / "auth.json").write_text(
+        json.dumps({"providers": {"nous": {"access_token": "oauth-token"}}})
+    )
+    monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
+    client = resilient_client()
+    assert client.api_key == "oauth-token"
+
+
+def test_resilient_client_raises_llm_unavailable_with_no_creds(monkeypatch, tmp_path):
+    monkeypatch.delenv("HUMORHIST_LLM_API_KEY", raising=False)
+    # no .hermes/auth.json present
+    monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
+    with pytest.raises(LLMUnavailable):
+        resilient_client()
+
+
+def test_nous_auth_token_reads_file(monkeypatch, tmp_path):
+    hermes = tmp_path / ".hermes"
+    hermes.mkdir()
+    (hermes / "auth.json").write_text(
+        json.dumps({"providers": {"nous": {"access_token": "abc"}}})
+    )
+    monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
+    assert nous_auth_token() == "abc"
+
+
+def test_nous_auth_token_returns_none_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
+    assert nous_auth_token() is None

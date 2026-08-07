@@ -626,6 +626,55 @@ def test_send_copy_content_carries_edit_regen_buttons(tmp_path):
     assert "France invaded" in stub.sent[-1]["text"]
 
 
+def test_regencopy_without_llm_sends_clean_unavailable(tmp_path, monkeypatch):
+    """A Telegram-only user with no LLM key must get a friendly message, not a
+    raw traceback, when they tap Regenerate copy."""
+    from humorhist.llm import LLMUnavailable
+
+    def _boom():
+        raise LLMUnavailable("no key")
+
+    monkeypatch.setattr("humorhist.llm.resilient_client", _boom)
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None  # no crash; action skipped gracefully
+    assert any("LLM unavailable" in m["text"] for m in stub.sent)
+    # the stored copy must be unchanged
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    assert row["post_copy"] == "France invaded Mexico over a pastry shop."
+
+
+def test_editor_line_approve_without_llm_skips_copy_gracefully(tmp_path, monkeypatch):
+    """Approve must still succeed (and enqueue) even when no LLM key exists for
+    post-copy generation -- it just skips the copy step silently."""
+    from humorhist.llm import LLMUnavailable
+
+    def _boom():
+        raise LLMUnavailable("no key")
+
+    monkeypatch.setattr("humorhist.llm.resilient_client", _boom)
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "approve:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    # draft approved + queued despite no LLM for the copy step
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+    # the joke-prompt was sent (so the review flow continues normally)
+    assert any("one-line joke" in m["text"] for m in stub.sent)
+
+
+
 def test_callback_copy_opens_copy_content(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)
@@ -805,7 +854,7 @@ def test_notes_on_pending_draft_regenerates_angles(tmp_path, monkeypatch):
     )
     conn.commit()
 
-    monkeypatch.setattr(llm, "default_client", lambda: StubClient([_angles()]))
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([_angles()]))
     stub = tg.StubTelegram()
     res = tg.handle_callback(
         conn, stub, "chat",
@@ -825,4 +874,128 @@ def test_notes_on_pending_draft_regenerates_angles(tmp_path, monkeypatch):
     assert row["editor_notes"] == "lean into bureaucracy"
     # draft stays pending (no review decision made)
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "pending"
+
+
+# --- discovery/draft commands (/harvest, /screen, /draft) ------------------
+
+
+def test_harvest_command_runs_and_reports(tmp_path, monkeypatch):
+    conn = _fresh_db(tmp_path)
+    monkeypatch.setattr(
+        "humorhist.harvest.seed.load_seed", lambda c: 3, raising=False
+    )
+    monkeypatch.setattr(
+        "humorhist.harvest.wikipedia_lists.harvest_wikipedia_lists",
+        lambda c: 5,
+        raising=False,
+    )
+    stub = tg.StubTelegram(updates=_message_batch("/harvest", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Harvesting new events" in m["text"] for m in stub.sent)
+    assert any("Harvest done" in m["text"] and "Pool now" in m["text"] for m in stub.sent)
+
+
+def test_screen_command_skips_without_llm(tmp_path, monkeypatch):
+    from humorhist.llm import LLMUnavailable
+
+    def _boom():
+        raise LLMUnavailable("no key")
+
+    monkeypatch.setattr("humorhist.llm.resilient_client", _boom)
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=_message_batch("/screen", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("LLM unavailable" in m["text"] for m in stub.sent)
+
+
+def test_draft_command_runs_and_reports(tmp_path, monkeypatch):
+    import json
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    # a draft_candidates stub: we don't call the LLM in this test, but the
+    # command path fetches a client first, so give it one.
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+
+    def fake_draft(conn2, client, count=3, min_score=7.0, **kw):
+        conn2.execute(
+            "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p1','X','drafted')"
+        )
+        conn2.execute(
+            "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+            "VALUES ('nd1','p1','{}','{}','pending','2026-01-01T00:00:00+00:00')"
+        )
+        conn2.commit()
+        return {"selected": 1, "drafted": 1, "failed": 0, "draft_ids": ["nd1"], "failures": []}
+
+    monkeypatch.setattr("humorhist.drafting.draft_candidates", fake_draft)
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=_message_batch("/draft 2", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Drafting 2 candidate(s)" in m["text"] for m in stub.sent)
+    assert any("Drafted 1 new draft(s)" in m["text"] for m in stub.sent)
+    assert conn.execute("SELECT status FROM drafts WHERE id='nd1'").fetchone()["status"] == "pending"
+
+
+# --- /buffer command + proactive nudge ------------------------------------
+
+
+def test_buffer_command_reports_health(tmp_path, monkeypatch):
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=_message_batch("/buffer", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("BUFFER" in m["text"] for m in stub.sent)
+
+
+def test_buffer_enqueue_command_sweeps_approved(tmp_path, monkeypatch):
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    # approve it so it becomes enqueue-able
+    conn.execute("UPDATE drafts SET status='approved' WHERE id='d1'")
+    conn.commit()
+    stub = tg.StubTelegram(updates=_message_batch("/buffer enqueue", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Enqueued 1 approved draft(s)" in m["text"] for m in stub.sent)
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+
+
+def test_proactive_nudge_on_new_pending_draft(tmp_path, monkeypatch):
+    """When a new draft appears between poll cycles, the bot nudges once."""
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+
+    def fake_draft(conn2, client, count=3, min_score=7.0, **kw):
+        conn2.execute(
+            "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p1','X','drafted')"
+        )
+        conn2.execute(
+            "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+            "VALUES ('nd1','p1','{}','{}','pending','2026-01-01T00:00:00+00:00')"
+        )
+        conn2.commit()
+        return {"selected": 1, "drafted": 1, "failed": 0, "draft_ids": ["nd1"], "failures": []}
+
+    monkeypatch.setattr("humorhist.drafting.draft_candidates", fake_draft)
+
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(
+        updates=[
+            *_message_batch("/draft", 1),
+            {"update_id": 2, "message": {"message_id": 102, "chat": {"id": "chat"}, "text": "/status"}},
+            {"update_id": 3, "message": {"message_id": 103, "chat": {"id": "chat"}, "text": "/noop"}},
+        ]
+    )
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5, poll_timeout=1)
+    assert any("🆕 1 new draft(s) awaiting review" in m["text"] for m in stub.sent)
+
 

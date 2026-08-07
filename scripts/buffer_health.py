@@ -24,7 +24,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-AUTH = Path.home() / ".hermes" / "auth.json"
 LOG = REPO / "data" / "buffer_health.log"
 
 sys.path.insert(0, str(REPO))
@@ -45,22 +44,14 @@ def log(msg: str) -> None:
         fh.write(line + "\n")
 
 
-def current_token() -> str | None:
-    try:
-        return json.loads(AUTH.read_text())["providers"]["nous"]["access_token"]
-    except Exception:  # noqa: BLE001 - token is optional for the report
-        return None
-
-
 def _llm():
-    from humorhist.llm import NousClient
+    from humorhist.llm import LLMUnavailable, resilient_client
 
-    token = current_token()
-    if not token:
-        import humorhist.llm as llm
-
-        return llm.NousClient(api_key="", max_retries=1, timeout=120.0)
-    return NousClient(api_key=token, max_retries=2, timeout=300.0)
+    try:
+        return resilient_client()
+    except LLMUnavailable:
+        # No static key and no live Nous token -> auto-draft simply can't run.
+        return None
 
 
 def main() -> int:

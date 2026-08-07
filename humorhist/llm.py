@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -27,6 +28,15 @@ DEFAULT_MODEL = "tencent/hy3:free"
 
 class LLMError(RuntimeError):
     """Raised when the LLM call fails or returns unusable output."""
+
+
+class LLMUnavailable(RuntimeError):
+    """Raised when no usable LLM credential is available at call time.
+
+    Distinct from ``LLMError`` (a transient/permanent call failure) so callers
+    — especially the Telegram bot — can show a clean "LLM unavailable" message
+    instead of surfacing a raw traceback to the user's phone.
+    """
 
 
 class LLMClient(Protocol):
@@ -204,3 +214,45 @@ class StubClient:
 def default_client() -> LLMClient:
     """Return the configured real client."""
     return NousClient()
+
+
+def nous_auth_token() -> str | None:
+    """Best-effort read of the Nous OAuth access token from ~/.hermes/auth.json.
+
+    This token only refreshes while a Hermes session is active and expires
+    hourly; it is a convenience fallback, not a durable credential. Returns
+    ``None`` if the file is absent or malformed.
+    """
+    try:
+        path = Path.home() / ".hermes" / "auth.json"
+        data = json.loads(path.read_text())
+        return data["providers"]["nous"]["access_token"]
+    except Exception:  # noqa: BLE001 - token is optional
+        return None
+
+
+def resilient_client(
+    timeout: float = 120.0,
+    max_retries: int = 2,
+) -> NousClient:
+    """Return an LLM client that works *unattended*.
+
+    Preference order:
+      1. ``HUMORHIST_LLM_API_KEY`` (persistent, survives logout — preferred for
+         the always-on Telegram bot / daily timers).
+      2. The Nous OAuth token from ``~/.hermes/auth.json`` (only valid while a
+         Hermes session is live).
+
+    Raises ``LLMUnavailable`` if neither is present, so callers can show a clean
+    "LLM unavailable" message to the user instead of a raw traceback.
+    """
+    static_key = os.environ.get("HUMORHIST_LLM_API_KEY")
+    if static_key:
+        return NousClient(api_key=static_key, timeout=timeout, max_retries=max_retries)
+    token = nous_auth_token()
+    if token:
+        return NousClient(api_key=token, timeout=timeout, max_retries=max_retries)
+    raise LLMUnavailable(
+        "no LLM credential available — set HUMORHIST_LLM_API_KEY for unattended "
+        "use, or keep a Hermes session open for the Nous OAuth token"
+    )
