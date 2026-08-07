@@ -723,42 +723,35 @@ def test_editor_line_approve_without_llm_skips_copy_gracefully(tmp_path, monkeyp
 
 
 
-def test_approve_generates_story_image_preview_and_persists(tmp_path, monkeypatch):
-    """On approve, A+B image gen must run (when an image client is available),
-    send a photo preview to chat, and persist prompt + path on the queue row."""
+def test_enqueue_generates_story_image_and_persists(tmp_path, monkeypatch):
+    """On enqueue (the publish step), story image gen must run when an image
+    client is available, persist prompt + path on the queue row, and the
+    generated PNG must exist on disk. Image generation is OFF the approve flow.
+    """
     import humorhist.imagegen as ig
     from humorhist.llm import StubClient
 
-    # LLM for the image-prompt step + post copy; image client returns PNG bytes.
     monkeypatch.setattr(
         "humorhist.llm.default_client",
         lambda: StubClient([{"prompt": "a wry period scene of the tax-dodge bear"}, {"post": "The bear was a tax dodge."}]),
     )
     img_client = ig.StubImageClient([b"\x89PNG\r\n\x1a\n fake-png-bytes"])
-    monkeypatch.setattr(
-        "humorhist.imagegen.resilient_image_client", lambda: img_client
-    )
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client", lambda: img_client)
 
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     img_dir = tmp_path / "images"
-    stub = tg.StubTelegram()
-    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
-    editor_line_msg_id = cb_res["note_message_id"]
-    awaiting = {"d1": {"note_message_id": editor_line_msg_id, "stage": "editor_line", "decision": "approve"}}
 
-    res1 = tg.handle_text(
-        conn, stub, "chat", awaiting, _text_update(2, "The bear was a tax dodge.", editor_line_msg_id),
-        image_dir=str(img_dir),
-    )
-    assert res1.get("editor_line_set") == "d1"
+    # approve first (apply_review auto-enqueues WITHOUT an image dir, so no image
+    # is generated yet — it is deferred to the explicit publish/enqueue step)
+    cb_res = tg.handle_callback(conn, tg.StubTelegram(), "chat", _callback_update(1, "cb1", "approve", "d1"))
+    assert db.get_image(conn, "d1")["image_path"] is None
 
-    # a photo was sent as a preview
-    photos = [m for m in stub.sent if "photo" in m]
-    assert photos, "expected a story image preview to be sent"
-    assert photos[0]["photo"] == b"\x89PNG\r\n\x1a\n fake-png-bytes"
+    # now the publish/enqueue step generates the image via the backfill path
+    import humorhist.review as review
 
-    # the prompt + path were persisted on the queue row
+    review.enqueue_approved(conn, image_dir=str(img_dir))
+
     info = db.get_image(conn, "d1")
     assert info is not None
     assert info["image_prompt"] == "a wry period scene of the tax-dodge bear"
@@ -766,9 +759,34 @@ def test_approve_generates_story_image_preview_and_persists(tmp_path, monkeypatc
     assert Path(info["image_path"]).is_file()
 
 
+def test_enqueue_sets_learn_more_source_link(tmp_path, monkeypatch):
+    """Enqueue must persist a 'learn more' shortened link from the pool source_url."""
+    from humorhist.imagegen import ImageUnavailable
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr("humorhist.llm.default_client", lambda: StubClient([{"post": "x"}]))
+    # No image client available: enqueue must still set the link, just skip image.
+    def _no_img():
+        raise ImageUnavailable("no key")
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client", _no_img)
+
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    conn.execute("UPDATE drafts SET status='approved' WHERE id='d1'")
+    conn.execute("UPDATE pool SET source_url='https://en.wikipedia.org/wiki/The_Great_Emu_War', source_name='Wikipedia'")
+    conn.commit()
+    import humorhist.review as review
+
+    review.enqueue_approved(conn, image_dir=None)
+    link = db.get_source_link(conn, "d1")
+    assert link == "https://en.wikipedia.org/wiki/The_Great_Emu_War"
+
+
+
 def test_approve_skips_image_when_no_image_client(tmp_path, monkeypatch):
     """When no image credential is available, approve must still succeed and NOT
-    send a photo -- image generation is best-effort and must not block review."""
+    send a photo -- image generation now happens at enqueue (publish), so an
+    approve with no image key simply defers the (skipped) image to that step."""
     from humorhist.imagegen import ImageUnavailable
     from humorhist.llm import StubClient
 

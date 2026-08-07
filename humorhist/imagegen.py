@@ -365,3 +365,58 @@ def generate_image(
     path = out_dir / f"{_sanitize_filename(draft_id)}.png"
     path.write_bytes(data)
     return str(path), prompt
+
+
+def generate_image_for_queue(
+    conn: Any,
+    draft_id: str,
+    *,
+    out_dir: str | Path,
+    llm_client: Any | None = None,
+) -> tuple[str, str] | None:
+    """Best-effort story image for a queued draft, persisted on the queue row.
+
+    Distills the prompt from the draft + pool via the LLM, renders it via FAL
+    FLUX, saves the PNG to ``out_dir/<draft_id>.png``, and writes
+    ``image_prompt`` / ``image_path`` onto the queue row via ``db.set_image``.
+
+    Returns ``(image_path, image_prompt)`` on success, or ``None`` if image
+    generation is unavailable or fails for any reason (missing credential,
+    exhausted balance, transport error, bad model response). Callers use this at
+    the *publish/enqueue* step so a missing image never blocks the pipeline.
+
+    ``llm_client`` is looked up lazily via ``humorhist.llm.default_client`` when
+    not supplied (so it is only constructed if an image client is actually
+    available).
+    """
+    import humorhist.db as db
+
+    img_client = None
+    try:
+        from humorhist.imagegen import ImageUnavailable, resilient_image_client
+
+        img_client = resilient_image_client()
+    except Exception:  # noqa: BLE001 - ImageUnavailable or any setup failure
+        img_client = None
+    if img_client is None:
+        return None
+
+    try:
+        if llm_client is None:
+            from humorhist.llm import default_client
+
+            llm_client = default_client()
+        draft_row = dict(
+            conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+        )
+        pool_row = db.get_pool_item(conn, draft_row["pool_id"])
+        path, prompt = generate_image(
+            llm_client, img_client, draft_row,
+            dict(pool_row) if pool_row else None,
+            out_dir=out_dir, draft_id=draft_id,
+        )
+        db.set_image(conn, draft_id, image_prompt=prompt, image_path=path)
+        return path, prompt
+    except Exception as exc:  # noqa: BLE001 - best-effort: never block publish
+        print(f"[image] not generated for {draft_id}: {exc}")
+        return None

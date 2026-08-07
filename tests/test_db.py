@@ -326,3 +326,62 @@ def test_migrate_runs_dedup_and_index(tmp_path):
     ).fetchone()
     assert idx is not None
 
+
+def test_source_link_roundtrip_and_shorten(tmp_path):
+    """queue.source_link persists via set/get; shorten_url truncates in the middle."""
+    conn = _fresh_db(tmp_path)
+    db.upsert_pool_item(conn, id="p1", title="Emu War", year=1932,
+                        date_hint=None, summary=None,
+                        source_url="https://en.wikipedia.org/wiki/The_Great_Emu_War",
+                        source_name="w")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, status) VALUES ('d1', 'p1', 'approved')"
+    )
+    conn.execute("INSERT INTO queue (draft_id, published) VALUES ('d1', 0)")
+    conn.commit()
+
+    long_url = "https://en.wikipedia.org/wiki/" + ("a" * 120)
+    db.set_source_link(conn, "d1", long_url)
+    assert db.get_source_link(conn, "d1") == long_url
+
+    url, name = db.pool_source_url(conn, "d1")
+    assert url is not None and url.endswith("The_Great_Emu_War")
+
+    # shorten=False returns unchanged; shorten=True truncates in the middle
+    assert db.shorten_url(long_url, shorten=False) == long_url
+    short = db.shorten_url(long_url, shorten=True, max_len=40)
+    assert len(short) == 40
+    assert "…" in short
+    # short url keeps domain head + tail
+    assert short.startswith("https://")
+
+
+def test_enqueue_approved_populates_link_best_effort(tmp_path, monkeypatch):
+    """review.enqueue_approved persists a 'learn more' link from pool.source_url
+    even when no image dir is supplied (image skipped, link still set)."""
+    from humorhist.imagegen import ImageUnavailable
+    from humorhist.llm import StubClient
+    from humorhist import review as review
+
+    monkeypatch.setattr("humorhist.llm.default_client", lambda: StubClient([{"post": "x"}]))
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client",
+                        lambda: (_ for _ in ()).throw(ImageUnavailable("no key")))
+
+    conn = _fresh_db(tmp_path)
+    db.upsert_pool_item(conn, id="p1", title="Emu War", year=1932,
+                        date_hint=None, summary=None,
+                        source_url="https://en.wikipedia.org/wiki/The_Great_Emu_War",
+                        source_name="w")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, status) VALUES ('d1', 'p1', 'approved')"
+    )
+    conn.commit()
+
+    n = review.enqueue_approved(conn, image_dir=None)
+    assert n == 1
+    assert db.get_source_link(conn, "d1") == "https://en.wikipedia.org/wiki/The_Great_Emu_War"
+    # no image generated without a dir/credential
+    info = db.get_image(conn, "d1")
+    assert info is not None
+    assert info["image_path"] is None
+

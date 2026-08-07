@@ -1,6 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
+# generated story images (one .png per approved draft; not code, not for github)
+data/images/
+
+# pooled drafts / copy, and the live sqlite db
 data/*.sqlite
 
 # runtime logs (no secrets, but not code)

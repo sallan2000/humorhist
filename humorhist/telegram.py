@@ -553,35 +553,6 @@ def handle_text(
                     fill_post_copy(conn, llm, draft_id=draft_id)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[telegram] post copy not generated for {draft_id}: {exc}")
-            # A+B image: generate a story picture on approve, best-effort.
-            # Missing image credential or generation failure => skip silently
-            # (post copy + pipeline unaffected). On success, persist the prompt
-            # + path on the queue row and show a preview in chat.
-            img_client = _get_image_client(chat_id, client, silent=True)
-            if img_client is not None:
-                try:
-                    from humorhist import imagegen as ig
-                    from humorhist.llm import default_client
-
-                    out_dir = _resolve_image_dir(image_dir)
-                    if out_dir:
-                        draft_row = dict(
-                            conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
-                        )
-                        pool_row = db.get_pool_item(conn, draft_row["pool_id"])
-                        path, prompt = ig.generate_image(
-                            default_client(), img_client, draft_row,
-                            dict(pool_row) if pool_row else None,
-                            out_dir=out_dir, draft_id=draft_id,
-                        )
-                        db.set_image(conn, draft_id, image_prompt=prompt, image_path=path)
-                        with open(path, "rb") as fh:
-                            client.send_photo(
-                                chat_id, fh.read(),
-                                caption=f"🖼️ Story image for `{draft_id}`",
-                            )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[telegram] image not generated for {draft_id}: {exc}")
         # secondary optional notes step
         note = client.send_message(
             chat_id,
@@ -716,6 +687,16 @@ def send_draft_content(
         )
     text = text + copy_block
 
+    # 'Learn more' link: a shortened reader-facing pointer to the source article.
+    try:
+        from humorhist.db import get_source_link, shorten_url
+
+        link = get_source_link(conn, draft_id)
+        if link:
+            text = text + f"\n\n🔗 Learn more: {shorten_url(link, shorten=False)}"
+    except Exception as exc:  # noqa: BLE001 - link is a bonus; never break the view
+        print(f"[telegram] failed to render source link for {draft_id}: {exc}")
+
     notes_btn = {
         "inline_keyboard": [
             [
@@ -778,7 +759,10 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         else:
             snippet = "(no copy yet)"
             status = f"0/{limit}"
-        lines.append(f"  • {title}\n    {snippet}  [{status}]")
+        lines.append(f"  • {title}\\n    {snippet}  [{status}]")
+        link = db.get_source_link(conn, r["draft_id"])
+        if link:
+            lines.append(f"    🔗 {db.shorten_url(link, shorten=False)}")
         keyboard.append(
             [{"text": f"✏️ {title[:28]}", "callback_data": f"copy:{r['draft_id']}"}]
         )
@@ -889,7 +873,7 @@ def telegram_buffer(conn, client, chat_id, *, enqueue: bool = False, auto_draft:
     import humorhist.buffer as buf
 
     if enqueue:
-        n = review.enqueue_approved(conn)
+        n = review.enqueue_approved(conn, image_dir=_resolve_image_dir(None))
         client.send_message(chat_id, f"📥 Enqueued {n} approved draft(s) into the queue.")
 
     llm = _get_llm(chat_id, client) if auto_draft else None
@@ -913,7 +897,7 @@ def telegram_queue(conn, client, chat_id, *, action: str = "list", draft_id: str
     `/queue remove <id>`  -> pull a draft back out of the queue (keeps it approved)
     """
     if action == "enqueue":
-        n = review.enqueue_approved(conn)
+        n = review.enqueue_approved(conn, image_dir=_resolve_image_dir(None))
         client.send_message(chat_id, f"📥 Enqueued {n} approved draft(s) into the queue.")
         send_queue_list(conn, client, chat_id)
     elif action == "remove":

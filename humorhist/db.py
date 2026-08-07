@@ -67,6 +67,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     # safe to re-run on already-migrated databases.
     _ensure_queue_copy_columns(conn)
     _ensure_queue_image_columns(conn)
+    _ensure_queue_link_column(conn)
     _ensure_defer_column(conn)
     _ensure_pool_note_column(conn)
     # Dedup: normalized_title lets the same event arriving from different
@@ -272,6 +273,66 @@ def get_image(conn: sqlite3.Connection, draft_id: str) -> dict | None:
     if row is None:
         return None
     return {"image_prompt": row["image_prompt"], "image_path": row["image_path"]}
+
+
+def _ensure_queue_link_column(conn: sqlite3.Connection) -> None:
+    """Add ``source_link`` to queue if absent (no-op if present).
+
+    ``source_link`` is a shortened "learn more" URL derived from the pool's
+    ``source_url`` (the Wikipedia/article a reader can visit for the real
+    story). It is generated at publish/enqueue time, best-effort, and purely a
+    convenience the publisher/editor can show alongside the post.
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(queue)")}
+    if "source_link" not in existing:
+        conn.execute("ALTER TABLE queue ADD COLUMN source_link TEXT")
+
+
+def set_source_link(conn: sqlite3.Connection, draft_id: str, link: str | None) -> None:
+    """Persist a shortened 'learn more' source link onto the queue row."""
+    conn.execute(
+        "UPDATE queue SET source_link = ? WHERE draft_id = ?", (link, draft_id)
+    )
+    conn.commit()
+
+
+def get_source_link(conn: sqlite3.Connection, draft_id: str) -> str | None:
+    """Return the persisted shortened source link for ``draft_id``, or None."""
+    row = conn.execute(
+        "SELECT source_link FROM queue WHERE draft_id = ?", (draft_id,)
+    ).fetchone()
+    return row["source_link"] if row else None
+
+
+def pool_source_url(conn: sqlite3.Connection, draft_id: str) -> tuple[str | None, str | None]:
+    """Return ``(source_url, source_name)`` for a draft's pool row, or (None, None)."""
+    row = conn.execute(
+        "SELECT p.source_url, p.source_name FROM drafts d "
+        "LEFT JOIN pool p ON p.id = d.pool_id WHERE d.id = ?",
+        (draft_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    return row["source_url"], row["source_name"]
+
+
+def shorten_url(url: str, *, max_len: int = 40, shorten: bool = False) -> str:
+    """Return a display-safe 'learn more' link for ``url``.
+
+    No network is used. When ``shorten`` is True and ``url`` is longer than
+    ``max_len``, it is truncated in the middle and an ellipsis is appended, so a
+    reader still sees the domain + a recognizable tail. When ``shorten`` is False
+    (the default) the URL is returned unchanged. The shortened form is purely a
+    display convenience; the full URL is what the publisher should link to.
+    """
+    if not url:
+        return url
+    if not shorten or len(url) <= max_len:
+        return url
+    keep = max_len - 1
+    head = url[: keep // 2]
+    tail = url[-(keep - len(head)) :]
+    return f"{head}…{tail}"
 
 
 def make_id(*parts: str) -> str:

@@ -63,9 +63,9 @@ repo):
     HUMORHIST_CHAR_LIMIT      Optional. Max length of generated post copy
                               (default 280). Raise it (e.g. 280 -> 400) if you
                               later post to a platform with a larger limit.
-    HUMORHIST_IMAGE_API_KEY   Optional. Enables story-image generation on approve
-                              (FAL FLUX). When unset, approval still works; the
-                              image step is skipped silently.
+    HUMORHIST_IMAGE_API_KEY   Optional. Enables story-image generation at the
+                              publish step (FAL FLUX). When unset, publish still
+                              works; the image is skipped silently.
     HUMORHIST_IMAGE_STYLE     Optional. One of: editorial-historical (default),
                               editorial-cartoon, meme.
     HUMORHIST_IMAGE_DIR       Optional. Where generated PNGs are written
@@ -189,9 +189,10 @@ the weekly timer, etc.) — you don't have to remember to poll it.
 **Commands**
 
     /reviewdraft   review pending drafts one by one (✅ Approve / ❌ Reject / ⏸ Later)
-                  on Approve the bot asks for your one-line joke, then optional notes;
-                  if HUMORHIST_IMAGE_API_KEY is set it also generates a story image
-                  and shows it as a preview (skipped silently otherwise)
+                  on Approve the bot asks for your one-line joke, then optional notes
+    /queue enqueue  move approved drafts into the publish queue — if HUMORHIST_IMAGE_API_KEY
+                  is set, this also generates a story image + a "learn more" source link
+                  for each (both skipped silently if no key)
     /harvest       top up the candidate pool from seed + Wikipedia lists
     /screen [limit]  LLM-score unscored pool candidates
     /draft [count] [min_score]  fact-check + generate angles for top candidates
@@ -231,8 +232,8 @@ the weekly timer, etc.) — you don't have to remember to poll it.
         → 📊 progress block, then one draft at a time with ✅/❌/⏸ buttons.
         Tapping ✅ → bot asks "Reply with the one-line joke (the human voice)…";
         you send it → "📝 Saved. Optional notes? (or /skip)" → /skip.
-        If HUMORHIST_IMAGE_API_KEY is set, the bot also DMs a generated
-        🖼️ story image (and opens it again from /listapproved / /viewcopy).
+        The story image + "learn more" link are generated later, at the publish
+        step (`/queue enqueue` or `/buffer enqueue`) — see below.
         On a *pending* draft, send /notes then your steer ("lean into the
         bureaucracy") to regenerate the angles with that as steering.
 
@@ -408,12 +409,19 @@ The **B+ copy loop** is done (2026-08-06): on approve, post copy is generated
 `copy show/edit/regen` commands and Telegram `/listqueue` + `/viewcopy`
 (inline ✏️ Edit / 🔄 Regenerate). See "Phase 4: post copy" above.
 
-**Story images (A+B, 2026-08-07):** on approve, an AI image representing the
-story is generated (FAL FLUX, gated by `HUMORHIST_IMAGE_API_KEY`) and shown as
-a Telegram preview; the prompt + PNG path are persisted on the `queue` row
-(`image_prompt` / `image_path`) so a future publisher can attach them. The
-image step is best-effort: with no image key it is skipped silently and the
-rest of the pipeline is unaffected.
+**Story images (A+B, 2026-08-08):** an AI image representing the story is
+generated at the **publish step** (`/queue enqueue` or `/buffer enqueue`) — not
+on approve — so it lands when a draft is about to be published. It uses FAL FLUX
+(gated by `HUMORHIST_IMAGE_API_KEY`), writes the PNG to `data/images/<draft_id>.png`
+(gitignored), and persists the prompt + path on the `queue` row
+(`image_prompt` / `image_path`) so a future publisher can attach them. At the
+same step each queued draft also gets a **"learn more" link** derived from the
+pool's `source_url` (the Wikipedia/article behind the story), stored on the
+queue row as `source_link` and shown in `/listapproved`, `/queue`, and the draft
+view. Both are best-effort: with no image key the image is skipped silently and
+the link is still set when a source exists; the rest of the pipeline is
+unaffected. Images and the key are kept out of git (`.env` and `data/images/`
+are gitignored).
 
 **Telegram-primary (2026-08-07):** the entire pipeline is now drivable from
 Telegram, not just review/edit. From chat you can `/harvest` the pool,

@@ -173,7 +173,12 @@ def remove_from_queue(conn: sqlite3.Connection, draft_id: str) -> int:
     return cur.rowcount
 
 
-def enqueue_approved(conn: sqlite3.Connection, scheduled_for: str | None = None) -> int:
+def enqueue_approved(
+    conn: sqlite3.Connection,
+    scheduled_for: str | None = None,
+    *,
+    image_dir: str | None = None,
+) -> int:
     """Move every `approved` draft into `queue` (Phase 4 handoff).
 
     Idempotent: drafts already in `queue` are skipped, so this is safe to run
@@ -181,6 +186,13 @@ def enqueue_approved(conn: sqlite3.Connection, scheduled_for: str | None = None)
 
     `scheduled_for` is an optional ISO timestamp; when omitted the row is left
     unscheduled (published = 0) for the publisher to pick up in arrival order.
+
+    When `image_dir` is given, each newly-queued draft also gets a best-effort
+    story image (and a persisted 'learn more' source link) — this is the
+    *publish-time* generation step (image moved off the approve flow so it aligns
+    with "about to be published"). Both are best-effort: a missing image
+    credential or generation failure is logged and skipped, never blocking the
+    enqueue.
     """
     approved = conn.execute(
         "SELECT id FROM drafts WHERE status = 'approved'"
@@ -199,9 +211,53 @@ def enqueue_approved(conn: sqlite3.Connection, scheduled_for: str | None = None)
             (draft_id, scheduled_for),
         )
         inserted += 1
+        # Publish-time artifacts (best-effort): shortened 'learn more' link +
+        # story image. None of this blocks the enqueue.
+        _populate_publish_artifacts(conn, draft_id, image_dir=image_dir)
     if inserted:
         conn.commit()
+    # When an image dir is supplied (the explicit publish/enqueue step), also
+    # backfill artifacts for drafts already sitting in the queue without them —
+    # e.g. rows auto-enqueued at approve time (where image_dir was not yet known,
+    # or an image/link was skipped). This keeps the publish step idempotent and
+    # makes it the single place images are generated.
+    if image_dir:
+        for r in conn.execute(
+            "SELECT draft_id FROM queue WHERE image_path IS NULL"
+        ).fetchall():
+            _populate_publish_artifacts(conn, r["draft_id"], image_dir=image_dir)
     return inserted
+
+
+def _populate_publish_artifacts(
+    conn: sqlite3.Connection, draft_id: str, *, image_dir: str | None = None
+) -> None:
+    """Best-effort: persist a 'learn more' source link (always, if a source
+    exists) and a story image (only if ``image_dir`` is given and image is
+    available).
+
+    A reader-facing convenience: the link points at the original article
+    (Wikipedia, etc.) behind the story; the image is generated via FAL FLUX.
+    Either failing is logged and swallowed — the draft still enters the queue.
+    """
+    # 1) Shortened 'learn more' link (no network; derived from pool.source_url).
+    try:
+        import humorhist.db as db
+
+        url, name = db.pool_source_url(conn, draft_id)
+        if url:
+            db.set_source_link(conn, draft_id, db.shorten_url(url, shorten=False))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[queue] source link not set for {draft_id}: {exc}")
+
+    # 2) Story image (best-effort; only when a target dir is supplied).
+    if image_dir:
+        try:
+            from humorhist import imagegen as ig
+
+            ig.generate_image_for_queue(conn, draft_id, out_dir=image_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[queue] image not generated for {draft_id}: {exc}")
 
 
 def queued_drafts(conn: sqlite3.Connection) -> list[dict]:

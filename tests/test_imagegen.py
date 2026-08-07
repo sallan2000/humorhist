@@ -8,6 +8,7 @@ disk, and the prompt + path come back, plus the resilience/error paths.
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 import humorhist.db as db
 from humorhist.imagegen import (
@@ -20,6 +21,8 @@ from humorhist.imagegen import (
     resilient_image_client,
 )
 from humorhist.llm import StubClient
+
+import humorhist.imagegen as ig
 
 
 def _fresh_db(tmp_path):
@@ -40,6 +43,8 @@ def _seed(conn, draft_id="d1"):
                    'pending', '2026-01-01T00:00:00+00:00')""",
         (draft_id,),
     )
+    # generate_image_for_queue reads/writes via the queue row (db.set_image/get_image)
+    conn.execute("INSERT OR IGNORE INTO queue (draft_id, published) VALUES (?, 0)", (draft_id,))
     conn.commit()
 
 
@@ -110,3 +115,35 @@ def test_stub_image_client_exhaustion_raises(monkeypatch):
     img_client = StubImageClient([])
     with pytest.raises(ImageError):
         img_client.generate("a prompt")
+
+
+def test_generate_image_for_queue_persists_and_returns(tmp_path, monkeypatch):
+    """generate_image_for_queue generates, writes the PNG, persists on the queue
+    row, and returns (path, prompt); returns None when no image client."""
+    from humorhist.imagegen import ImageUnavailable
+    from humorhist.llm import StubClient
+
+    conn = _fresh_db(tmp_path)
+    _seed(conn)
+
+    # No image client -> returns None, nothing persisted, no crash.
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client",
+                        lambda: (_ for _ in ()).throw(ImageUnavailable("no key")))
+    assert ig.generate_image_for_queue(conn, "d1", out_dir=tmp_path / "images") is None
+    none_info = db.get_image(conn, "d1")
+    assert none_info is not None
+    assert none_info["image_path"] is None
+
+    # With a client -> generates + persists + returns.
+    monkeypatch.setattr("humorhist.llm.default_client",
+                        lambda: StubClient([{"prompt": "a wry period scene"}]))
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client",
+                        lambda: StubImageClient([b"\x89PNG generated"]))
+    out_dir = tmp_path / "images"
+    res = ig.generate_image_for_queue(conn, "d1", out_dir=out_dir)
+    assert res is not None
+    path, prompt = res
+    assert path.endswith("d1.png") and Path(path).is_file()
+    info = db.get_image(conn, "d1")
+    assert info is not None
+    assert info["image_path"] == path and info["image_prompt"] == "a wry period scene"
