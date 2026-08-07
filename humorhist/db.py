@@ -8,6 +8,7 @@ first.
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -26,7 +27,8 @@ CREATE TABLE IF NOT EXISTS pool (
   funny_score REAL,
   status TEXT DEFAULT 'new',
   harvested_at TEXT,
-  note TEXT
+  note TEXT,
+  normalized_title TEXT
 );
 CREATE TABLE IF NOT EXISTS drafts (
   id TEXT PRIMARY KEY, pool_id TEXT REFERENCES pool(id),
@@ -66,6 +68,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_queue_copy_columns(conn)
     _ensure_defer_column(conn)
     _ensure_pool_note_column(conn)
+    # Dedup: normalized_title lets the same event arriving from different
+    # sources / spellings collapse to one pool row (see upsert_pool_item).
+    _ensure_normalized_title_column(conn)
+    _backfill_normalized_title(conn)
+    _dedupe_pool(conn)
     conn.commit()
 
 
@@ -81,6 +88,130 @@ def _ensure_pool_note_column(conn: sqlite3.Connection) -> None:
     existing = {r[1] for r in conn.execute("PRAGMA table_info(pool)")}
     if "note" not in existing:
         conn.execute("ALTER TABLE pool ADD COLUMN note TEXT")
+
+
+def _ensure_normalized_title_column(conn: sqlite3.Connection) -> None:
+    """Add pool.normalized_title if absent (no-op if present)."""
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(pool)")}
+    if "normalized_title" not in existing:
+        conn.execute("ALTER TABLE pool ADD COLUMN normalized_title TEXT")
+
+
+def _backfill_normalized_title(conn: sqlite3.Connection) -> None:
+    """Populate normalized_title for any legacy rows that lack it.
+
+    Pure-junk rows (normalize to "") are dropped rather than kept.
+    """
+    # sqlite can't call python normalize_title per row, so loop.
+    rows = conn.execute(
+        "SELECT id, title FROM pool WHERE normalized_title IS NULL"
+    ).fetchall()
+    for r in rows:
+        norm = normalize_title(r["title"])
+        if norm:
+            conn.execute(
+                "UPDATE pool SET normalized_title = ? WHERE id = ?", (norm, r["id"])
+            )
+        else:
+            conn.execute("DELETE FROM pool WHERE id = ?", (r["id"],))
+    conn.commit()
+
+
+def _dedupe_pool(conn: sqlite3.Connection) -> int:
+    """Collapse existing duplicate pool rows (same normalized_title).
+
+    Picks a survivor by rank (has-a-draft > status used>drafted>rejected>new >
+    higher funny_score > stable id), merges the best fields into it, re-points any
+    orphaned drafts to the survivor, and deletes the rest. Returns the number of
+    rows removed. Safe to call repeatedly (idempotent).
+
+    Pure-junk rows (normalized_title IS NULL after backfill) are dropped unless a
+    draft depends on them.
+    """
+    # 1) drop junk rows that have no draft
+    for r in conn.execute(
+        "SELECT id FROM pool WHERE normalized_title IS NULL"
+    ).fetchall():
+        if conn.execute("SELECT 1 FROM drafts WHERE pool_id=? LIMIT 1", (r["id"],)).fetchone() is None:
+            conn.execute("DELETE FROM pool WHERE id = ?", (r["id"],))
+
+    _STATUS_RANK = {"used": 4, "drafted": 3, "rejected": 2, "new": 1}
+
+    def _rank(row: sqlite3.Row) -> tuple:
+        has_draft = conn.execute(
+            "SELECT 1 FROM drafts WHERE pool_id=? LIMIT 1", (row["id"],)
+        ).fetchone() is not None
+        return (
+            1 if has_draft else 0,
+            _STATUS_RANK.get(row["status"], 0),
+            row["funny_score"] or 0,
+            row["id"],
+        )
+
+    removed = 0
+    groups = conn.execute(
+        "SELECT normalized_title, COUNT(*) n FROM pool "
+        "WHERE normalized_title IS NOT NULL GROUP BY normalized_title HAVING n > 1"
+    ).fetchall()
+    for g in groups:
+        rows = conn.execute(
+            "SELECT * FROM pool WHERE normalized_title = ?", (g["normalized_title"],)
+        ).fetchall()
+        rows = sorted(rows, key=_rank, reverse=True)
+        survivor, others = rows[0], rows[1:]
+        # merge best fields into survivor (without clobbering reviewed work)
+        upd: dict[str, object] = {}
+        for o in others:
+            if o["year"] is not None and survivor["year"] is None:
+                upd["year"] = o["year"]
+            if o["summary"] and not survivor["summary"]:
+                upd["summary"] = o["summary"]
+            if o["source_url"] and not survivor["source_url"]:
+                upd["source_url"] = o["source_url"]
+            if o["source_name"] and not survivor["source_name"]:
+                upd["source_name"] = o["source_name"]
+            if o["funny_score"] is not None and (
+                survivor["funny_score"] is None or o["funny_score"] > survivor["funny_score"]
+            ):
+                upd["funny_score"] = o["funny_score"]
+            if o["note"] and not survivor["note"]:
+                upd["note"] = o["note"]
+        if upd:
+            set_clause = ", ".join(f"{k} = ?" for k in upd)
+            conn.execute(
+                f"UPDATE pool SET {set_clause} WHERE id = ?",
+                (*upd.values(), survivor["id"]),
+            )
+        # re-point any orphaned drafts to the survivor, then delete the others
+        for o in others:
+            conn.execute(
+                "UPDATE drafts SET pool_id = ? WHERE pool_id = ?",
+                (survivor["id"], o["id"]),
+            )
+            conn.execute("DELETE FROM pool WHERE id = ?", (o["id"],))
+            removed += 1
+    conn.commit()
+    return removed
+
+
+def dedupe_pool(conn: sqlite3.Connection) -> int:
+    """Public helper: collapse duplicate pool rows. Returns rows removed.
+
+    Also safe to call manually (e.g. after bulk edits) — it is idempotent.
+    """
+    return _dedupe_pool(conn)
+
+
+def _ensure_pool_norm_index(conn: sqlite3.Connection) -> None:
+    """Add a UNIQUE index on normalized_title (safety net vs. the merge logic).
+
+    Created only AFTER duplicates are collapsed, so it never fails on legacy data.
+    Rows with a NULL normalized_title are excluded from the unique constraint.
+    """
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_norm "
+        "ON pool(normalized_title) WHERE normalized_title IS NOT NULL"
+    )
 
 
 def _ensure_queue_copy_columns(conn: sqlite3.Connection) -> None:
@@ -99,6 +230,26 @@ def make_id(*parts: str) -> str:
     return digest[:_ID_LEN]
 
 
+def normalize_title(title: str | None) -> str:
+    """Normalize a title for cross-source/duplicate detection.
+
+    Lowercases, strips wiki-link junk (``[http...]``), URLs and parentheticals,
+    removes punctuation and collapses whitespace. Two different sources/spellings
+    of the *same* event should map to the same normalized string so they collapse
+    to one pool row. Returns ``""`` for pure-junk titles (no real words) so they
+    are dropped rather than inserted.
+    """
+    if not title:
+        return ""
+    t = title.lower().strip()
+    t = re.sub(r"\[http[^\]]*\]", " ", t)        # [http://...] wiki link junk
+    t = re.sub(r"https?://\S+", " ", t)          # bare URLs
+    t = re.sub(r"\([^)]*\)", " ", t)             # parentheticals
+    t = re.sub(r"[^\w\s]", " ", t)               # punctuation -> space
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def upsert_pool_item(
     conn: sqlite3.Connection,
     *,
@@ -109,24 +260,82 @@ def upsert_pool_item(
     summary: str | None,
     source_url: str | None,
     source_name: str | None,
+    funny_score: float | None = None,
 ) -> bool:
-    """Insert a pool item if absent (INSERT OR IGNORE).
+    """Insert a pool item, merging with any existing row for the same event.
 
-    Returns True if newly inserted, False if it already existed. Never
-    overwrites an existing row's funny_score or status. Sets harvested_at to
-    the current UTC ISO8601 timestamp on insert.
+    Dedup is by *normalized* title (``normalize_title``), not by the synthetic
+    ``id`` — so the same historical event arriving from a different source or
+    under a different spelling collapses to ONE pool row instead of producing
+    duplicate drafts. Returns True only if a brand-new row was inserted.
+
+    Merge / tie-breaker rules (protect reviewed work):
+      * If a row already exists for the normalized title:
+          - The survivor is chosen by rank: has-a-draft > status (used >
+            drafted > rejected > new) > higher funny_score > stable id.
+          - The incoming data is folded in WITHOUT overwriting reviewed work:
+            adopt its funny_score only if the survivor has none / a lower one,
+            and fill empty fields (year/summary/source_url) from the incoming row.
+          - Two already-actioned rows (e.g. both drafted) are never force-merged
+            in a way that destroys one: the highest-ranked survivor keeps its
+            draft; the other's draft (if any) is re-pointed to the survivor.
+      * Pure-junk titles (normalize to "") are dropped (return False).
     """
-    harvested_at = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        """
-        INSERT OR IGNORE INTO pool
-          (id, title, year, date_hint, summary, source_url, source_name, harvested_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (id, title, year, date_hint, summary, source_url, source_name, harvested_at),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    norm = normalize_title(title)
+    if not norm:
+        return False
+    # Idempotent on the synthetic id too: if a row with this exact id already
+    # exists (e.g. re-running the same harvest row), just make sure its
+    # normalized_title is populated and return False rather than inserting a twin.
+    existing_by_id = conn.execute(
+        "SELECT id, normalized_title FROM pool WHERE id = ?", (id,)
+    ).fetchone()
+    if existing_by_id is not None:
+        if not existing_by_id["normalized_title"]:
+            conn.execute(
+                "UPDATE pool SET normalized_title = ? WHERE id = ?", (norm, id)
+            )
+            conn.commit()
+        return False
+    existing = conn.execute(
+        "SELECT * FROM pool WHERE normalized_title = ?", (norm,)
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO pool
+              (id, title, year, date_hint, summary, source_url, source_name,
+               funny_score, status, harvested_at, normalized_title)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+            """,
+            (id, title, year, date_hint, summary, source_url, source_name,
+             funny_score, datetime.now(timezone.utc).isoformat(), norm),
+        )
+        conn.commit()
+        return True
+
+    # Merge into the existing survivor, protecting reviewed work.
+    upd: dict[str, object] = {}
+    if year is not None and existing["year"] is None:
+        upd["year"] = year
+    if summary and not existing["summary"]:
+        upd["summary"] = summary
+    if source_url and not existing["source_url"]:
+        upd["source_url"] = source_url
+    if source_name and not existing["source_name"]:
+        upd["source_name"] = source_name
+    if funny_score is not None and (
+        existing["funny_score"] is None or funny_score > existing["funny_score"]
+    ):
+        upd["funny_score"] = funny_score
+    if upd:
+        set_clause = ", ".join(f"{k} = ?" for k in upd)
+        conn.execute(
+            f"UPDATE pool SET {set_clause} WHERE id = ?",
+            (*upd.values(), existing["id"]),
+        )
+        conn.commit()
+    return False
 
 
 def set_status(conn: sqlite3.Connection, table: str, row_id: str, status: str) -> None:
@@ -173,24 +382,55 @@ def add_suggested_pool_item(
     """Insert an editor-suggested pool candidate (via Telegram /suggest).
 
     Suggested items enter with status ``'new'`` and a NULL score so they flow
-    through the normal draft pipeline. The human's note (if any) is stored on
-    the pool row for the fact-check/angle step to see. Idempotent on the stable
-    id (sha1 of the title) — re-suggesting the same topic updates the note.
-
-    Returns the new/updated pool id.
+    through the normal draft pipeline. Idempotent on the stable id (sha1 of the
+    title) — re-suggesting the same topic updates the note. If a pool row for the
+    *same event* already exists (from any source), the suggestion is folded into
+    that row (note + status reset to 'new') rather than creating a twin, so the
+    editor never reviews the same event twice.
     """
+    norm = normalize_title(title)
+    if not norm:
+        # pure junk -> still store with a generated id so /suggest doesn't 500,
+        # but normalized_title stays NULL so it never collides with real rows.
+        pool_id = make_id("suggest", title.strip().lower())
+        conn.execute(
+            """
+            INSERT INTO pool (id, title, year, summary, source_url, source_name,
+                              status, harvested_at, note)
+            VALUES (?, ?, ?, ?, ?, 'editor-suggestion', 'new', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              note = excluded.note,
+              status = 'new'
+            """,
+            (pool_id, title.strip(), year, note or "", source_url,
+             datetime.now(timezone.utc).isoformat(), note or ""),
+        )
+        conn.commit()
+        return pool_id
+
+    existing = conn.execute(
+        "SELECT id FROM pool WHERE normalized_title = ?", (norm,)
+    ).fetchone()
+    if existing is not None:
+        # fold the suggestion into the existing event row; bump it back to 'new'
+        # so it (re)enters the draft pipeline, and keep the human's note.
+        conn.execute(
+            "UPDATE pool SET status='new', note=?, source_name='editor-suggestion' "
+            "WHERE id = ?",
+            (note or "", existing["id"]),
+        )
+        conn.commit()
+        return existing["id"]
+
     pool_id = make_id("suggest", title.strip().lower())
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT INTO pool (id, title, year, summary, source_url, source_name,
-                          status, harvested_at, note)
-        VALUES (?, ?, ?, ?, ?, 'editor-suggestion', 'new', ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          note = excluded.note,
-          status = 'new'
+                          status, harvested_at, note, normalized_title)
+        VALUES (?, ?, ?, ?, ?, 'editor-suggestion', 'new', ?, ?, ?)
         """,
-        (pool_id, title.strip(), year, note or "", source_url, now, note or ""),
+        (pool_id, title.strip(), year, note or "", source_url, now, note or "", norm),
     )
     conn.commit()
     return pool_id
