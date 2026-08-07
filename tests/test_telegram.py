@@ -999,3 +999,48 @@ def test_proactive_nudge_on_new_pending_draft(tmp_path, monkeypatch):
     assert any("🆕 1 new draft(s) awaiting review" in m["text"] for m in stub.sent)
 
 
+# --- /queue command ---------------------------------------------------------
+
+
+def test_queue_command_lists_queue(tmp_path, monkeypatch):
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram(updates=_message_batch("/queue", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Queued drafts" in m["text"] for m in stub.sent)
+
+
+def test_queue_enqueue_sweeps_approved(tmp_path, monkeypatch):
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    conn.execute("UPDATE drafts SET status='approved' WHERE id='d1'")
+    conn.commit()
+    stub = tg.StubTelegram(updates=_message_batch("/queue enqueue", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Enqueued 1 approved draft(s)" in m["text"] for m in stub.sent)
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+
+
+def test_queue_remove_pulls_draft_back(tmp_path, monkeypatch):
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram(updates=_message_batch("/queue remove d1", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Removed `d1` from the queue" in m["text"] for m in stub.sent)
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
+    # draft stays approved (not deleted)
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+
+

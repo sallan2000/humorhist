@@ -518,6 +518,9 @@ HELP_TEXT = (
     "BUFFER & STATUS\n"
     "/buffer - buffer health report + on-demand top-up\n"
     "/buffer enqueue - also sweep approved drafts into the queue\n"
+    "/queue - list the publish queue (approved+queued drafts)\n"
+    "/queue enqueue - sweep approved drafts into the queue\n"
+    "/queue remove <id> - pull a draft back out of the queue (kept approved)\n"
     "/status - approved / rejected / pending breakdown\n"
     "/help - this message\n\n"
     "The bot also nudges you with 🆕 N new draft(s) when fresh drafts appear."
@@ -759,6 +762,30 @@ def telegram_buffer(conn, client, chat_id, *, enqueue: bool = False, auto_draft:
         client.send_message(chat_id, f"⚠️ Auto-draft error: {result['draft_error']}")
 
 
+def telegram_queue(conn, client, chat_id, *, action: str = "list", draft_id: str | None = None) -> None:
+    """Inbound /queue: manage the publish queue (Phase 4 handoff).
+
+    `/queue`              -> list approved+queued drafts (same as /listqueue)
+    `/queue enqueue`      -> sweep approved drafts into the queue
+    `/queue remove <id>`  -> pull a draft back out of the queue (keeps it approved)
+    """
+    if action == "enqueue":
+        n = review.enqueue_approved(conn)
+        client.send_message(chat_id, f"📥 Enqueued {n} approved draft(s) into the queue.")
+        send_queue_list(conn, client, chat_id)
+    elif action == "remove":
+        if not draft_id:
+            client.send_message(chat_id, "Usage: /queue remove <draft_id>")
+            return
+        removed = review.remove_from_queue(conn, draft_id)
+        if removed:
+            client.send_message(chat_id, f"↩️ Removed `{draft_id}` from the queue (kept approved).")
+        else:
+            client.send_message(chat_id, f"⚠️ `{draft_id}` was not in the queue.")
+    else:
+        send_queue_list(conn, client, chat_id)
+
+
 def telegram_draft(
     conn, client, chat_id, *, count: int = 3, min_score: float = 7.0
 ) -> None:
@@ -989,6 +1016,14 @@ def run_review_bot(
             # optional /buffer enqueue
             enqueue = "enqueue" in text.split()
             telegram_buffer(conn, client, chat_id, enqueue=enqueue)
+        elif cmd == "/queue":
+            # /queue | /queue enqueue | /queue remove <id>
+            bits = text.split()[1:]
+            action = bits[0].lower() if bits else "list"
+            if action == "remove":
+                telegram_queue(conn, client, chat_id, action="remove", draft_id=bits[1] if len(bits) > 1 else None)
+            else:
+                telegram_queue(conn, client, chat_id, action=action)
         elif cmd in ("/help", "/start"):
             client.send_message(chat_id, HELP_TEXT)
         else:

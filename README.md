@@ -190,10 +190,72 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /listapproved  list drafts you've greenlit; tap one to open it
     /listqueue     list approved+queued drafts and their post copy
     /viewcopy <id> open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)
+    /queue         list the publish queue (approved+queued drafts)
+    /queue enqueue  sweep approved drafts into the queue
+    /queue remove <id>  pull a draft back out of the queue (kept approved)
     /buffer        buffer health report + on-demand top-up
     /buffer enqueue  also sweep approved drafts into the queue
     /status        approved / rejected / pending breakdown
     /help          this list
+
+**Examples** (what you type → what happens)
+
+    /harvest
+        → "🌾 Harvesting new events…" then "🌾 Harvest done (seed +3; wiki +5).
+           Pool now: {'pool': 738, …}".
+
+    /screen 50
+        → "🔍 Scoring the pool with the LLM (batch 20)…" then "🔍 Screened.
+           {'scored': 50, 'skipped': 0}". (Needs HUMORHIST_LLM_API_KEY.)
+
+    /draft 4 8.0
+        → "✍️ Drafting 4 candidate(s) (min score 8.0)…" then "✍️ Drafted 4 new
+           draft(s). 9 pending total — send /reviewdraft to review them."
+           This is the only way to create drafts from chat.
+
+    /suggest The Great Emu War
+        → "💡 Suggested `the great emu war` added to the pool (id `a1b2c3d4…`).
+           It'll be drafted in a future harvest/draft pass."
+
+    /reviewdraft
+        → 📊 progress block, then one draft at a time with ✅/❌/⏸ buttons.
+        Tapping ✅ → bot asks "Reply with the one-line joke (the human voice)…";
+        you send it → "📝 Saved. Optional notes? (or /skip)" → /skip.
+        On a *pending* draft, send /notes then your steer ("lean into the
+        bureaucracy") to regenerate the angles with that as steering.
+
+    /later d4f1a2b3
+        → "⏸ `d4f1a2b3` deferred 30 days." (drops out of review until then.)
+
+    /listapproved
+        → list of greenlit drafts, each with a 👁 button to open its content.
+
+    /listqueue
+        → "📋 Queued drafts (3) — edit copy before publishing:" with one
+           ✏️ <title> button per row.
+
+    /viewcopy d4f1a2b3
+        → the post copy + N/280 count + ✏️ Edit / 🔄 Regenerate buttons.
+
+    /queue
+        → same list as /listqueue (approved+queued drafts).
+    /queue enqueue
+        → "📥 Enqueued 2 approved draft(s) into the queue." + the queue list.
+    /queue remove d4f1a2b3
+        → "↩️ Removed `d4f1a2b3` from the queue (kept approved)."
+
+    /buffer
+        → buffer health (pending/queued counts, level) + on-demand top-up if
+           the LLM key is set.
+    /buffer enqueue
+        → sweep approved→queue first, then the health report.
+
+    /status
+        → approved / rejected / pending breakdown + buffer level.
+
+If an LLM-backed command has no credential, you get a clean
+"⚠️ LLM unavailable: …" message instead of a crash (set HUMORHIST_LLM_API_KEY
+for unattended use).
 
 **What you do in Telegram**
 
