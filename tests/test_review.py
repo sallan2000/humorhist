@@ -7,6 +7,7 @@ both call apply_review(), so this is where the behaviour lives and is tested.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -214,3 +215,29 @@ def test_apply_review_reject_removes_from_queue(tmp_path):
     # flip to reject -> queue row must be cleaned up
     review.apply_review(conn, "d1", decision="reject")
     assert list(conn.execute("SELECT * FROM queue")) == []
+
+
+def test_defer_draft_sets_defer_until_and_pends(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    review.defer_draft(conn, "d1", days=30)
+    row = conn.execute("SELECT defer_until, status FROM drafts WHERE id='d1'").fetchone()
+    assert row["defer_until"] is not None
+    assert row["status"] == "pending"  # still reviewable later
+    # applying a review clears the defer
+    review.apply_review(conn, "d1", decision="approve")
+    assert conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()["defer_until"] is None
+
+
+def test_pending_drafts_orders_deferred_last(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "normal", "pending")
+    _make_draft(conn, "deferred", "pending")
+    # defer one far into the future
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    conn.execute("UPDATE drafts SET defer_until = ? WHERE id='deferred'", (future,))
+    conn.commit()
+    pend = review.pending_drafts(conn)
+    ids = [d["id"] for d in pend]
+    assert ids == ["normal", "deferred"]  # deferred sorts after the window
+

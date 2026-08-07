@@ -18,6 +18,7 @@ from pathlib import Path
 
 import humorhist.db as db
 import humorhist.render as render
+from humorhist.buffer import ESCALATE_THRESHOLD, NUDGE_THRESHOLD
 import humorhist.env as env  # noqa: F401  (loads local .env into os.environ)
 
 env.load_env()
@@ -122,8 +123,59 @@ def cmd_status(args: argparse.Namespace) -> int:
         "SELECT count(*) AS n FROM queue WHERE published = 0"
     ).fetchone()["n"]
     print(f"\nApproved and queued (unpublished): {queued}")
-    if queued < 3:
+    if queued < ESCALATE_THRESHOLD:
+        print("  ** BUFFER CRITICAL ** draft more / review now")
+    elif queued < NUDGE_THRESHOLD:
         print("  ** BUFFER LOW ** run a review session soon")
+    else:
+        print("  (healthy — a week+ of buffer)")
+    return 0
+
+
+def cmd_buffer(args: argparse.Namespace) -> int:
+    """Phase 3.4: report buffer health and auto-draft if running low.
+
+    With no flags it only reports. With --auto-draft it tops up candidates when
+    pending drafts are scarce (needs an LLM key). With --notify it DMs the
+    report to Telegram when the buffer is low (nudge/escalate).
+    """
+    import humorhist.buffer as buf
+
+    conn = _open_db(args.db)
+    telegram = None
+    chat_id = args.chat_id or os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
+    if args.notify:
+        if not os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
+            print("error: --notify needs HUMORHIST_TELEGRAM_BOT_TOKEN")
+            return 2
+        if not chat_id:
+            print("error: --notify needs --chat-id or HUMORHIST_TELEGRAM_CHAT_ID")
+            return 2
+        import humorhist.telegram as tg
+
+        telegram = tg.TelegramClient()
+
+    client = None
+    if args.auto_draft:
+        from humorhist.llm import default_client
+
+        client = default_client()
+
+    result = buf.run_buffer_check(
+        conn,
+        client=client if args.auto_draft else None,
+        auto_draft=args.auto_draft,
+        chat_id=chat_id,
+        telegram=telegram,
+    )
+    will_draft = bool(args.auto_draft and client is not None)
+    print(buf.health_message(result, will_draft=will_draft))
+    if result.get("drafted"):
+        print(f"Auto-drafted {result['drafted']} candidate(s).")
+    if result.get("draft_error"):
+        print(f"(auto-draft error: {result['draft_error']})")
+    if result.get("notified"):
+        print("(low-buffer alert sent to Telegram)")
     return 0
 
 
@@ -186,10 +238,15 @@ def cmd_review(args: argparse.Namespace) -> int:
         print("-" * 70)
 
         decision = _prompt_choice(
-            "Decision [a/r/s] (approve/reject/skip)", {"a": "approve", "r": "reject", "s": "skip"}
+            "Decision [a/r/s/l] (approve/reject/skip/later)",
+            {"a": "approve", "r": "reject", "s": "skip", "l": "later"},
         )
         if decision == "skip":
             print("  skipped\n")
+            continue
+        if decision == "later":
+            review.defer_draft(conn, row["id"])
+            print("  -> deferred 30 days\n")
             continue
 
         editor_line = input("  Editor line (optional, Enter to skip): ").strip()
@@ -221,6 +278,27 @@ def cmd_review(args: argparse.Namespace) -> int:
         print()
 
     print(f"Review session done. {acted} draft(s) decided.")
+    return 0
+
+
+def cmd_suggest(args: argparse.Namespace) -> int:
+    """Add an editor-suggested event/topic to the pool (plan 3.2 /suggest).
+
+    Suggested items enter with status 'new' and a NULL score so they flow
+    through the normal draft pipeline on the next harvest/draft pass.
+    """
+    import humorhist.db as db
+
+    conn = _open_db(args.db)
+    pool_id = db.add_suggested_pool_item(
+        conn,
+        title=args.topic,
+        note=args.note,
+        source_url=args.source_url,
+        year=args.year,
+    )
+    print(f"Suggested '{args.topic}' added to the pool (id {pool_id[:8]}…).")
+    print("It will be drafted in a future harvest/draft pass.")
     return 0
 
 
@@ -493,12 +571,25 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="pool/draft/queue health")
     st.set_defaults(func=cmd_status)
 
+    bf = sub.add_parser("buffer", help="Phase 3.4: buffer health + auto-draft")
+    bf.add_argument("--auto-draft", action="store_true", help="top up candidates when pending is low")
+    bf.add_argument("--notify", action="store_true", help="DM a low-buffer alert to Telegram")
+    bf.add_argument("--chat-id", default=None, help="Telegram chat id to DM")
+    bf.set_defaults(func=cmd_buffer)
+
     sh = sub.add_parser("show", help="print a draft in full")
     sh.add_argument("draft_id", nargs="?", default=None)
     sh.set_defaults(func=cmd_show)
 
     rv = sub.add_parser("review", help="Phase 3: approve/reject pending drafts")
     rv.set_defaults(func=cmd_review)
+
+    sg = sub.add_parser("suggest", help="add an editor-suggested event to the pool")
+    sg.add_argument("topic", help="the event/topic to suggest")
+    sg.add_argument("--note", default=None, help="optional context/steering note")
+    sg.add_argument("--source-url", default=None, help="optional source URL")
+    sg.add_argument("--year", type=int, default=None, help="optional year")
+    sg.set_defaults(func=cmd_suggest)
 
     tr = sub.add_parser("telegram-review", help="Phase 3.3: Telegram review loop")
     tr.add_argument("--chat-id", default=None, help="Telegram chat id to DM")

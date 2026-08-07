@@ -70,11 +70,12 @@ def test_send_pending_drafts_sends_one_message_per_pending(tmp_path):
     sent = tg.send_pending_drafts(conn, stub, "chat")
 
     assert len(sent) == 2
-    # each sent message carried the inline Approve/Reject keyboard
+    # each sent message carried the inline Approve/Reject/Later keyboard
     for s in stub.sent:
         kb = s["reply_markup"]["inline_keyboard"][0]
-        assert {b["callback_data"] for b in kb} == {"approve:d1", "reject:d1"} or \
-               {b["callback_data"] for b in kb} == {"approve:d2", "reject:d2"}
+        cbs = {b["callback_data"] for b in kb}
+        assert cbs == {"approve:d1", "reject:d1", "later:d1"} or \
+               cbs == {"approve:d2", "reject:d2", "later:d2"}
 
 
 def test_send_pending_drafts_empty_when_none_pending(tmp_path):
@@ -721,3 +722,107 @@ def test_dispatch_listqueue_and_viewcopy(tmp_path):
     stub.sent.clear()
     tg.send_copy_content(conn, stub, "chat", "d1")
     assert any("POST COPY" in m["text"] for m in stub.sent)
+
+
+# --- /later (defer a pending draft) ----------------------------------------
+
+
+def test_handle_callback_later_defers_draft(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "later:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res and res.get("deferred") is True
+    row = conn.execute("SELECT defer_until, status FROM drafts WHERE id='d1'").fetchone()
+    assert row["defer_until"] is not None
+    assert row["status"] == "pending"  # still reviewable later
+    assert any("deferred" in m["text"].lower() for m in stub.sent)
+
+
+def test_run_review_bot_later_command(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram(updates=[
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/later d1"}},
+    ])
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    row = conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()
+    assert row["defer_until"] is not None
+    assert any("deferred 30 days" in m["text"] for m in stub.sent)
+
+
+# --- /suggest (editor-submitted pool candidate) ----------------------------
+
+
+def test_run_review_bot_suggest_command(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=[
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
+                                      "text": "/suggest The Dancing Plague of 1518"}},
+    ])
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    row = conn.execute("SELECT title, status, source_name FROM pool WHERE title='The Dancing Plague of 1518'").fetchone()
+    assert row is not None
+    assert row["status"] == "new"
+    assert row["source_name"] == "editor-suggestion"
+    assert any("Suggested" in m["text"] for m in stub.sent)
+
+
+# --- notes -> angle regeneration (pending draft) ---------------------------
+
+
+def test_notes_on_pending_draft_regenerates_angles(tmp_path, monkeypatch):
+    import json
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    # A minimal valid angles payload (3 angles) for the stub to return.
+    def _angles():
+        return {
+            "angles": [
+                {"angle_name": "A", "setup": "s", "why_it_lands": "w",
+                 "pitfalls": "p", "raw_material": ["r"]},
+                {"angle_name": "B", "setup": "s", "why_it_lands": "w",
+                 "pitfalls": "p", "raw_material": ["r"]},
+                {"angle_name": "C", "setup": "s", "why_it_lands": "w",
+                 "pitfalls": "p", "raw_material": ["r"]},
+            ],
+            "strongest_single_detail": "d",
+            "suggested_hook": "h",
+        }
+
+    conn = _fresh_db(tmp_path)
+    # seed a PENDING draft with a brief + angles so regeneration has something
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x','Emu War','drafted')")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','pool-x',?,?,'pending','2026-01-01T00:00:00+00:00')",
+        (json.dumps({"verified_facts": ["x"]}), json.dumps(_angles())),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(llm, "default_client", lambda: StubClient([_angles()]))
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "notes:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res and res.get("regenerate_angles") is True
+    note_msg_id = res["note_message_id"]
+    awaiting = {"d1": {"note_message_id": note_msg_id, "stage": "notes",
+                        "decision": "approve", "regenerate_angles": True}}
+    out = tg.handle_text(
+        conn, stub, "chat", awaiting,
+        _text_update(2, "lean into bureaucracy", note_msg_id),
+    )
+    assert out.get("angles_regenerated") == "d1"
+    row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_notes"] == "lean into bureaucracy"
+    # draft stays pending (no review decision made)
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "pending"
+

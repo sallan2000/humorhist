@@ -11,6 +11,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
+import humorhist.db as db
+
 # Decisions the review gate understands. ``skip`` is handled by the caller
 # (it means "leave pending, move on") and never reaches apply_review.
 APPROVE = "approve"
@@ -23,11 +25,26 @@ _REVIEWABLE_STATUSES = {"pending", "approved", "rejected"}
 
 
 def pending_drafts(conn: sqlite3.Connection) -> list[dict]:
-    """Return all drafts with status 'pending', oldest first."""
+    """Return all drafts with status 'pending', review-order friendly.
+
+    Deferred drafts (``defer_until`` set in the future) sort *after* the
+    non-deferred ones, so they stay out of the review surface until their
+    window opens. Drafts whose defer window has already passed sort as normal
+    pending (the /later window expired).
+    """
+    now = datetime.now(timezone.utc).isoformat()
     return [
         dict(r)
         for r in conn.execute(
-            "SELECT * FROM drafts WHERE status = 'pending' ORDER BY created_at ASC, id ASC"
+            """
+            SELECT * FROM drafts
+            WHERE status = 'pending'
+            ORDER BY
+              CASE WHEN defer_until IS NOT NULL AND defer_until > ? THEN 1 ELSE 0 END,
+              created_at ASC,
+              id ASC
+            """,
+            (now,),
         )
     ]
 
@@ -126,7 +143,8 @@ def apply_review(
     conn.execute(
         """
         UPDATE drafts
-        SET status = ?, reviewed_at = ?, editor_line = ?, editor_notes = ?
+        SET status = ?, reviewed_at = ?, editor_line = ?, editor_notes = ?,
+            defer_until = NULL
         WHERE id = ?
         """,
         (
@@ -222,3 +240,13 @@ def approved_drafts(conn: sqlite3.Connection) -> list[dict]:
             """
         )
     ]
+
+
+def defer_draft(conn: sqlite3.Connection, draft_id: str, days: int = 30) -> None:
+    """Defer a pending draft for ``days`` (the /later command). See ``db.defer_draft``."""
+    db.defer_draft(conn, draft_id, days=days)
+
+
+def clear_defer(conn: sqlite3.Connection, draft_id: str) -> None:
+    """Clear a draft's defer_until (convenience over ``db.clear_defer``)."""
+    db.clear_defer(conn, draft_id)

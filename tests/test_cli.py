@@ -87,7 +87,8 @@ def test_status_on_empty_db(dbpath, capsys):
     assert rc == 0
     assert "humorhist status" in out
     assert "unscored : 0" in out
-    assert "BUFFER LOW" in out
+    # empty buffer (0 queued) must be flagged as critical under the new thresholds
+    assert "BUFFER CRITICAL" in out
 
 
 def test_status_reports_score_bands(dbpath, capsys):

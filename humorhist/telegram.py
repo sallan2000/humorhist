@@ -155,6 +155,7 @@ def _keyboard(draft_id: str) -> dict:
             [
                 {"text": "✅ Approve", "callback_data": f"approve:{draft_id}"},
                 {"text": "❌ Reject", "callback_data": f"reject:{draft_id}"},
+                {"text": "⏸ Later", "callback_data": f"later:{draft_id}"},
             ]
         ]
     }
@@ -276,12 +277,38 @@ def handle_callback(
     if data.startswith("notes:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="add notes")
-        note = client.send_message(
-            chat_id,
-            f"Notes for already-approved draft `{draft_id}`. Reply here "
-            f"(or send /skip to leave the existing notes untouched):",
+        # For a *pending* draft, a note should regenerate the angles (steering),
+        # not just store text. For an already-approved draft, store the note.
+        row = conn.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+        is_pending = row and row["status"] == "pending"
+        prompt = (
+            f"Reply with a note to STEER the angles for pending draft `{draft_id}` "
+            f"(or /skip to keep the current angles):"
+            if is_pending
+            else f"Notes for already-approved draft `{draft_id}`. Reply here "
+            f"(or send /skip to leave the existing notes untouched):"
         )
-        return {"draft_id": draft_id, "note_message_id": note["message_id"]}
+        note = client.send_message(chat_id, prompt)
+        return {
+            "draft_id": draft_id,
+            "note_message_id": note["message_id"],
+            "stage": "notes",
+            "decision": "approve",
+            "regenerate_angles": bool(is_pending),
+        }
+    if data.startswith("later:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="deferred 30d")
+        try:
+            review.defer_draft(conn, draft_id)
+        except ValueError:
+            client.answer_callback_query(cq["id"], text="cannot defer")
+            return None
+        client.send_message(
+            chat_id,
+            f"⏸ Draft `{draft_id}` deferred for 30 days (it'll resurface in the review queue then).",
+        )
+        return {"draft_id": draft_id, "deferred": True}
     if data.startswith("view:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="opened")
@@ -418,6 +445,24 @@ def handle_text(
         awaiting.pop(draft_id, None)
         client.send_message(chat_id, f"Notes left blank for `{draft_id}`.")
         return {"skipped": draft_id}
+    # If this note came from a *pending* draft's "steer angles" prompt, regenerate
+    # the angles with the note as steering (the /notes -> angles behaviour).
+    if (st or {}).get("regenerate_angles"):
+        from humorhist.brief import regenerate_angles
+        from humorhist.llm import default_client
+
+        try:
+            regenerate_angles(conn, default_client(), draft_id, steering_note=text)
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive on LLM failure
+            client.send_message(chat_id, f"Angle regen failed for `{draft_id}`: {exc}")
+            return {"angle_regen_failed": draft_id}
+        awaiting.pop(draft_id, None)
+        client.send_message(
+            chat_id,
+            f"🔄 Angles regenerated for `{draft_id}` using your note as steering. "
+            f"Review them with /reviewdraft or /show.",
+        )
+        return {"angles_regenerated": draft_id}
     # merge=True keeps the editor_line we just captured; only notes change.
     review.apply_review(conn, draft_id, decision=decision, notes=text, merge=True)
     awaiting.pop(draft_id, None)
@@ -427,10 +472,12 @@ def handle_text(
 
 HELP_TEXT = (
     "HumorHist review bot\n\n"
-    "/reviewdraft - review pending drafts one by one (Approve/Reject + notes)\n"
+    "/reviewdraft - review pending drafts one by one (Approve/Reject/Later + joke + notes)\n"
     "/listapproved - list drafts you've greenlit; tap one to open it\n"
     "/listqueue - list approved+queued drafts and their post copy\n"
     "/viewcopy <id> - open a queued draft's post copy (edit / regenerate)\n"
+    "/later <id> - defer a pending draft 30 days\n"
+    "/suggest <topic> - add an editor-suggested event to the pool\n"
     "/status - approved / rejected / pending breakdown\n"
     "/help - this message"
 )
@@ -748,6 +795,30 @@ def run_review_bot(
                 send_copy_content(conn, client, chat_id, target[1])
         elif cmd == "/status":
             send_reviewed_summary(conn, client, chat_id)
+        elif cmd == "/later":
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                client.send_message(chat_id, "Usage: /later <draft_id>")
+            else:
+                did = parts[1].strip()
+                try:
+                    review.defer_draft(conn, did)
+                except ValueError as exc:
+                    client.send_message(chat_id, f"Cannot defer: {exc}")
+                else:
+                    client.send_message(chat_id, f"⏸ `{did}` deferred 30 days.")
+        elif cmd == "/suggest":
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                client.send_message(chat_id, "Usage: /suggest <topic or event>")
+            else:
+                topic = parts[1].strip()
+                pool_id = db.add_suggested_pool_item(conn, title=topic)
+                client.send_message(
+                    chat_id,
+                    f"💡 Suggested `{topic}` added to the pool (id `{pool_id[:8]}…`). "
+                    f"It'll be drafted in a future harvest/draft pass.",
+                )
         elif cmd in ("/help", "/start"):
             client.send_message(chat_id, HELP_TEXT)
         else:

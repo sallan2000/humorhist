@@ -154,3 +154,52 @@ def test_counts(tmp_path):
     )
     counts = db.counts(conn)
     assert counts == {"pool": 1, "drafts": 0, "queue": 0, "posts": 0}
+
+
+def test_migrate_adds_defer_and_note_columns(tmp_path):
+    conn = _fresh_db(tmp_path)
+    db.migrate(conn)  # idempotent re-run must keep the new columns
+    draft_cols = {r[1] for r in conn.execute("PRAGMA table_info(drafts)")}
+    pool_cols = {r[1] for r in conn.execute("PRAGMA table_info(pool)")}
+    assert "defer_until" in draft_cols
+    assert "note" in pool_cols
+
+
+def test_add_suggested_pool_item_inserts_new(tmp_path):
+    conn = _fresh_db(tmp_path)
+    pid = db.add_suggested_pool_item(conn, title="The Dancing Plague of 1518", note="lean into mass hysteria")
+    row = db.get_pool_item(conn, pid)
+    assert row["title"] == "The Dancing Plague of 1518"
+    assert row["status"] == "new"
+    assert row["funny_score"] is None
+    assert row["source_name"] == "editor-suggestion"
+    assert row["note"] == "lean into mass hysteria"
+
+
+def test_add_suggested_pool_item_is_idempotent(tmp_path):
+    conn = _fresh_db(tmp_path)
+    db.add_suggested_pool_item(conn, title="Same Topic", note="first")
+    db.add_suggested_pool_item(conn, title="Same Topic", note="second")
+    rows = conn.execute("SELECT count(*) n FROM pool WHERE title='Same Topic'").fetchone()["n"]
+    assert rows == 1
+    row = conn.execute("SELECT note, status FROM pool WHERE title='Same Topic'").fetchone()
+    assert row["note"] == "second"
+    assert row["status"] == "new"
+
+
+def test_defer_draft_sets_defer_until(tmp_path):
+    conn = _fresh_db(tmp_path)
+    db.upsert_pool_item(conn, id="p1", title="t", year=None, date_hint=None, summary=None, source_url=None, source_name=None)
+    conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1','p1','pending')")
+    conn.commit()
+    db.defer_draft(conn, "d1", days=30)
+    row = conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()
+    assert row["defer_until"] is not None
+    # cannot defer a non-pending draft
+    db.set_status(conn, "drafts", "d1", "approved")
+    with pytest.raises(ValueError):
+        db.defer_draft(conn, "d1")
+    # clear works
+    db.clear_defer(conn, "d1")
+    assert conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()["defer_until"] is None
+

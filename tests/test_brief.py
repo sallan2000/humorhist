@@ -282,3 +282,58 @@ def test_angles_system_prompt_is_meaningful():
     assert "caveats" in ANGLES_SYSTEM_PROMPT
     assert "misconceptions" in ANGLES_SYSTEM_PROMPT
     assert "STRICT JSON" in ANGLES_SYSTEM_PROMPT
+
+
+# --- regenerate_angles (steering on an editor note) ------------------------
+
+import json  # noqa: E402
+import humorhist.db as db  # noqa: E402
+from humorhist.brief import regenerate_angles  # noqa: E402
+
+
+def _seed_pending_with_brief(tmp_path):
+    path = tmp_path / "test.sqlite"
+    conn = db.connect(str(path))
+    db.migrate(conn)
+    db.upsert_pool_item(
+        conn,
+        id="pool-emu",
+        title=EMU_ITEM["title"],
+        year=EMU_ITEM["year"],
+        date_hint=None,
+        summary=EMU_ITEM["summary"],
+        source_url=None,
+        source_name=None,
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','pool-emu',?,?,'pending','2026-01-01T00:00:00+00:00')",
+        (json.dumps(EMU_BRIEF), json.dumps(_good_payload())),
+    )
+    conn.commit()
+    return conn
+
+
+def test_regenerate_angles_rewrites_angles_with_steering(tmp_path):
+    conn = _seed_pending_with_brief(tmp_path)
+    client = StubClient([_good_payload()])
+    angles = regenerate_angles(conn, client, "d1", steering_note="lean into bureaucracy")
+    assert angles == _good_payload()  # validates + writes back
+    row = conn.execute("SELECT angles_json, editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert json.loads(row["angles_json"]) == _good_payload()
+    assert row["editor_notes"] == "lean into bureaucracy"
+    # the steering note must have reached the prompt
+    last = client.calls[-1]
+    assert last["user"].strip().endswith(
+        "Produce the comic angles payload now, following the system instructions exactly."
+    )
+    assert "EDITOR STEERING" in last["user"]
+    assert "lean into bureaucracy" in last["user"]
+
+
+def test_regenerate_angles_rejects_non_pending(tmp_path):
+    conn = _seed_pending_with_brief(tmp_path)
+    db.set_status(conn, "drafts", "d1", "approved")
+    with pytest.raises(ValueError):
+        regenerate_angles(conn, StubClient([_good_payload()]), "d1")
+

@@ -18,6 +18,8 @@ network.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from typing import Any
 
 from humorhist.llm import LLMClient, LLMError
@@ -113,12 +115,16 @@ JSON.
 
 # --- Prompt construction ----------------------------------------------------
 
-def build_angles_prompt(item: dict, brief: dict) -> str:
+def build_angles_prompt(item: dict, brief: dict, steering_note: str | None = None) -> str:
     """Render the item + verified brief into the user prompt for the model.
 
     The disputed-claim warnings (``caveats`` and ``misconceptions``) are
     surfaced explicitly so the model cannot miss them -- a writer must never
     accidentally build a joke on a debunked claim.
+
+    When ``steering_note`` is provided (e.g. an editor's /notes on a pending
+    draft), it is appended as explicit steering so regeneration can pivot the
+    angles toward what the human wants.
     """
     lines: list[str] = []
 
@@ -160,6 +166,11 @@ def build_angles_prompt(item: dict, brief: dict) -> str:
     )
     _section("SOURCES:", brief.get("sources"))
     _section("SENSITIVITY FLAGS:", brief.get("sensitivity_flags"))
+
+    if steering_note:
+        lines.append("EDITOR STEERING (the human editor wants angles that lean into this):")
+        lines.append(f"  {steering_note.strip()}")
+        lines.append("")
 
     lines.append(
         "Produce the comic angles payload now, following the system "
@@ -251,14 +262,18 @@ def generate_angles(
     *,
     max_tokens: int = 4096,
     temperature: float = 0.7,
+    steering_note: str | None = None,
 ) -> dict:
     """Generate validated comic angles for ``item`` from ``brief``.
 
     Makes a single LLM call, validates the result, and -- if validation fails --
     retries ONCE with the specific validation error appended so the model can
     self-correct. Raises :class:`AnglesError` if both attempts fail.
+
+    ``steering_note`` (an editor's note) is forwarded into the prompt so the
+    angles pivot toward what the human wants (used by regeneration).
     """
-    prompt = build_angles_prompt(item, brief)
+    prompt = build_angles_prompt(item, brief, steering_note=steering_note)
     last_error: Exception | None = None
 
     for _ in range(_MAX_ATTEMPTS):
@@ -283,3 +298,64 @@ def generate_angles(
     if last_error is None:  # pragma: no cover - defensive
         last_error = AnglesError("generate_angles failed with no error captured")
     raise last_error
+
+
+def regenerate_angles(
+    conn: sqlite3.Connection,
+    client: LLMClient,
+    draft_id: str,
+    *,
+    steering_note: str | None = None,
+    http_client=None,
+) -> dict:
+    """Re-generate the comic angles for an existing draft, steering on a note.
+
+    Used by the Telegram ``/notes`` flow on a *pending* draft: instead of only
+    storing the note, it re-runs angle generation with the note as steering and
+    writes the fresh ``angles_json`` back onto the draft (and stores the note as
+    ``editor_notes``). The draft stays ``pending`` -- no review decision is made.
+
+    Reuses the draft's existing ``brief_json``; only the angles are regenerated.
+    Raises ValueError if the draft is unknown or not pending.
+    """
+    import json
+
+    import humorhist.db as db
+
+    row = conn.execute(
+        "SELECT id, pool_id, brief_json, angles_json, status FROM drafts WHERE id = ?",
+        (draft_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no draft with id {draft_id!r}")
+    if row["status"] != "pending":
+        raise ValueError(
+            f"draft {draft_id!r} has status {row['status']!r}; only pending drafts can regenerate angles"
+        )
+
+    item = _row_to_item(db.get_pool_item(conn, row["pool_id"]))
+    brief = json.loads(row["brief_json"] or "{}")
+    angles = generate_angles(client, item, brief, steering_note=steering_note)
+
+    conn.execute(
+        "UPDATE drafts SET angles_json = ?, editor_notes = ? WHERE id = ?",
+        (json.dumps(angles, ensure_ascii=False), (steering_note or "").strip() or None, draft_id),
+    )
+    conn.commit()
+    return angles
+
+
+def _row_to_item(row: sqlite3.Row | None) -> dict:
+    """Adapt a pool row into the item dict the brief/drafting code expects."""
+    if row is None:
+        return {}
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "year": row["year"],
+        "summary": row["summary"],
+        "source_url": row["source_url"],
+        "url": row["source_url"],  # alias the fact-check prompt looks for
+        "source_name": row["source_name"],
+        "funny_score": row["funny_score"],
+    }
