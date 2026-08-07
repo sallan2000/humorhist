@@ -63,6 +63,14 @@ repo):
     HUMORHIST_CHAR_LIMIT      Optional. Max length of generated post copy
                               (default 280). Raise it (e.g. 280 -> 400) if you
                               later post to a platform with a larger limit.
+    HUMORHIST_IMAGE_API_KEY   Optional. Enables story-image generation on approve
+                              (FAL FLUX). When unset, approval still works; the
+                              image step is skipped silently.
+    HUMORHIST_IMAGE_STYLE     Optional. One of: editorial-historical (default),
+                              editorial-cartoon, meme.
+    HUMORHIST_IMAGE_DIR       Optional. Where generated PNGs are written
+                              (default: <data dir>/images).
+    HUMORHIST_IMAGE_MODEL     Optional. FAL model id (default: fal-ai/flux/dev).
 
 The client speaks the OpenAI-compatible /chat/completions schema, so any
 provider that exposes that endpoint works — point BASE_URL at it and set the
@@ -181,7 +189,9 @@ the weekly timer, etc.) — you don't have to remember to poll it.
 **Commands**
 
     /reviewdraft   review pending drafts one by one (✅ Approve / ❌ Reject / ⏸ Later)
-                  on Approve the bot asks for your one-line joke, then optional notes
+                  on Approve the bot asks for your one-line joke, then optional notes;
+                  if HUMORHIST_IMAGE_API_KEY is set it also generates a story image
+                  and shows it as a preview (skipped silently otherwise)
     /harvest       top up the candidate pool from seed + Wikipedia lists
     /screen [limit]  LLM-score unscored pool candidates
     /draft [count] [min_score]  fact-check + generate angles for top candidates
@@ -221,6 +231,8 @@ the weekly timer, etc.) — you don't have to remember to poll it.
         → 📊 progress block, then one draft at a time with ✅/❌/⏸ buttons.
         Tapping ✅ → bot asks "Reply with the one-line joke (the human voice)…";
         you send it → "📝 Saved. Optional notes? (or /skip)" → /skip.
+        If HUMORHIST_IMAGE_API_KEY is set, the bot also DMs a generated
+        🖼️ story image (and opens it again from /listapproved / /viewcopy).
         On a *pending* draft, send /notes then your steer ("lean into the
         bureaucracy") to regenerate the angles with that as steering.
 
@@ -378,7 +390,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-251 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
+263 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -395,6 +407,13 @@ The **B+ copy loop** is done (2026-08-06): on approve, post copy is generated
 (≤280 chars, `HUMORHIST_CHAR_LIMIT`-driven) and is editable via the CLI
 `copy show/edit/regen` commands and Telegram `/listqueue` + `/viewcopy`
 (inline ✏️ Edit / 🔄 Regenerate). See "Phase 4: post copy" above.
+
+**Story images (A+B, 2026-08-07):** on approve, an AI image representing the
+story is generated (FAL FLUX, gated by `HUMORHIST_IMAGE_API_KEY`) and shown as
+a Telegram preview; the prompt + PNG path are persisted on the `queue` row
+(`image_prompt` / `image_path`) so a future publisher can attach them. The
+image step is best-effort: with no image key it is skipped silently and the
+rest of the pipeline is unaffected.
 
 **Telegram-primary (2026-08-07):** the entire pipeline is now drivable from
 Telegram, not just review/edit. From chat you can `/harvest` the pool,

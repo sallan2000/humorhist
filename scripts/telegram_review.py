@@ -50,13 +50,18 @@ def main() -> int:
     db.migrate(conn)
     client = tg.TelegramClient()
 
+    # Where generated story images are written. Derive a sane default next to the
+    # DB (../images) when HUMORHIST_IMAGE_DIR is unset.
+    default_img_dir = str(Path(args.db).resolve().parent / "images")
+    image_dir = os.environ.get("HUMORHIST_IMAGE_DIR", default_img_dir)
+
     if args.once:
-        decided = tg.run_review_bot(conn, client, chat_id, once=True)
+        decided = tg.run_review_bot(conn, client, chat_id, once=True, image_dir=image_dir)
         print(f"telegram-review (once): {decided} decision(s) processed")
         return 0
 
     print("telegram-review loop started (Ctrl-C to stop)", flush=True)
-    tg.run_review_bot(conn, client, chat_id)
+    tg.run_review_bot(conn, client, chat_id, image_dir=image_dir)
     return 0
 
 

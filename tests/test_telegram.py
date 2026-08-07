@@ -723,6 +723,80 @@ def test_editor_line_approve_without_llm_skips_copy_gracefully(tmp_path, monkeyp
 
 
 
+def test_approve_generates_story_image_preview_and_persists(tmp_path, monkeypatch):
+    """On approve, A+B image gen must run (when an image client is available),
+    send a photo preview to chat, and persist prompt + path on the queue row."""
+    import humorhist.imagegen as ig
+    from humorhist.llm import StubClient
+
+    # LLM for the image-prompt step + post copy; image client returns PNG bytes.
+    monkeypatch.setattr(
+        "humorhist.llm.default_client",
+        lambda: StubClient([{"prompt": "a wry period scene of the tax-dodge bear"}, {"post": "The bear was a tax dodge."}]),
+    )
+    img_client = ig.StubImageClient([b"\x89PNG\r\n\x1a\n fake-png-bytes"])
+    monkeypatch.setattr(
+        "humorhist.imagegen.resilient_image_client", lambda: img_client
+    )
+
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    img_dir = tmp_path / "images"
+    stub = tg.StubTelegram()
+    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    editor_line_msg_id = cb_res["note_message_id"]
+    awaiting = {"d1": {"note_message_id": editor_line_msg_id, "stage": "editor_line", "decision": "approve"}}
+
+    res1 = tg.handle_text(
+        conn, stub, "chat", awaiting, _text_update(2, "The bear was a tax dodge.", editor_line_msg_id),
+        image_dir=str(img_dir),
+    )
+    assert res1.get("editor_line_set") == "d1"
+
+    # a photo was sent as a preview
+    photos = [m for m in stub.sent if "photo" in m]
+    assert photos, "expected a story image preview to be sent"
+    assert photos[0]["photo"] == b"\x89PNG\r\n\x1a\n fake-png-bytes"
+
+    # the prompt + path were persisted on the queue row
+    info = db.get_image(conn, "d1")
+    assert info is not None
+    assert info["image_prompt"] == "a wry period scene of the tax-dodge bear"
+    assert info["image_path"] and info["image_path"].endswith("d1.png")
+    assert Path(info["image_path"]).is_file()
+
+
+def test_approve_skips_image_when_no_image_client(tmp_path, monkeypatch):
+    """When no image credential is available, approve must still succeed and NOT
+    send a photo -- image generation is best-effort and must not block review."""
+    from humorhist.imagegen import ImageUnavailable
+    from humorhist.llm import StubClient
+
+    def _no_img():
+        raise ImageUnavailable("no key")
+
+    monkeypatch.setattr("humorhist.llm.default_client", lambda: StubClient([{"post": "x"}]))
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client", _no_img)
+
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
+
+    tg.handle_text(
+        conn, stub, "chat", awaiting, _text_update(2, "The bear was a tax dodge.", cb_res["note_message_id"]),
+        image_dir=str(tmp_path / "images"),
+    )
+    # no photo sent
+    assert not any("photo" in m for m in stub.sent)
+    # queue row exists but no image persisted
+    info = db.get_image(conn, "d1")
+    assert info is not None
+    assert info["image_path"] is None
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+
+
 def test_callback_copy_opens_copy_content(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)

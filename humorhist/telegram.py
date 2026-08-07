@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -30,6 +31,26 @@ import humorhist.render as render
 import humorhist.review as review
 
 API_BASE = "https://api.telegram.org"
+
+
+def _resolve_image_dir(image_dir: str | None) -> str | None:
+    """Resolve where generated story images are written.
+
+    Priority: explicit ``image_dir`` argument, then the ``HUMORHIST_IMAGE_DIR``
+    env var, then ``<repo>/data/images``. Returns ``None`` only if even the
+    fallback can't be located (shouldn't happen); callers treat a missing dir as
+    "skip image generation" rather than crashing the approve path.
+    """
+    if image_dir:
+        return str(image_dir)
+    env_dir = os.environ.get("HUMORHIST_IMAGE_DIR")
+    if env_dir:
+        return env_dir
+    try:
+        repo = Path(__file__).resolve().parent.parent
+        return str(repo / "data" / "images")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _get_llm(chat_id: str, client: "TelegramTransport", *, silent: bool = False):
@@ -56,6 +77,27 @@ def _get_llm(chat_id: str, client: "TelegramTransport", *, silent: bool = False)
         return None
 
 
+def _get_image_client(chat_id: str, client: "TelegramTransport", *, silent: bool = False):
+    """Return a resilient image client, or ``None`` if none is available.
+
+    Mirrors ``_get_llm``: missing ``HUMORHIST_IMAGE_API_KEY`` yields ``None``
+    (callers skip image generation, post copy + pipeline unaffected) instead of
+    surfacing a traceback to the user's phone.
+    """
+    from humorhist.imagegen import ImageUnavailable, resilient_image_client
+
+    try:
+        return resilient_image_client()
+    except ImageUnavailable as exc:
+        if not silent:
+            client.send_message(
+                chat_id,
+                f"🖼️ Story image skipped (no image credential: {exc}). "
+                f"Set HUMORHIST_IMAGE_API_KEY to enable. (Post copy unaffected.)",
+            )
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Transport protocol + stub                                                   #
 # --------------------------------------------------------------------------- #
@@ -68,6 +110,10 @@ class TelegramTransport(Protocol):
 
     def send_message(
         self, chat_id: str, text: str, reply_markup: dict | None = None
+    ) -> dict: ...
+
+    def send_photo(
+        self, chat_id: str, photo: bytes | str, caption: str | None = None
     ) -> dict: ...
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict: ...
@@ -108,6 +154,20 @@ class StubTelegram:
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict:
         self.answered.add(callback_query_id)
         return {}
+
+    def send_photo(
+        self, chat_id: str, photo: bytes | str, caption: str | None = None
+    ) -> dict:
+        self._mid += 1
+        msg: dict[str, Any] = {
+            "message_id": self._mid,
+            "chat_id": chat_id,
+            "photo": photo,
+        }
+        if caption is not None:
+            msg["caption"] = caption
+        self.sent.append(msg)
+        return msg
 
 
 class TelegramError(RuntimeError):
@@ -166,6 +226,42 @@ class TelegramClient:
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         return self._call("sendMessage", params)
+
+    def send_photo(
+        self, chat_id: str, photo: bytes | str, caption: str | None = None
+    ) -> dict:
+        params: dict[str, Any] = {"chat_id": chat_id}
+        # ``photo`` may be raw bytes (we send multipart) or a file_id / URL
+        # (we send as a string param). Telegram's sendPhoto takes either.
+        if isinstance(photo, (bytes, bytearray)):
+            files = {"photo": ("image.png", bytes(photo), "image/png")}
+            if caption is not None:
+                params["caption"] = caption
+            # _call only does JSON; do a small multipart POST here.
+            if not self.token:
+                raise TelegramError(
+                    "no bot token: set HUMORHIST_TELEGRAM_BOT_TOKEN or pass token="
+                )
+            url = f"{API_BASE}/bot{self.token}/sendPhoto"
+            last: Exception | None = None
+            for attempt in range(self.max_retries + 1):
+                try:
+                    with httpx.Client(timeout=self.timeout) as client:
+                        resp = client.post(url, data=params, files=files)
+                        resp.raise_for_status()
+                        body = resp.json()
+                    if not body.get("ok"):
+                        raise TelegramError(f"Telegram API error: {body}")
+                    return body["result"]
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    if attempt < self.max_retries:
+                        time.sleep(2 ** attempt)
+            raise TelegramError(f"Telegram sendPhoto failed: {last}")
+        params["photo"] = photo
+        if caption is not None:
+            params["caption"] = caption
+        return self._call("sendPhoto", params)
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict:
         return self._call(
@@ -382,6 +478,8 @@ def handle_text(
     chat_id: str,
     awaiting: dict,
     update: dict,
+    *,
+    image_dir: str | None = None,
 ) -> dict | None:
     """Process a reply to a review prompt.
 
@@ -455,6 +553,35 @@ def handle_text(
                     fill_post_copy(conn, llm, draft_id=draft_id)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[telegram] post copy not generated for {draft_id}: {exc}")
+            # A+B image: generate a story picture on approve, best-effort.
+            # Missing image credential or generation failure => skip silently
+            # (post copy + pipeline unaffected). On success, persist the prompt
+            # + path on the queue row and show a preview in chat.
+            img_client = _get_image_client(chat_id, client, silent=True)
+            if img_client is not None:
+                try:
+                    from humorhist import imagegen as ig
+                    from humorhist.llm import default_client
+
+                    out_dir = _resolve_image_dir(image_dir)
+                    if out_dir:
+                        draft_row = dict(
+                            conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+                        )
+                        pool_row = db.get_pool_item(conn, draft_row["pool_id"])
+                        path, prompt = ig.generate_image(
+                            default_client(), img_client, draft_row,
+                            dict(pool_row) if pool_row else None,
+                            out_dir=out_dir, draft_id=draft_id,
+                        )
+                        db.set_image(conn, draft_id, image_prompt=prompt, image_path=path)
+                        with open(path, "rb") as fh:
+                            client.send_photo(
+                                chat_id, fh.read(),
+                                caption=f"🖼️ Story image for `{draft_id}`",
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[telegram] image not generated for {draft_id}: {exc}")
         # secondary optional notes step
         note = client.send_message(
             chat_id,
@@ -598,10 +725,25 @@ def send_draft_content(
         ]
     }
     try:
-        return _send_long(client, chat_id, text, reply_markup=notes_btn)
+        sent = _send_long(client, chat_id, text, reply_markup=notes_btn)
     except Exception as exc:  # noqa: BLE001
         print(f"[telegram] failed to send draft content {draft_id}: {exc}")
         return []
+    # A+B: show the generated story image alongside the content, if present.
+    try:
+        info = db.get_image(conn, draft_id)
+        if info and info.get("image_path"):
+            img_path = info["image_path"]
+            if Path(img_path).is_file():
+                with open(img_path, "rb") as fh:
+                    client.send_photo(
+                        chat_id, fh.read(),
+                        caption=f"🖼️ Story image for `{draft_id}`"
+                        + (f" — prompt: {info['image_prompt']}" if info.get("image_prompt") else ""),
+                    )
+    except Exception as exc:  # noqa: BLE001 - image is a bonus; never break the view
+        print(f"[telegram] failed to send story image for {draft_id}: {exc}")
+    return sent
 
 
 # --------------------------------------------------------------------------- #
@@ -826,6 +968,7 @@ def run_review_session(
     *,
     poll_timeout: int = 30,
     max_iterations: int = 1_000_000,
+    image_dir: str | None = None,
 ) -> int:
     """The one-draft-at-a-time review flow, triggered by /reviewdraft.
 
@@ -861,7 +1004,7 @@ def run_review_session(
                     "editcopy_message_id": res["editcopy_message_id"]
                 }
         elif "message" in upd:
-            handle_text(conn, client, chat_id, awaiting, upd)
+            handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
         return None
 
     send_reviewed_summary(conn, client, chat_id)
@@ -932,6 +1075,7 @@ def run_review_bot(
     once: bool = False,
     poll_timeout: int = 30,
     max_iterations: int = 1_000_000,
+    image_dir: str | None = None,
 ) -> int:
     """Command-driven Telegram review bot (long-poll).
 
@@ -977,7 +1121,7 @@ def run_review_bot(
         if text.startswith("/"):
             _dispatch(text)
             return
-        handle_text(conn, client, chat_id, awaiting, upd)
+        handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
 
     def _dispatch(text: str) -> None:
         nonlocal decided

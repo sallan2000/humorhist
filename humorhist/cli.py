@@ -275,6 +275,34 @@ def cmd_review(args: argparse.Namespace) -> int:
                     print("  generated initial post copy (editable via `humorhist copy`)")
             except Exception as exc:  # noqa: BLE001 - don't fail the review on copy gen
                 print(f"  (post copy not generated: {exc})")
+            # A+B: generate a story image on approve, best-effort. Needs an
+            # image credential (HUMORHIST_IMAGE_API_KEY); on any failure we print
+            # a note and continue — the post copy + pipeline are unaffected.
+            try:
+                from humorhist import imagegen as ig
+                from humorhist.imagegen import resilient_image_client
+
+                img_client = resilient_image_client()
+            except Exception:  # noqa: BLE001 - ImageUnavailable or missing key
+                img_client = None
+            if img_client is not None:
+                try:
+                    from humorhist import imagegen as ig
+                    from humorhist.llm import default_client
+
+                    img_dir = os.environ.get("HUMORHIST_IMAGE_DIR") or str(
+                        Path(args.db).resolve().parent / "images"
+                    )
+                    pool_row = db.get_pool_item(conn, row["pool_id"])
+                    path, prompt = ig.generate_image(
+                        default_client(), img_client, dict(row),
+                        dict(pool_row) if pool_row else None,
+                        out_dir=img_dir, draft_id=row["id"],
+                    )
+                    db.set_image(conn, row["id"], image_prompt=prompt, image_path=path)
+                    print(f"  generated story image -> {path}")
+                except Exception as exc:  # noqa: BLE001 - don't fail review on image gen
+                    print(f"  (story image not generated: {exc})")
         print()
 
     print(f"Review session done. {acted} draft(s) decided.")

@@ -66,6 +66,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     # original schema shipped, so guard with PRAGMA checks to make the migration
     # safe to re-run on already-migrated databases.
     _ensure_queue_copy_columns(conn)
+    _ensure_queue_image_columns(conn)
     _ensure_defer_column(conn)
     _ensure_pool_note_column(conn)
     # Dedup: normalized_title lets the same event arriving from different
@@ -221,6 +222,56 @@ def _ensure_queue_copy_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE queue ADD COLUMN post_copy TEXT")
     if "post_copy_at" not in existing:
         conn.execute("ALTER TABLE queue ADD COLUMN post_copy_at TEXT")
+
+
+def _ensure_queue_image_columns(conn: sqlite3.Connection) -> None:
+    """Add image_prompt / image_path to queue if absent (no-op if present).
+
+    ``image_prompt`` is the text prompt fed to the image model; ``image_path``
+    is the on-disk location of the generated PNG (relative to the data dir).
+    Both are best-effort: an image is generated on approve when credentials are
+    available, but the pipeline works fine without one.
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(queue)")}
+    if "image_prompt" not in existing:
+        conn.execute("ALTER TABLE queue ADD COLUMN image_prompt TEXT")
+    if "image_path" not in existing:
+        conn.execute("ALTER TABLE queue ADD COLUMN image_path TEXT")
+
+
+def set_image(
+    conn: sqlite3.Connection,
+    draft_id: str,
+    *,
+    image_prompt: str | None = None,
+    image_path: str | None = None,
+) -> None:
+    """Persist the generated image prompt + path onto the queue row for ``draft_id``.
+
+    Idempotent on re-calls (an existing path is kept unless a new one is passed).
+    """
+    row = conn.execute(
+        "SELECT image_prompt, image_path FROM queue WHERE draft_id = ?", (draft_id,)
+    ).fetchone()
+    if row is None:
+        return
+    new_prompt = image_prompt if image_prompt is not None else row["image_prompt"]
+    new_path = image_path if image_path is not None else row["image_path"]
+    conn.execute(
+        "UPDATE queue SET image_prompt = ?, image_path = ? WHERE draft_id = ?",
+        (new_prompt, new_path, draft_id),
+    )
+    conn.commit()
+
+
+def get_image(conn: sqlite3.Connection, draft_id: str) -> dict | None:
+    """Return ``{"image_prompt": ..., "image_path": ...}`` for a queued draft, or None."""
+    row = conn.execute(
+        "SELECT image_prompt, image_path FROM queue WHERE draft_id = ?", (draft_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"image_prompt": row["image_prompt"], "image_path": row["image_path"]}
 
 
 def make_id(*parts: str) -> str:
