@@ -101,9 +101,11 @@ def test_handle_callback_approve_calls_apply_review(tmp_path):
     row = conn.execute("SELECT status, reviewed_at FROM drafts WHERE id='d1'").fetchone()
     assert row["status"] == "approved"
     assert row["reviewed_at"] is not None
-    # callback was answered and a notes prompt was sent
+    # callback was answered and an editor_line prompt was sent
     assert "cb1" in stub.answered
-    assert any("optional notes" in m["text"] for m in stub.sent)
+    assert any("one-line joke" in m["text"] for m in stub.sent)
+    # the prompt carries the new stage metadata so handle_text captures editor_line
+    assert res["stage"] == "editor_line"
 
 
 def test_handle_callback_reject_calls_apply_review(tmp_path):
@@ -133,20 +135,72 @@ def test_handle_callback_ignores_unknown_data(tmp_path):
 # --- handle_text (notes) -----------------------------------------------------
 
 
-def test_handle_text_stores_notes(tmp_path):
+def test_handle_text_captures_editor_line_then_optional_notes(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
-    # first approve -> draft approved, notes prompt sent as message id 1
     cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
-    note_msg_id = cb_res["note_message_id"]
+    editor_line_msg_id = cb_res["note_message_id"]
+    awaiting = {
+        "d1": {
+            "note_message_id": editor_line_msg_id,
+            "stage": "editor_line",
+            "decision": "approve",
+        }
+    }
 
-    awaiting = {"d1": {"note_message_id": note_msg_id}}
-    res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "tighten the third angle", note_msg_id))
+    # first reply -> the human joke (editor_line)
+    res1 = tg.handle_text(
+        conn, stub, "chat", awaiting, _text_update(2, "The bear was a tax dodge.", editor_line_msg_id)
+    )
+    assert res1.get("editor_line_set") == "d1"
+    row = conn.execute("SELECT editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] == "The bear was a tax dodge."
+    # a secondary notes prompt should now be open
+    assert awaiting["d1"]["stage"] == "notes"
 
-    assert res is not None and res.get("noted") == "d1"
-    row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
+    # second reply -> optional notes, must NOT clobber the editor_line
+    notes_msg_id = awaiting["d1"]["note_message_id"]
+    res2 = tg.handle_text(
+        conn, stub, "chat", awaiting, _text_update(3, "tighten the third angle", notes_msg_id)
+    )
+    assert res2.get("noted") == "d1"
+    row = conn.execute("SELECT editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] == "The bear was a tax dodge."
     assert row["editor_notes"] == "tighten the third angle"
+
+
+def test_handle_text_editor_line_skip_then_notes(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
+
+    res1 = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", cb_res["note_message_id"]))
+    assert res1 is not None
+    row = conn.execute("SELECT editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] is None
+    assert awaiting["d1"]["stage"] == "notes"
+
+
+def test_handle_text_notes_merge_keeps_existing_editor_line(tmp_path):
+    """A /listapproved 'Add notes' re-apply must not wipe a prior editor_line."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    # pre-set an editor_line via a normal apply_review
+    review.apply_review(conn, "d1", decision="approve", editor_line="Pre-existing joke")
+    stub = tg.StubTelegram()
+    # simulate the /listapproved notes button -> awaiting has stage 'notes'
+    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "notes", "d1"))
+    note_msg_id = cb_res["note_message_id"]
+    awaiting = {"d1": {"note_message_id": note_msg_id, "stage": "notes", "decision": "approve"}}
+
+    res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "add a citation", note_msg_id))
+    assert res.get("noted") == "d1"
+    row = conn.execute("SELECT editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] == "Pre-existing joke"  # preserved by merge
+    assert row["editor_notes"] == "add a citation"
 
 
 def test_handle_text_skip_clears_awaiting(tmp_path):
@@ -154,15 +208,19 @@ def test_handle_text_skip_clears_awaiting(tmp_path):
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
     cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
-    note_msg_id = cb_res["note_message_id"]
+    awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
 
-    awaiting = {"d1": {"note_message_id": note_msg_id}}
-    res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", note_msg_id))
-
-    assert res.get("skipped") == "d1"
+    res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", cb_res["note_message_id"]))
+    # skipping the editor_line moves to the notes stage, not out
+    assert awaiting["d1"]["stage"] == "notes"
+    # now skip notes too -> cleared
+    notes_msg_id = awaiting["d1"]["note_message_id"]
+    res2 = tg.handle_text(conn, stub, "chat", awaiting, _text_update(3, "/skip", notes_msg_id))
+    assert res2.get("skipped") == "d1"
     assert "d1" not in awaiting
-    # notes left empty
-    assert conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()["editor_notes"] is None
+    # nothing stored
+    row = conn.execute("SELECT editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] is None and row["editor_notes"] is None
 
 
 def test_handle_text_ignores_unrelated_message(tmp_path):

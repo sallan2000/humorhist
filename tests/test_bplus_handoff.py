@@ -142,6 +142,22 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
     assert res is not None
     assert res["decision"] == "approve"
 
+    # Tap only approves + prompts for the joke; copy is generated once the
+    # editor_line reply arrives (so the human joke can steer the copy).
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
+    assert row["post_copy"] is None
+
+    # reply with the editor_line -> triggers fill_post_copy
+    note_msg_id = res["note_message_id"]
+    tg.handle_text(
+        conn,
+        stub,
+        "chat",
+        {"d1": {"note_message_id": note_msg_id, "stage": "editor_line", "decision": "approve"}},
+        {"update_id": 2, "message": {"message_id": 20, "text": "The bear was a tax dodge.",
+                                     "reply_to_message": {"message_id": note_msg_id}}},
+    )
+
     row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
     assert row["post_copy"] == "A pastry shop started a war. Honestly."
 

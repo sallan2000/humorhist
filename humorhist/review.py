@@ -69,6 +69,7 @@ def apply_review(
     decision: str,
     editor_line: str | None = None,
     notes: str | None = None,
+    merge: bool = False,
 ) -> None:
     """Record a human review decision for one draft.
 
@@ -76,6 +77,11 @@ def apply_review(
     stores an optional ``editor_line`` (a one-line steer for the writing pass)
     and ``editor_notes``. Idempotent on the same decision; re-reviewing lets the
     editor flip approve<->reject and update notes.
+
+    When ``merge=True`` (used when only *some* fields are supplied by a later
+    interaction, e.g. the Telegram "Add notes" button), any field left as
+    ``None`` keeps its existing value instead of being overwritten. This stops a
+    notes-only re-apply from clobbering a previously-entered ``editor_line``.
 
     Raises ``ValueError`` on a bad decision, an unknown draft id, or a draft
     whose status is outside the review gate.
@@ -97,6 +103,26 @@ def apply_review(
     new_status = "approved" if decision == APPROVE else "rejected"
     reviewed_at = datetime.now(timezone.utc).isoformat()
 
+    # Resolve the field values to write. A plain apply (merge=False) overwrites
+    # both fields with whatever was passed (None => cleared). A merge applies
+    # only the fields the caller actually supplied, keeping the others.
+    if merge:
+        cur = conn.execute(
+            "SELECT editor_line, editor_notes FROM drafts WHERE id = ?",
+            (draft_id,),
+        ).fetchone()
+        cur_line = (cur["editor_line"] if cur else None) or ""
+        cur_notes = (cur["editor_notes"] if cur else None) or ""
+        editor_line, editor_notes = (
+            (editor_line.strip() if editor_line else cur_line.strip()) or None,
+            (notes.strip() if notes else cur_notes.strip()) or None,
+        )
+    else:
+        editor_line, editor_notes = (
+            editor_line.strip() if editor_line else None,
+            notes.strip() if notes else None,
+        )
+
     conn.execute(
         """
         UPDATE drafts
@@ -106,8 +132,8 @@ def apply_review(
         (
             new_status,
             reviewed_at,
-            editor_line.strip() if editor_line else None,
-            notes.strip() if notes else None,
+            editor_line,
+            editor_notes,
             draft_id,
         ),
     )

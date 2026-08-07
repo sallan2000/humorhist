@@ -257,23 +257,22 @@ def handle_callback(
             client.answer_callback_query(cq["id"], text="already handled")
             return None
         client.answer_callback_query(cq["id"], text=f"{decision}d")
+        # The joke is the whole point of the product: capture the human-written
+        # editor_line first. A reply to this prompt becomes editor_line (which
+        # also steers B+ post-copy generation); /skip leaves it blank.
         note = client.send_message(
             chat_id,
-            f"Draft `{draft_id}` {decision}d. Reply here with optional notes "
-            f"(or send /skip to leave blank):",
+            f"Draft `{draft_id}` {decision}d. Reply here with your one-line "
+            f"joke (the editor_line) — or send /skip to leave it blank:",
         )
-        # B+ handoff: on approve, generate initial post copy onto the queue row
-        # so the editor can revise it (via /viewcopy) before any publishing step.
-        # Best-effort: a missing LLM key just skips copy generation.
-        if decision == "approve":
-            from humorhist.copywriter import fill_post_copy
-            from humorhist.llm import default_client
-
-            try:
-                fill_post_copy(conn, default_client(), draft_id=draft_id)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[telegram] post copy not generated for {draft_id}: {exc}")
-        return {"draft_id": draft_id, "decision": decision, "note_message_id": note["message_id"]}
+        # Stash the decision so a follow-up reply knows whether to also capture
+        # a (secondary) notes step after the editor_line.
+        return {
+            "draft_id": draft_id,
+            "decision": decision,
+            "note_message_id": note["message_id"],
+            "stage": "editor_line",
+        }
     if data.startswith("notes:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="add notes")
@@ -331,13 +330,22 @@ def handle_text(
     awaiting: dict,
     update: dict,
 ) -> dict | None:
-    """Process a text message as optional editor notes.
+    """Process a reply to a review prompt.
 
-    ``awaiting`` maps draft_id -> {"note_message_id": <id>}. A reply whose
-    reply_to_message_id matches a tracked note prompt stores the text as editor
-    notes on that draft (re-applying approve, which is idempotent). ``/skip``
-    clears the prompt without storing notes. Falls back to the single open note
-    prompt when the user just types instead of replying to the prompt.
+    There are three prompt kinds tracked in ``awaiting``:
+
+    * ``editcopy``  — a reply replaces the post copy (handled, unchanged).
+    * ``editor_line`` (stage) — the first reply after an approve/reject tap.
+      Stored as ``editor_line`` (the human joke; this steers B+ copy). A
+      ``/skip`` leaves it blank. After capturing it we prompt for *optional*
+      longer notes (the ``notes`` stage).
+    * ``notes`` (stage) — a secondary reply (or the ``/listapproved`` "Add
+      notes" button). Stored as ``editor_notes`` with ``merge=True`` so a
+      notes-only save never clobbers an already-entered ``editor_line``.
+
+    ``/skip`` at any note/editor_line prompt clears it without storing.
+    Falls back to the single open prompt when the user types instead of
+    replying to the prompt.
     """
     msg = update.get("message")
     if not msg or "text" not in msg:
@@ -347,24 +355,23 @@ def handle_text(
 
     # Resolve which draft (and which kind of prompt) this reply answers.
     draft_id = None
-    prompt_kind = None  # "note" or "editcopy"
-    for did, st in awaiting.items():
-        if reply_to is not None and st.get("note_message_id") == reply_to:
-            draft_id, prompt_kind = did, "note"
+    st = None
+    for did, s in awaiting.items():
+        if reply_to is not None and s.get("editcopy_message_id") == reply_to:
+            draft_id, st = did, s
             break
-        if reply_to is not None and st.get("editcopy_message_id") == reply_to:
-            draft_id, prompt_kind = did, "editcopy"
+        if reply_to is not None and s.get("note_message_id") == reply_to:
+            draft_id, st = did, s
             break
     # Fallback: a single open prompt the user typed at rather than replied to.
     if draft_id is None and len(awaiting) == 1 and text not in ("/skip", "/cancel"):
         did = next(iter(awaiting))
-        draft_id, prompt_kind = did, (
-            "editcopy" if "editcopy_message_id" in awaiting[did] else "note"
-        )
+        draft_id, st = did, awaiting[did]
     if draft_id is None:
         return None
 
-    if prompt_kind == "editcopy":
+    # editcopy prompt: replace the post copy (unchanged behaviour).
+    if st is not None and st.get("editcopy_message_id") is not None:
         if text == "/cancel":
             awaiting.pop(draft_id, None)
             client.send_message(chat_id, f"Kept the existing copy for `{draft_id}`.")
@@ -376,14 +383,43 @@ def handle_text(
         client.send_message(chat_id, f"Post copy saved for `{draft_id}`.")
         return {"editcopy_saved": draft_id}
 
-    # note prompt (existing behaviour)
+    stage = (st or {}).get("stage", "notes")
+    decision = (st or {}).get("decision", "approve")
+
+    # --- editor_line stage: capture the human joke (the product's point) ---
+    if stage == "editor_line":
+        editor_line = None if text == "/skip" else text
+        review.apply_review(conn, draft_id, decision=decision, editor_line=editor_line)
+        # B+ handoff: on approve, generate initial post copy now that we have
+        # the editor_line to steer it. Best-effort (missing LLM key => skip).
+        if decision == "approve":
+            from humorhist.copywriter import fill_post_copy
+            from humorhist.llm import default_client
+
+            try:
+                fill_post_copy(conn, default_client(), draft_id=draft_id)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[telegram] post copy not generated for {draft_id}: {exc}")
+        # secondary optional notes step
+        note = client.send_message(
+            chat_id,
+            f"Got it. Optionally reply with longer notes for `{draft_id}` "
+            f"(or /skip to finish):",
+        )
+        awaiting[draft_id] = {
+            "note_message_id": note["message_id"],
+            "stage": "notes",
+            "decision": decision,
+        }
+        return {"editor_line_set": draft_id}
+
+    # --- notes stage: optional free-form annotation (merge, don't clobber) ---
     if text == "/skip":
         awaiting.pop(draft_id, None)
         client.send_message(chat_id, f"Notes left blank for `{draft_id}`.")
         return {"skipped": draft_id}
-    # re-apply with the same (approve) decision so notes persist idempotently;
-    # an already-approved draft stays approved and keeps its queue row.
-    review.apply_review(conn, draft_id, decision="approve", notes=text)
+    # merge=True keeps the editor_line we just captured; only notes change.
+    review.apply_review(conn, draft_id, decision=decision, notes=text, merge=True)
     awaiting.pop(draft_id, None)
     client.send_message(chat_id, f"Notes saved for `{draft_id}`.")
     return {"noted": draft_id}
@@ -585,7 +621,11 @@ def run_review_session(
             if res and "decision" in res:
                 nonlocal decided
                 decided += 1
-                awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
+                awaiting[res["draft_id"]] = {
+                    "note_message_id": res["note_message_id"],
+                    "stage": res.get("stage", "editor_line"),
+                    "decision": res.get("decision", "approve"),
+                }
                 return res["draft_id"]
             elif res and "editcopy_message_id" in res:
                 awaiting[res["draft_id"]] = {
@@ -665,7 +705,11 @@ def run_review_bot(
             if res and "decision" in res:
                 nonlocal decided
                 decided += 1
-                awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
+                awaiting[res["draft_id"]] = {
+                    "note_message_id": res["note_message_id"],
+                    "stage": res.get("stage", "editor_line"),
+                    "decision": res.get("decision", "approve"),
+                }
             elif res and "note_message_id" in res:
                 # notes: button from /listapproved
                 awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
