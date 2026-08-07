@@ -489,7 +489,7 @@ def handle_text(
         client.send_message(
             chat_id,
             f"🔄 Angles regenerated for `{draft_id}` using your note as steering. "
-            f"Review them with /reviewdraft or /show.",
+            f"Review them with /reviewdraft.",
         )
         return {"angles_regenerated": draft_id}
     # merge=True keeps the editor_line we just captured; only notes change.
@@ -500,19 +500,27 @@ def handle_text(
 
 
 HELP_TEXT = (
-    "HumorHist review bot\n\n"
-    "/reviewdraft - review pending drafts one by one (Approve/Reject/Later + joke + notes)\n"
+    "HumorHist review bot — the whole pipeline runs from here.\n\n"
+    "DISCOVERY & DRAFTING\n"
     "/harvest - top up the candidate pool from seed + Wikipedia lists\n"
-    "/screen [limit] - LLM-score unscored pool candidates\n"
+    "/screen [limit] - LLM-score unscored pool candidates (funny_score)\n"
     "/draft [count] [min_score] - fact-check + generate angles for top candidates\n"
+    "/suggest <topic> - add an editor-suggested event to the pool\n\n"
+    "REVIEW\n"
+    "/reviewdraft - review pending drafts one by one\n"
+    "    each draft has ✅ Approve / ❌ Reject / ⏸ Later buttons\n"
+    "    on Approve the bot asks for your one-line joke, then optional notes\n"
+    "    on a pending draft, /notes steers the angles with your note\n"
+    "/later <id> - defer a pending draft 30 days\n"
     "/listapproved - list drafts you've greenlit; tap one to open it\n"
     "/listqueue - list approved+queued drafts and their post copy\n"
-    "/viewcopy <id> - open a queued draft's post copy (edit / regenerate)\n"
-    "/later <id> - defer a pending draft 30 days\n"
-    "/suggest <topic> - add an editor-suggested event to the pool\n"
-    "/buffer - buffer health + on-demand top-up\n"
+    "/viewcopy <id> - open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)\n\n"
+    "BUFFER & STATUS\n"
+    "/buffer - buffer health report + on-demand top-up\n"
+    "/buffer enqueue - also sweep approved drafts into the queue\n"
     "/status - approved / rejected / pending breakdown\n"
-    "/help - this message"
+    "/help - this message\n\n"
+    "The bot also nudges you with 🆕 N new draft(s) when fresh drafts appear."
 )
 
 

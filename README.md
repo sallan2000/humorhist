@@ -15,8 +15,9 @@ It is a command-line tool, not a service. You run stages in order:
 ## What it actually does
 -------------------------------------------------------------------------------
 
-- harvest  Gather candidate historical events into a pool (741 curated +
-           Wikipedia-list events out of the box).
+- harvest  Gather candidate historical events into a pool (curated seed events +
+           Wikipedia-list events out of the box). Cross-source/cross-spelling
+           duplicates are collapsed to one pool row automatically.
 - screen   Ask an LLM to score each event 0-10 on how absurd/funny it is, so
            drafting can later pick the best ones.
 - draft    For the top-scored events: fetch the Wikipedia article, run a
@@ -168,16 +169,29 @@ decided on.
 It long-polls forever — run it as a durable `systemd --user` unit (see
 `scripts/telegram_review.py`) so it survives logout:
 
-    systemctl --user status humorhist-telegram-review.service
-    journalctl --user -u humorhist-telegram-review.service -f
+    systemctl --user status humorhist-telegram.service
+    journalctl --user -u humorhist-telegram.service -f
 
-The bot **idles** until you send a command; it does **not** push drafts on
-startup.
+The bot long-polls Telegram and runs as a durable `systemd --user` unit
+(`humorhist-telegram.service`, `Restart=always`) so it survives logout. On
+startup it sends a ready message, then **proactively nudges** you with
+"🆕 N new draft(s) awaiting review" whenever fresh drafts appear (from `/draft`,
+the weekly timer, etc.) — you don't have to remember to poll it.
 
 **Commands**
 
-    /reviewdraft   start reviewing pending drafts one by one (Approve/Reject + notes)
-    /listapproved  list every draft you've greenlit; tap one to open its content
+    /reviewdraft   review pending drafts one by one (✅ Approve / ❌ Reject / ⏸ Later)
+                  on Approve the bot asks for your one-line joke, then optional notes
+    /harvest       top up the candidate pool from seed + Wikipedia lists
+    /screen [limit]  LLM-score unscored pool candidates
+    /draft [count] [min_score]  fact-check + generate angles for top candidates
+    /suggest <topic>  add an editor-suggested event to the pool
+    /later <id>    defer a pending draft 30 days
+    /listapproved  list drafts you've greenlit; tap one to open it
+    /listqueue     list approved+queued drafts and their post copy
+    /viewcopy <id> open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)
+    /buffer        buffer health report + on-demand top-up
+    /buffer enqueue  also sweep approved drafts into the queue
     /status        approved / rejected / pending breakdown
     /help          this list
 
@@ -196,7 +210,11 @@ startup.
    `editor_notes`; it does not change the decision.)
 4. **Only after you've decided that draft does the next one arrive.** One at a
    time — no wall of drafts. When all are done you get "✅ All caught up". If new
-   drafts are generated later, start another /reviewdraft to pick them up.
+   drafts are generated later (by the weekly timer, `/draft`, or `/harvest`), the
+   bot proactively sends "🆕 N new draft(s) awaiting review" — or just send
+   **/reviewdraft** again to pick them up. On **Approve** the bot next asks for
+   your one-line joke (the human voice), then optional notes; on a *pending* draft
+   you can also send **/notes** to steer the angles with your note.
 
 **Browse and annotate approved drafts**
 
@@ -298,7 +316,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-209 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
+251 tests, no network calls (LLM, Wikipedia, and Telegram are stubbed).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -316,13 +334,23 @@ The **B+ copy loop** is done (2026-08-06): on approve, post copy is generated
 `copy show/edit/regen` commands and Telegram `/listqueue` + `/viewcopy`
 (inline ✏️ Edit / 🔄 Regenerate). See "Phase 4: post copy" above.
 
+**Telegram-primary (2026-08-07):** the entire pipeline is now drivable from
+Telegram, not just review/edit. From chat you can `/harvest` the pool,
+`/screen` candidates, `/draft` new drafts (the previously CLI-only upstream
+hole), `/suggest` events, `/buffer [enqueue]` to check health and top up, and
+review/approve/edit as before. The bot also proactively nudges on new drafts.
+
+**Duplicate-event prevention (2026-08-07):** the same event arriving from a
+different source or spelling/case variant collapses to ONE pool row via a
+normalized-title merge (with a tie-breaker that protects already-reviewed work),
+so it yields at most one draft to review. Cross-source/cross-spelling dedup is
+now built and the live database has been de-duplicated.
+
 Not yet built:
 - Phase 4 publisher: turning a `queue` row into an actual posted item and
   writing `posts` (auto-post to Mastodon/X vs. just holding copy for you to
   paste — the `queue`/`posts` schema is ready for either). The copy-generation
   half is complete; only the destination is deferred.
-- Cross-source topic dedup: dedup is by source page id, not by topic, so the
-  same event appearing on two Wikipedia lists yields two pool rows.
 
 Until the publisher exists, "publishing" means: read the approved draft with
 `show`, write the post yourself, and it's already in `queue`.
@@ -374,4 +402,4 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
         weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
         fill_approved_copy.py  one-shot: generate post copy for approved+queued drafts
-    tests/                  pytest suite (209 tests)
+    tests/                  pytest suite (251 tests)
