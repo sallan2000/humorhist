@@ -417,7 +417,8 @@ def handle_text(
             draft_id, st = did, s
             break
     # Fallback: a single open prompt the user typed at rather than replied to.
-    if draft_id is None and len(awaiting) == 1 and text not in ("/skip", "/cancel"):
+    # /skip and /cancel are valid replies to a prompt, so they resolve here too.
+    if draft_id is None and len(awaiting) == 1:
         did = next(iter(awaiting))
         draft_id, st = did, awaiting[did]
     if draft_id is None:
@@ -837,6 +838,14 @@ def run_review_session(
     def _handle(upd: dict) -> str | None:
         offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
         if "callback_query" in upd:
+            data = (upd.get("callback_query") or {}).get("data") or ""
+            # One-at-a-time: a decision for a draft we haven't shown yet can't be a
+            # real tap. Ignore it so it neither approves prematurely nor gets
+            # swallowed before that draft is presented.
+            if data.startswith(("approve:", "reject:", "later:")):
+                _, _, did = data.partition(":")
+                if did not in sent:
+                    return None
             res = handle_callback(conn, client, chat_id, upd)
             if res and "decision" in res:
                 nonlocal decided
@@ -876,10 +885,17 @@ def run_review_session(
                 print(f"[telegram] {exc}; retrying in 5s")
                 time.sleep(5)
             continue
+
         _send_one(conn, client, chat_id, draft)
         sent.add(draft["id"])
         caught_up = False
+        # Wait for a decision on THIS draft (approve/reject/later). On approve the
+        # draft leaves `pending` immediately but leaves an `awaiting` entry for the
+        # joke; the drain loop below handles that before we move on.
         while draft["id"] in _pending_ids(conn):
+            iters += 1
+            if iters > max_iterations:
+                return decided
             try:
                 upds = client.get_updates(offset=offset_ref[0], timeout=poll_timeout)
             except TelegramError as exc:
@@ -890,6 +906,21 @@ def run_review_session(
                 rid = _handle(upd)
                 if rid == draft["id"]:
                     break
+        # Decision recorded. If a joke/notes capture is now open for this draft,
+        # drain it HERE — do not present the next draft until the human has had
+        # their say (the editor_line is the whole point of the product).
+        while draft["id"] in awaiting:
+            iters += 1
+            if iters > max_iterations:
+                return decided
+            try:
+                upds = client.get_updates(offset=offset_ref[0], timeout=poll_timeout)
+            except TelegramError as exc:
+                print(f"[telegram] {exc}; retrying in 5s")
+                time.sleep(5)
+                continue
+            for upd in upds:
+                _handle(upd)
     return decided
 
 

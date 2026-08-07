@@ -426,21 +426,69 @@ def test_run_review_bot_one_by_one(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     _seed_pending(conn, "d2")
-    # serve: /reviewdraft command, then tap d1, then tap d2, then nothing
+    # realistic one-at-a-time flow: /reviewdraft, then for EACH draft a tap plus
+    # its joke + /skip notes capture, before the next draft is shown.
     stub = _SeqStub([
         _message_batch("/reviewdraft", 1),
         _callback_batch("d1", 2),
-        _callback_batch("d2", 3),
+        _message_batch("joke for d1", 3),
+        _message_batch("/skip", 4),
+        _callback_batch("d2", 5),
+        _message_batch("joke for d2", 6),
+        _message_batch("/skip", 7),
     ])
     decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
     assert decided == 2
     # both drafts persisted as approved, in decision order
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
     assert conn.execute("SELECT status FROM drafts WHERE id='d2'").fetchone()["status"] == "approved"
+    # jokes captured
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] == "joke for d1"
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d2'").fetchone()["editor_line"] == "joke for d2"
     # only TWO drafts were sent (one at a time), not dumped all at once up front:
     # count messages that carry a reply_markup (the button messages)
     button_msgs = [m for m in stub.sent if "reply_markup" in m]
     assert len(button_msgs) == 2  # one per draft, not 8 simultaneously
+
+
+def test_review_session_waits_for_joke_before_next_draft(tmp_path):
+    """Approve must NOT race the next draft: d2's buttons appear only after d1's
+    editor_line (joke) + notes capture is complete."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    _seed_pending(conn, "d2")
+
+    class _ScriptStub(tg.StubTelegram):
+        def __init__(self, batches):
+            super().__init__(updates=[])
+            self._batches = list(batches)
+        def get_updates(self, offset=0, timeout=0):
+            return self._batches.pop(0) if self._batches else []
+
+    # /reviewdraft -> approve d1 -> joke -> /skip notes -> approve d2 -> joke -> /skip
+    stub = _ScriptStub([
+        _message_batch("/reviewdraft", 1),
+        _callback_batch("d1", 2),
+        _message_batch("the emus did nothing wrong", 3),  # editor_line reply
+        _message_batch("/skip", 4),                        # end notes capture
+        _callback_batch("d2", 5),
+        _message_batch("and the humans lost", 6),
+        _message_batch("/skip", 7),
+    ])
+    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=60)
+
+    # d1's joke was captured before any d2 button could be shown
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] == "the emus did nothing wrong"
+    # find button messages per draft
+    d1_btn = next(i for i, m in enumerate(stub.sent) if "reply_markup" in m and "approve:d1" in str(m))
+    d2_btn = next(i for i, m in enumerate(stub.sent) if "reply_markup" in m and "approve:d2" in str(m))
+    joke_prompt = next(i for i, m in enumerate(stub.sent) if "one-line joke" in m["text"])
+    # the joke prompt (and thus the whole d1 capture) precedes d2's button
+    assert joke_prompt < d2_btn, "next draft appeared before the joke prompt"
+    assert d1_btn < d2_btn, "d2 button raced ahead of d1"
+    # both drafts fully decided, in order, with their jokes captured
+    assert decided == 2
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d2'").fetchone()["editor_line"] == "and the humans lost"
 
 
 def test_listapproved_lists_greenlit_drafts_with_buttons(tmp_path):
