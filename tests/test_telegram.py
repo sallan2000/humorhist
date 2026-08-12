@@ -662,6 +662,65 @@ def test_send_queue_list_empty_when_no_queue(tmp_path):
     assert "empty" in stub.sent[-1]["text"].lower()
 
 
+def test_listapproved_shows_draft_id_in_text_and_button(tmp_path):
+    conn = _seed_with_statuses(tmp_path)  # d1 approved
+    stub = tg.StubTelegram()
+    n = tg.send_approved_list(conn, stub, "chat")
+    assert n == 1
+    text = stub.sent[-1]["text"]
+    # the numeric draft id is shown so the user can type it into /later etc.
+    assert "#d1" in text
+    # and the view button label also carries the id
+    btns = stub.sent[-1]["reply_markup"]["inline_keyboard"]
+    assert btns[0][0]["text"].startswith("👁 #d1")
+    assert btns[0][0]["callback_data"] == "view:d1"
+
+
+def test_send_queue_list_shows_draft_id_and_remove_button(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)  # d1 approved + queued
+    stub = tg.StubTelegram()
+    n = tg.send_queue_list(conn, stub, "chat")
+    assert n == 1
+    text = stub.sent[-1]["text"]
+    # the numeric draft id is shown so /viewcopy <id> / /queue remove <id> are usable
+    assert "#d1" in text
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0]
+    cbs = {b["callback_data"] for b in kb}
+    assert "copy:d1" in cbs
+    # Remove button pulls the draft out of the queue without typing the id
+    assert "remove:d1" in cbs
+
+
+def test_remove_callback_pulls_draft_from_queue(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)  # d1 approved + queued
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "remove:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None
+    # removed from the queue but kept approved
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert any("removed from the queue" in m["text"] for m in stub.sent)
+
+
+def test_remove_callback_when_not_in_queue_is_safe(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "remove:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None
+    assert any("was not in the queue" in m["text"] for m in stub.sent)
+
+
 def test_send_copy_content_carries_edit_regen_buttons(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)

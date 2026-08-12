@@ -361,6 +361,8 @@ def handle_callback(
       approved draft (re-applying approve is idempotent and keeps its queue row).
     - ``view:<id>``: from /listapproved -- open the draft's full content (with an
       inline 'Add notes' button on the last chunk).
+    - ``remove:<id>``: from /listqueue -- pull a draft back out of the queue
+      (kept approved), the button equivalent of ``/queue remove <id>``.
 
     Returns a dict describing the action so the caller can track note state.
     """
@@ -438,6 +440,21 @@ def handle_callback(
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="opened copy")
         send_copy_content(conn, client, chat_id, draft_id)
+        return None
+    if data.startswith("remove:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="removed from queue")
+        removed = review.remove_from_queue(conn, draft_id)
+        if removed:
+            client.send_message(
+                chat_id,
+                f"↩️ `#{draft_id}` removed from the queue (kept approved). "
+                f"List it again with /listqueue.",
+            )
+        else:
+            client.send_message(
+                chat_id, f"⚠️ `#{draft_id}` was not in the queue."
+            )
         return None
     if data.startswith("editcopy:"):
         _, _, draft_id = data.partition(":")
@@ -609,11 +626,12 @@ HELP_TEXT = (
     "/reviewdraft - review pending drafts one by one\n"
     "    each draft has ✅ Approve / ❌ Reject / ⏸ Later buttons\n"
     "    on Approve the bot asks for your one-line joke, then optional notes\n"
-    "    on a pending draft, /notes steers the angles with your note\n"
-    "/later <id> - defer a pending draft 30 days\n"
-    "/listapproved - list drafts you've greenlit; tap one to open it\n"
-    "/listqueue - list approved+queued drafts and their post copy\n"
-    "/viewcopy <id> - open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)\n\n"
+    "    /later <id> defers a pending draft 30 days (#id shown in /listapproved)\n"
+    "/listapproved - list approved drafts with their #id; tap one to open it\n"
+    "/listqueue - list queued drafts with their #id, copy + a Remove button\n"
+    "    /queue remove <id> pulls a draft out of the queue (kept approved)\n"
+    "/viewcopy <id> - open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)\n"
+    "    (use the #id shown by /listapproved or /listqueue)\n\n"
     "BUFFER & STATUS\n"
     "/buffer - buffer health report + on-demand top-up\n"
     "/buffer enqueue - also sweep approved drafts into the queue\n"
@@ -636,13 +654,14 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     if not rows:
         client.send_message(chat_id, "No approved drafts yet.")
         return 0
-    lines = ["✅ Approved drafts (tap to open):"]
+    lines = ["✅ Approved drafts (tap to open; #id is the draft number):"]
     keyboard = []
     for r in rows:
         title = r["title"] or "(unknown)"
-        lines.append(f"  • {title}")
+        did = r["draft_id"]
+        lines.append(f"  • #{did} {title}")
         keyboard.append(
-            [{"text": f"👁 {title[:30]}", "callback_data": f"view:{r['draft_id']}"}]
+            [{"text": f"👁 #{did} {title[:24]}", "callback_data": f"view:{did}"}]
         )
     client.send_message(
         chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
@@ -748,10 +767,11 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
     if not rows:
         client.send_message(chat_id, "Queue is empty (nothing approved + queued).")
         return 0
-    lines = [f"📋 Queued drafts ({len(rows)}) — edit copy before publishing:"]
+    lines = [f"📋 Queued drafts ({len(rows)}) — edit copy before publishing (#id = draft number):"]
     keyboard: list[list[dict]] = []
     for r in rows:
         title = r["title"] or "(unknown)"
+        did = r["draft_id"]
         copy = r.get("post_copy")
         if copy:
             snippet = copy if len(copy) <= 80 else copy[:77] + "..."
@@ -759,12 +779,15 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         else:
             snippet = "(no copy yet)"
             status = f"0/{limit}"
-        lines.append(f"  • {title}\\n    {snippet}  [{status}]")
-        link = db.get_source_link(conn, r["draft_id"])
+        lines.append(f"  • #{did} {title}\n    {snippet}  [{status}]")
+        link = db.get_source_link(conn, did)
         if link:
             lines.append(f"    🔗 {db.shorten_url(link, shorten=False)}")
         keyboard.append(
-            [{"text": f"✏️ {title[:28]}", "callback_data": f"copy:{r['draft_id']}"}]
+            [
+                {"text": f"✏️ #{did} {title[:20]}", "callback_data": f"copy:{did}"},
+                {"text": "↩️ Remove", "callback_data": f"remove:{did}"},
+            ]
         )
     client.send_message(
         chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
