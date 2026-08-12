@@ -456,6 +456,20 @@ def handle_callback(
                 chat_id, f"⚠️ `#{draft_id}` was not in the queue."
             )
         return None
+    if data.startswith("reopen:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="reopened for re-review")
+        try:
+            review.reopen_draft(conn, draft_id)
+        except ValueError as exc:
+            client.send_message(chat_id, f"Cannot reopen: {exc}")
+            return None
+        client.send_message(
+            chat_id,
+            f"↩️ `#{draft_id}` sent back to pending for re-review. "
+            f"List it with /reviewdraft.",
+        )
+        return None
     if data.startswith("editcopy:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="editing copy")
@@ -628,6 +642,7 @@ HELP_TEXT = (
     "    on Approve the bot asks for your one-line joke, then optional notes\n"
     "    /later <id> defers a pending draft 30 days (#id shown in /listapproved)\n"
     "/listapproved - list approved drafts with their #id; tap one to open it\n"
+    "/listrejected - list rejected drafts; tap one to reopen for re-review\n"
     "/listqueue - list queued drafts with their #id, copy + a Remove button\n"
     "    /queue remove <id> pulls a draft out of the queue (kept approved)\n"
     "/view <id> - re-read any draft's full content (pending/approved/rejected)\n"
@@ -663,6 +678,31 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
         lines.append(f"  • #{did} {title}")
         keyboard.append(
             [{"text": f"👁 #{did} {title[:24]}", "callback_data": f"view:{did}"}]
+        )
+    client.send_message(
+        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
+    )
+    return len(rows)
+
+
+def send_rejected_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str) -> int:
+    """DM a list of rejected drafts, each with an inline 'reopen' button.
+
+    Tapping a draft sends it back to pending for re-review (the editor's undo
+    for a mistaken reject). Returns the count listed.
+    """
+    rows = review.rejected_drafts(conn)
+    if not rows:
+        client.send_message(chat_id, "No rejected drafts.")
+        return 0
+    lines = ["❌ Rejected drafts (tap to reopen for re-review; #id is the draft number):"]
+    keyboard = []
+    for r in rows:
+        title = r["title"] or "(unknown)"
+        did = r["draft_id"]
+        lines.append(f"  • #{did} {title}")
+        keyboard.append(
+            [{"text": f"↩️ Reopen #{did}", "callback_data": f"reopen:{did}"}]
         )
     client.send_message(
         chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
@@ -1143,6 +1183,8 @@ def run_review_bot(
             send_approved_list(conn, client, chat_id)
         elif cmd == "/listqueue":
             send_queue_list(conn, client, chat_id)
+        elif cmd == "/listrejected":
+            send_rejected_list(conn, client, chat_id)
         elif cmd == "/viewcopy":
             target = text.split()
             if len(target) < 2:

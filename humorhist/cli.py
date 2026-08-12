@@ -281,6 +281,24 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reopen(args: argparse.Namespace) -> int:
+    """Send a rejected (or approved) draft back to pending for re-review.
+
+    The editor's undo for a mistaken reject/approve: clears the decision and
+    reopens the draft so it re-enters /reviewdraft.
+    """
+    import humorhist.review as review
+
+    conn = _open_db(args.db)
+    try:
+        review.reopen_draft(conn, args.draft_id)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
+    print(f"Reopened {args.draft_id} for re-review (status -> pending).")
+    return 0
+
+
 def cmd_suggest(args: argparse.Namespace) -> int:
     """Add an editor-suggested event/topic to the pool (plan 3.2 /suggest).
 
@@ -586,6 +604,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     rv = sub.add_parser("review", help="Phase 3: approve/reject pending drafts")
     rv.set_defaults(func=cmd_review)
+
+    ro = sub.add_parser("reopen", help="reopen a rejected/approved draft for re-review")
+    ro.add_argument("draft_id", help="the draft id to send back to pending")
+    ro.set_defaults(func=cmd_reopen)
 
     sg = sub.add_parser("suggest", help="add an editor-suggested event to the pool")
     sg.add_argument("topic", help="the event/topic to suggest")

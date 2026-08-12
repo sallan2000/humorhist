@@ -758,6 +758,96 @@ def test_remove_callback_when_not_in_queue_is_safe(tmp_path):
     assert any("was not in the queue" in m["text"] for m in stub.sent)
 
 
+def _seed_rejected(conn, draft_id="d1"):
+    conn.execute(
+        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')"
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, reviewed_at) "
+        "VALUES (?, 'pool-x', '{}', '{}', 'rejected', '2026-01-01T00:00:00+00:00')",
+        (draft_id,),
+    )
+    conn.commit()
+
+
+def test_send_rejected_list_shows_reopen_button(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_rejected(conn, "d1")
+    stub = tg.StubTelegram()
+    n = tg.send_rejected_list(conn, stub, "chat")
+    assert n == 1
+    text = stub.sent[-1]["text"]
+    assert "#d1" in text
+    assert "Pastry War" in text
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0][0]
+    assert kb["callback_data"] == "reopen:d1"
+    assert kb["text"].startswith("↩️ Reopen")
+
+
+def test_send_rejected_list_empty_when_none(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    n = tg.send_rejected_list(conn, stub, "chat")
+    assert n == 0
+    assert "No rejected" in stub.sent[-1]["text"]
+
+
+def test_reopen_callback_sends_draft_back_to_pending(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_rejected(conn, "d1")
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reopen:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None
+    # status flipped back to pending
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "pending"
+    # decision fields cleared
+    row = conn.execute(
+        "SELECT reviewed_at, editor_line, editor_notes FROM drafts WHERE id='d1'"
+    ).fetchone()
+    assert row["reviewed_at"] is None and row["editor_line"] is None
+    assert any("back to pending" in m["text"] for m in stub.sent)
+
+
+def test_reopen_callback_when_not_rejected_is_safe(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")  # already pending -> nothing to reopen
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reopen:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None
+    assert any("Cannot reopen" in m["text"] for m in stub.sent)
+
+
+def test_reopen_draft_removes_from_queue(tmp_path):
+    """A reopened approved+queued draft must leave the publish queue."""
+    import humorhist.review as review
+
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)  # d1 approved + queued
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+    review.reopen_draft(conn, "d1")
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "pending"
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
+
+
+def test_listrejected_command_dispatches(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_rejected(conn, "d1")
+    stub = tg.StubTelegram(updates=[
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
+                                     "text": "/listrejected"}},
+    ])
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Pastry War" in m["text"] for m in stub.sent)
+
+
 def test_send_copy_content_carries_edit_regen_buttons(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)

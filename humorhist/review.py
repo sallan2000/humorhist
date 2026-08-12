@@ -298,6 +298,57 @@ def approved_drafts(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def rejected_drafts(conn: sqlite3.Connection) -> list[dict]:
+    """Return rejected drafts, newest-reviewed first, joined to pool title.
+
+    Used by the Telegram /listrejected command so a mistaken reject can be
+    sent back for re-review (the editor's undo for a bad tap).
+    """
+    return [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT d.id AS draft_id, d.editor_line, d.editor_notes, d.reviewed_at,
+                   p.title AS title
+            FROM drafts d
+            LEFT JOIN pool p ON p.id = d.pool_id
+            WHERE d.status = 'rejected'
+            ORDER BY d.reviewed_at DESC, d.id ASC
+            """
+        )
+    ]
+
+
+def reopen_draft(conn: sqlite3.Connection, draft_id: str) -> None:
+    """Send a rejected (or approved) draft back to 'pending' for re-review.
+
+    Clears the decision (reviewed_at, editor_line, editor_notes) and any defer
+    window, and removes it from the publish queue so it re-enters the review
+    surface cleanly. This is the editor's undo for a mistaken reject/approve.
+
+    Raises ValueError on an unknown id, or if the draft is already pending
+    (nothing to reopen).
+    """
+    row = conn.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no draft with id {draft_id!r}")
+    if row["status"] == "pending":
+        raise ValueError(f"draft {draft_id!r} is already pending")
+    conn.execute(
+        """
+        UPDATE drafts
+        SET status = 'pending', reviewed_at = NULL, editor_line = NULL,
+            editor_notes = NULL, defer_until = NULL
+        WHERE id = ?
+        """,
+        (draft_id,),
+    )
+    conn.commit()
+    # Keep the queue consistent: a reopened draft is not approved, so it must
+    # not linger in the publish queue.
+    remove_from_queue(conn, draft_id)
+
+
 def defer_draft(conn: sqlite3.Connection, draft_id: str, days: int = 30) -> None:
     """Defer a pending draft for ``days`` (the /later command). See ``db.defer_draft``."""
     db.defer_draft(conn, draft_id, days=days)
