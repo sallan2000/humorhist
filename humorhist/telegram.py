@@ -630,8 +630,9 @@ HELP_TEXT = (
     "/listapproved - list approved drafts with their #id; tap one to open it\n"
     "/listqueue - list queued drafts with their #id, copy + a Remove button\n"
     "    /queue remove <id> pulls a draft out of the queue (kept approved)\n"
-    "/viewcopy <id> - open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)\n"
-    "    (use the #id shown by /listapproved or /listqueue)\n\n"
+    "/view <id> - re-read any draft's full content (pending/approved/rejected)\n"
+    "    (use the #id shown by /listapproved or /listqueue)\n"
+    "/viewcopy <id> - open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)\n\n"
     "BUFFER & STATUS\n"
     "/buffer - buffer health report + on-demand top-up\n"
     "/buffer enqueue - also sweep approved drafts into the queue\n"
@@ -1148,6 +1149,15 @@ def run_review_bot(
                 client.send_message(chat_id, "Usage: /viewcopy <draft_id>")
             else:
                 send_copy_content(conn, client, chat_id, target[1])
+        elif cmd == "/view":
+            target = text.split()
+            if len(target) < 2:
+                client.send_message(chat_id, "Usage: /view <draft_id>")
+            else:
+                # Re-read any draft's full content from the phone, regardless of
+                # status (pending/approved/rejected). /viewcopy is for queued
+                # post-copy only; /view is the general "show me the draft" view.
+                send_draft_content(conn, client, chat_id, target[1])
         elif cmd == "/status":
             send_reviewed_summary(conn, client, chat_id)
         elif cmd == "/later":

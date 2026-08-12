@@ -676,6 +676,43 @@ def test_listapproved_shows_draft_id_in_text_and_button(tmp_path):
     assert btns[0][0]["callback_data"] == "view:d1"
 
 
+def test_view_command_re_reads_any_draft_from_phone(tmp_path):
+    """`/view <id>` must render a draft's full content from Telegram regardless
+    of status (pending/approved/rejected) -- the phone has no other way to
+    re-read a pending draft outside a /reviewdraft session."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")  # a pending draft, not in queue/listapproved
+    stub = tg.StubTelegram(updates=[
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
+                                     "text": "/view d1"}},
+    ])
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    # the draft body was sent (rendered), incl. the topic + sources
+    full = "\n".join(m["text"] for m in stub.sent)
+    assert "Pool X" in full  # the seeded pending draft's pool title
+    assert "VERIFIED FACTS" in full  # the full draft renderer ran
+
+
+def test_view_command_missing_id_shows_usage(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=[
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
+                                     "text": "/view"}},
+    ])
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Usage: /view <draft_id>" in m["text"] for m in stub.sent)
+
+
+def test_view_command_unknown_id_is_safe(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=[
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
+                                     "text": "/view nope"}},
+    ])
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("No such draft" in m["text"] for m in stub.sent)
+
+
 def test_send_queue_list_shows_draft_id_and_remove_button(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)  # d1 approved + queued
