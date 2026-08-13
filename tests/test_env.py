@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-
 from pathlib import Path
 
 import humorhist.env as env
@@ -14,10 +13,7 @@ def test_load_env_reads_pairs(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("HUMORHIST_TELEGRAM_CHAT_ID", raising=False)
     p = tmp_path / ".env"
     p.write_text(
-        "# comment line\n"
-        "HUMORHIST_TELEGRAM_BOT_TOKEN=abc123\n"
-        "HUMORHIST_TELEGRAM_CHAT_ID=999\n"
-        "\n"  # blank line ignored
+        "# comment line\nHUMORHIST_TELEGRAM_BOT_TOKEN=abc123\nHUMORHIST_TELEGRAM_CHAT_ID=999\n\n"  # blank line ignored
     )
     env.load_env(p)
     assert os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN") == "abc123"

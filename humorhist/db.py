@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 # Allowed statuses per table. Used to validate set_status inputs and to
 # whitelist the table name before interpolation.
@@ -105,15 +105,11 @@ def _backfill_normalized_title(conn: sqlite3.Connection) -> None:
     Pure-junk rows (normalize to "") are dropped rather than kept.
     """
     # sqlite can't call python normalize_title per row, so loop.
-    rows = conn.execute(
-        "SELECT id, title FROM pool WHERE normalized_title IS NULL"
-    ).fetchall()
+    rows = conn.execute("SELECT id, title FROM pool WHERE normalized_title IS NULL").fetchall()
     for r in rows:
         norm = normalize_title(r["title"])
         if norm:
-            conn.execute(
-                "UPDATE pool SET normalized_title = ? WHERE id = ?", (norm, r["id"])
-            )
+            conn.execute("UPDATE pool SET normalized_title = ? WHERE id = ?", (norm, r["id"]))
         else:
             conn.execute("DELETE FROM pool WHERE id = ?", (r["id"],))
     conn.commit()
@@ -131,18 +127,14 @@ def _dedupe_pool(conn: sqlite3.Connection) -> int:
     draft depends on them.
     """
     # 1) drop junk rows that have no draft
-    for r in conn.execute(
-        "SELECT id FROM pool WHERE normalized_title IS NULL"
-    ).fetchall():
+    for r in conn.execute("SELECT id FROM pool WHERE normalized_title IS NULL").fetchall():
         if conn.execute("SELECT 1 FROM drafts WHERE pool_id=? LIMIT 1", (r["id"],)).fetchone() is None:
             conn.execute("DELETE FROM pool WHERE id = ?", (r["id"],))
 
     _STATUS_RANK = {"used": 4, "drafted": 3, "rejected": 2, "new": 1}
 
     def _rank(row: sqlite3.Row) -> tuple:
-        has_draft = conn.execute(
-            "SELECT 1 FROM drafts WHERE pool_id=? LIMIT 1", (row["id"],)
-        ).fetchone() is not None
+        has_draft = conn.execute("SELECT 1 FROM drafts WHERE pool_id=? LIMIT 1", (row["id"],)).fetchone() is not None
         return (
             1 if has_draft else 0,
             _STATUS_RANK.get(row["status"], 0),
@@ -156,9 +148,7 @@ def _dedupe_pool(conn: sqlite3.Connection) -> int:
         "WHERE normalized_title IS NOT NULL GROUP BY normalized_title HAVING n > 1"
     ).fetchall()
     for g in groups:
-        rows = conn.execute(
-            "SELECT * FROM pool WHERE normalized_title = ?", (g["normalized_title"],)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM pool WHERE normalized_title = ?", (g["normalized_title"],)).fetchall()
         rows = sorted(rows, key=_rank, reverse=True)
         survivor, others = rows[0], rows[1:]
         # merge best fields into survivor (without clobbering reviewed work)
@@ -211,8 +201,7 @@ def _ensure_pool_norm_index(conn: sqlite3.Connection) -> None:
     Rows with a NULL normalized_title are excluded from the unique constraint.
     """
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_norm "
-        "ON pool(normalized_title) WHERE normalized_title IS NOT NULL"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_norm ON pool(normalized_title) WHERE normalized_title IS NOT NULL"
     )
 
 
@@ -251,9 +240,7 @@ def set_image(
 
     Idempotent on re-calls (an existing path is kept unless a new one is passed).
     """
-    row = conn.execute(
-        "SELECT image_prompt, image_path FROM queue WHERE draft_id = ?", (draft_id,)
-    ).fetchone()
+    row = conn.execute("SELECT image_prompt, image_path FROM queue WHERE draft_id = ?", (draft_id,)).fetchone()
     if row is None:
         return
     new_prompt = image_prompt if image_prompt is not None else row["image_prompt"]
@@ -267,9 +254,7 @@ def set_image(
 
 def get_image(conn: sqlite3.Connection, draft_id: str) -> dict | None:
     """Return ``{"image_prompt": ..., "image_path": ...}`` for a queued draft, or None."""
-    row = conn.execute(
-        "SELECT image_prompt, image_path FROM queue WHERE draft_id = ?", (draft_id,)
-    ).fetchone()
+    row = conn.execute("SELECT image_prompt, image_path FROM queue WHERE draft_id = ?", (draft_id,)).fetchone()
     if row is None:
         return None
     return {"image_prompt": row["image_prompt"], "image_path": row["image_path"]}
@@ -290,25 +275,20 @@ def _ensure_queue_link_column(conn: sqlite3.Connection) -> None:
 
 def set_source_link(conn: sqlite3.Connection, draft_id: str, link: str | None) -> None:
     """Persist a shortened 'learn more' source link onto the queue row."""
-    conn.execute(
-        "UPDATE queue SET source_link = ? WHERE draft_id = ?", (link, draft_id)
-    )
+    conn.execute("UPDATE queue SET source_link = ? WHERE draft_id = ?", (link, draft_id))
     conn.commit()
 
 
 def get_source_link(conn: sqlite3.Connection, draft_id: str) -> str | None:
     """Return the persisted shortened source link for ``draft_id``, or None."""
-    row = conn.execute(
-        "SELECT source_link FROM queue WHERE draft_id = ?", (draft_id,)
-    ).fetchone()
+    row = conn.execute("SELECT source_link FROM queue WHERE draft_id = ?", (draft_id,)).fetchone()
     return row["source_link"] if row else None
 
 
 def pool_source_url(conn: sqlite3.Connection, draft_id: str) -> tuple[str | None, str | None]:
     """Return ``(source_url, source_name)`` for a draft's pool row, or (None, None)."""
     row = conn.execute(
-        "SELECT p.source_url, p.source_name FROM drafts d "
-        "LEFT JOIN pool p ON p.id = d.pool_id WHERE d.id = ?",
+        "SELECT p.source_url, p.source_name FROM drafts d LEFT JOIN pool p ON p.id = d.pool_id WHERE d.id = ?",
         (draft_id,),
     ).fetchone()
     if row is None:
@@ -338,7 +318,8 @@ def shorten_url(url: str, *, max_len: int = 40, shorten: bool = False) -> str:
 def make_id(*parts: str) -> str:
     """Stable 16-char id from parts joined by '|' (sha1 hex digest)."""
     joined = "|".join(parts)
-    digest = hashlib.sha1(joined.encode("utf-8")).hexdigest()
+    # Non-security use: stable dedupe id, not for integrity/authentication.
+    digest = hashlib.sha1(joined.encode("utf-8"), usedforsecurity=False).hexdigest()
     return digest[:_ID_LEN]
 
 
@@ -354,10 +335,10 @@ def normalize_title(title: str | None) -> str:
     if not title:
         return ""
     t = title.lower().strip()
-    t = re.sub(r"\[http[^\]]*\]", " ", t)        # [http://...] wiki link junk
-    t = re.sub(r"https?://\S+", " ", t)          # bare URLs
-    t = re.sub(r"\([^)]*\)", " ", t)             # parentheticals
-    t = re.sub(r"[^\w\s]", " ", t)               # punctuation -> space
+    t = re.sub(r"\[http[^\]]*\]", " ", t)  # [http://...] wiki link junk
+    t = re.sub(r"https?://\S+", " ", t)  # bare URLs
+    t = re.sub(r"\([^)]*\)", " ", t)  # parentheticals
+    t = re.sub(r"[^\w\s]", " ", t)  # punctuation -> space
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -399,19 +380,13 @@ def upsert_pool_item(
     # Idempotent on the synthetic id too: if a row with this exact id already
     # exists (e.g. re-running the same harvest row), just make sure its
     # normalized_title is populated and return False rather than inserting a twin.
-    existing_by_id = conn.execute(
-        "SELECT id, normalized_title FROM pool WHERE id = ?", (id,)
-    ).fetchone()
+    existing_by_id = conn.execute("SELECT id, normalized_title FROM pool WHERE id = ?", (id,)).fetchone()
     if existing_by_id is not None:
         if not existing_by_id["normalized_title"]:
-            conn.execute(
-                "UPDATE pool SET normalized_title = ? WHERE id = ?", (norm, id)
-            )
+            conn.execute("UPDATE pool SET normalized_title = ? WHERE id = ?", (norm, id))
             conn.commit()
         return False
-    existing = conn.execute(
-        "SELECT * FROM pool WHERE normalized_title = ?", (norm,)
-    ).fetchone()
+    existing = conn.execute("SELECT * FROM pool WHERE normalized_title = ?", (norm,)).fetchone()
     if existing is None:
         conn.execute(
             """
@@ -420,8 +395,18 @@ def upsert_pool_item(
                funny_score, status, harvested_at, normalized_title)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
             """,
-            (id, title, year, date_hint, summary, source_url, source_name,
-             funny_score, datetime.now(timezone.utc).isoformat(), norm),
+            (
+                id,
+                title,
+                year,
+                date_hint,
+                summary,
+                source_url,
+                source_name,
+                funny_score,
+                datetime.now(UTC).isoformat(),
+                norm,
+            ),
         )
         conn.commit()
         return True
@@ -436,9 +421,7 @@ def upsert_pool_item(
         upd["source_url"] = source_url
     if source_name and not existing["source_name"]:
         upd["source_name"] = source_name
-    if funny_score is not None and (
-        existing["funny_score"] is None or funny_score > existing["funny_score"]
-    ):
+    if funny_score is not None and (existing["funny_score"] is None or funny_score > existing["funny_score"]):
         upd["funny_score"] = funny_score
     if upd:
         set_clause = ", ".join(f"{k} = ?" for k in upd)
@@ -514,28 +497,24 @@ def add_suggested_pool_item(
               note = excluded.note,
               status = 'new'
             """,
-            (pool_id, title.strip(), year, note or "", source_url,
-             datetime.now(timezone.utc).isoformat(), note or ""),
+            (pool_id, title.strip(), year, note or "", source_url, datetime.now(UTC).isoformat(), note or ""),
         )
         conn.commit()
         return pool_id
 
-    existing = conn.execute(
-        "SELECT id FROM pool WHERE normalized_title = ?", (norm,)
-    ).fetchone()
+    existing = conn.execute("SELECT id FROM pool WHERE normalized_title = ?", (norm,)).fetchone()
     if existing is not None:
         # fold the suggestion into the existing event row; bump it back to 'new'
         # so it (re)enters the draft pipeline, and keep the human's note.
         conn.execute(
-            "UPDATE pool SET status='new', note=?, source_name='editor-suggestion' "
-            "WHERE id = ?",
+            "UPDATE pool SET status='new', note=?, source_name='editor-suggestion' WHERE id = ?",
             (note or "", existing["id"]),
         )
         conn.commit()
         return existing["id"]
 
     pool_id = make_id("suggest", title.strip().lower())
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     conn.execute(
         """
         INSERT INTO pool (id, title, year, summary, source_url, source_name,
@@ -560,7 +539,7 @@ def defer_draft(conn: sqlite3.Connection, draft_id: str, days: int = 30) -> None
         raise ValueError(f"no draft with id {draft_id!r}")
     if row["status"] != "pending":
         raise ValueError(f"draft {draft_id!r} has status {row['status']!r}; cannot defer")
-    when = datetime.now(timezone.utc) + timedelta(days=days)
+    when = datetime.now(UTC) + timedelta(days=days)
     conn.execute(
         "UPDATE drafts SET defer_until = ? WHERE id = ?",
         (when.isoformat(), draft_id),
@@ -572,6 +551,22 @@ def clear_defer(conn: sqlite3.Connection, draft_id: str) -> None:
     """Clear a draft's defer_until (used when it is reviewed/acted on)."""
     conn.execute("UPDATE drafts SET defer_until = NULL WHERE id = ?", (draft_id,))
     conn.commit()
+
+
+def clear_deferred(conn: sqlite3.Connection, now: str | None = None) -> int:
+    """Clear defer_until on every still-deferred draft (defer_until > now).
+
+    Used by ``review.bring_forward(None)`` to bring ALL deferred drafts back
+    into the review surface in a single statement. Returns the count cleared.
+    """
+    if now is None:
+        now = datetime.now(UTC).isoformat()
+    cur = conn.execute(
+        "UPDATE drafts SET defer_until = NULL WHERE status = 'pending' AND defer_until IS NOT NULL AND defer_until > ?",
+        (now,),
+    )
+    conn.commit()
+    return cur.rowcount
 
 
 def draft_exists_for_pool(conn: sqlite3.Connection, pool_id: str) -> bool:

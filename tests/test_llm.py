@@ -19,7 +19,6 @@ from humorhist.llm import (
     resilient_client,
 )
 
-
 # --- extract_json -----------------------------------------------------------
 
 
@@ -37,7 +36,7 @@ def test_extract_json_fenced():
 
 
 def test_extract_json_fenced_without_language():
-    text = '```\n[1, 2, 3]\n```'
+    text = "```\n[1, 2, 3]\n```"
     assert extract_json(text) == [1, 2, 3]
 
 
@@ -95,16 +94,12 @@ def test_stub_raises_when_exhausted():
 
 
 def _chat_response(content: str) -> httpx.Response:
-    return httpx.Response(
-        200, json={"choices": [{"message": {"content": content}}]}
-    )
+    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
 
 @respx.mock
 def test_nous_client_parses_response():
-    route = respx.post(f"{DEFAULT_BASE_URL}/chat/completions").mock(
-        return_value=_chat_response('{"score": 9}')
-    )
+    route = respx.post(f"{DEFAULT_BASE_URL}/chat/completions").mock(return_value=_chat_response('{"score": 9}'))
     client = NousClient(api_key="test-key")
     assert client.complete_json("sys", "user") == {"score": 9}
     assert route.called
@@ -115,9 +110,7 @@ def test_nous_client_parses_response():
 
 @respx.mock
 def test_nous_client_sends_auth_header():
-    route = respx.post(f"{DEFAULT_BASE_URL}/chat/completions").mock(
-        return_value=_chat_response("{}")
-    )
+    route = respx.post(f"{DEFAULT_BASE_URL}/chat/completions").mock(return_value=_chat_response("{}"))
     NousClient(api_key="secret123").complete_json("s", "u")
     assert route.calls[0].request.headers["Authorization"] == "Bearer secret123"
 
@@ -143,9 +136,7 @@ def test_nous_client_retries_then_succeeds():
 
 @respx.mock
 def test_nous_client_raises_after_exhausting_retries():
-    respx.post(f"{DEFAULT_BASE_URL}/chat/completions").mock(
-        return_value=httpx.Response(500)
-    )
+    respx.post(f"{DEFAULT_BASE_URL}/chat/completions").mock(return_value=httpx.Response(500))
     client = NousClient(api_key="k", max_retries=1)
     with pytest.raises(LLMError, match="failed after 2 attempts"):
         client.complete_json("s", "u")
@@ -175,9 +166,7 @@ def test_resilient_client_falls_back_to_nous_auth_token(monkeypatch, tmp_path):
     monkeypatch.delenv("HUMORHIST_LLM_API_KEY", raising=False)
     hermes = tmp_path / ".hermes"
     hermes.mkdir()
-    (hermes / "auth.json").write_text(
-        json.dumps({"providers": {"nous": {"access_token": "oauth-token"}}})
-    )
+    (hermes / "auth.json").write_text(json.dumps({"providers": {"nous": {"access_token": "oauth-token"}}}))
     monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
     client = resilient_client()
     assert client.api_key == "oauth-token"
@@ -194,9 +183,7 @@ def test_resilient_client_raises_llm_unavailable_with_no_creds(monkeypatch, tmp_
 def test_nous_auth_token_reads_file(monkeypatch, tmp_path):
     hermes = tmp_path / ".hermes"
     hermes.mkdir()
-    (hermes / "auth.json").write_text(
-        json.dumps({"providers": {"nous": {"access_token": "abc"}}})
-    )
+    (hermes / "auth.json").write_text(json.dumps({"providers": {"nous": {"access_token": "abc"}}}))
     monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
     assert nous_auth_token() == "abc"
 

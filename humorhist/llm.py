@@ -104,9 +104,7 @@ class NousClient:
         max_retries: int = 2,
     ) -> None:
         self.api_key = api_key or os.environ.get("HUMORHIST_LLM_API_KEY", "")
-        self.base_url = (
-            base_url or os.environ.get("HUMORHIST_LLM_BASE_URL") or DEFAULT_BASE_URL
-        ).rstrip("/")
+        self.base_url = (base_url or os.environ.get("HUMORHIST_LLM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.model = model or os.environ.get("HUMORHIST_LLM_MODEL") or DEFAULT_MODEL
         self.timeout = timeout
         self.max_retries = max_retries
@@ -121,9 +119,7 @@ class NousClient:
         reasoning_off: bool = False,
     ) -> Any:
         if not self.api_key:
-            raise LLMError(
-                "no API key: set HUMORHIST_LLM_API_KEY or pass api_key explicitly"
-            )
+            raise LLMError("no API key: set HUMORHIST_LLM_API_KEY or pass api_key explicitly")
 
         payload = {
             "model": self.model,
@@ -165,7 +161,7 @@ class NousClient:
             except Exception as exc:  # noqa: BLE001 - retry on any transient failure
                 last_error = exc
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
 
         raise LLMError(f"LLM call failed after {self.max_retries + 1} attempts: {last_error}")
 

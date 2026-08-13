@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Optional
 
 import httpx
 
@@ -51,7 +50,7 @@ MAX_REDIRECT_HOPS = 2
 _REDIRECT_RE = re.compile(r"^\s*#REDIRECT\s*\[\[\s*([^\[\]|#]+)", re.IGNORECASE)
 
 
-def _extract_redirect_target(wikitext: str) -> Optional[str]:
+def _extract_redirect_target(wikitext: str) -> str | None:
     """Return the target page of a ``#REDIRECT [[Target]]`` page, else None."""
     m = _REDIRECT_RE.match(wikitext or "")
     if not m:
@@ -69,7 +68,7 @@ class HarvestError(Exception):
 # --------------------------------------------------------------------------- #
 
 
-def fetch_page_wikitext(title: str, client: Optional[httpx.Client] = None) -> str:
+def fetch_page_wikitext(title: str, client: httpx.Client | None = None) -> str:
     """Return the wikitext for a Wikipedia page via the MediaWiki parse API.
 
     Calls ``https://en.wikipedia.org/w/api.php`` with
@@ -106,8 +105,7 @@ def fetch_page_wikitext(title: str, client: Optional[httpx.Client] = None) -> st
             hops += 1
             if hops > MAX_REDIRECT_HOPS:
                 raise HarvestError(
-                    f"too many redirects following Wikipedia page {title!r} "
-                    f"(possible redirect loop at {target!r})"
+                    f"too many redirects following Wikipedia page {title!r} (possible redirect loop at {target!r})"
                 )
             wikitext = _fetch_raw(target, client, params, headers)
         return wikitext
@@ -129,9 +127,7 @@ def _fetch_raw(
     try:
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - surface as HarvestError
-        raise HarvestError(
-            f"non-JSON response from Wikipedia API for {title!r}: {exc}"
-        ) from exc
+        raise HarvestError(f"non-JSON response from Wikipedia API for {title!r}: {exc}") from exc
 
     if isinstance(data, dict) and "error" in data:
         code = data["error"].get("code", "error")
@@ -144,9 +140,7 @@ def _fetch_raw(
         or not isinstance(data["parse"], dict)
         or "wikitext" not in data["parse"]
     ):
-        raise HarvestError(
-            f"Wikipedia page {title!r} returned no wikitext (missing or malformed)"
-        )
+        raise HarvestError(f"Wikipedia page {title!r} returned no wikitext (missing or malformed)")
 
     return data["parse"]["wikitext"]
 
@@ -190,6 +184,7 @@ def _strip_noise(text: str) -> str:
 def _clean_markup(text: str) -> str:
     """Strip common wiki/markup noise from a single line of wikitext."""
     text = _strip_noise(text)
+
     # Wiki links: [[Target|Display]] -> Display, [[Target]] -> Target.
     # Drop file/image/category style links entirely.
     def _link(m: re.Match) -> str:
@@ -218,7 +213,7 @@ def _clean_markup(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _extract_first_link(text: str) -> Optional[str]:
+def _extract_first_link(text: str) -> str | None:
     """Return the display text of the first wiki link in ``text``, else None."""
     m = re.search(r"\[\[([^\[\]]+)\]\]", text)
     if not m:
@@ -231,7 +226,7 @@ def _extract_first_link(text: str) -> Optional[str]:
     return inner.split("|", 1)[1].strip() if "|" in inner else target
 
 
-def _extract_year(text: str) -> Optional[int]:
+def _extract_year(text: str) -> int | None:
     """Extract a year from the first 60 chars of cleaned text.
 
     * 3-4 digit years are taken directly (e.g. ``1932``, ``1325``).
@@ -286,7 +281,7 @@ def _derive_title(content: str) -> str:
 _HEADING_RE = re.compile(r"^\s*(={2,6})\s*(.*?)\s*\1\s*$")
 
 
-def _heading_year(line: str) -> Optional[int]:
+def _heading_year(line: str) -> int | None:
     """Return the year for a ``== 1991 ==`` style heading, else None.
 
     Returns None for non-heading lines and for headings whose text is not a
@@ -310,7 +305,7 @@ def parse_list_items(wikitext: str, source_page: str) -> list[dict]:
     used by subsequent items that carry no year of their own.
     """
     items: list[dict] = []
-    section_year: Optional[int] = None
+    section_year: int | None = None
     for line in wikitext.splitlines():
         if not line.startswith("*"):
             if _HEADING_RE.match(line):
@@ -355,8 +350,8 @@ def parse_list_items(wikitext: str, source_page: str) -> list[dict]:
 
 def harvest_wikipedia_lists(
     conn,
-    pages: Optional[list[str]] = None,
-    client: Optional[httpx.Client] = None,
+    pages: list[str] | None = None,
+    client: httpx.Client | None = None,
     sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
 ) -> dict:
     """Harvest candidate events from Wikipedia list pages into the pool.

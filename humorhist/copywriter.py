@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import humorhist.db as db
 from humorhist.llm import LLMClient
@@ -51,7 +51,7 @@ POST_COPY_SYSTEM_PROMPT = (
     "  - Be funny but factual. No invented quotes, dates, or deaths.\n"
     "  - Output ONLY the post text. No preamble, no hashtags unless natural.\n"
     "  - Stay within {limit} characters. Be ruthless about it.\n"
-    "Return a JSON object: {{\"post\": \"<the post text>\"}}.\n"
+    'Return a JSON object: {{"post": "<the post text>"}}.\n'
 )
 
 
@@ -122,11 +122,9 @@ def generate_post_copy(
     # can surface a degenerate stub. Disable reasoning for clean direct output,
     # and retry a few times if the model still returns something unusable.
     last_err: Exception | None = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
-            result = client.complete_json(
-                system, user, max_tokens=2048, reasoning_off=True
-            )
+            result = client.complete_json(system, user, max_tokens=2048, reasoning_off=True)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             continue
@@ -203,7 +201,7 @@ def fill_post_copy(
         except Exception as exc:  # noqa: BLE001 - one bad draft must not abort the fill
             print(f"[copywriter] failed for {did}: {exc}")
             continue
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             "UPDATE queue SET post_copy = ?, post_copy_at = ? WHERE draft_id = ?",
             (copy, now, did),
@@ -216,7 +214,7 @@ def fill_post_copy(
 
 def set_post_copy(conn: sqlite3.Connection, draft_id: str, copy: str) -> None:
     """Store an editor's manually edited copy for a queued draft."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     conn.execute(
         "UPDATE queue SET post_copy = ?, post_copy_at = ? WHERE draft_id = ?",
         (copy, now, draft_id),

@@ -16,17 +16,14 @@ from humorhist.brief import (
     generate_angles,
     validate_angles,
 )
-from humorhist.llm import LLMError, StubClient
+from humorhist.llm import StubClient
 
 # --- fixtures ---------------------------------------------------------------
 
 EMU_ITEM = {
     "title": "The Emu War",
     "year": 1932,
-    "summary": (
-        "Australia deployed soldiers with machine guns against ~20,000 emus "
-        "and effectively lost."
-    ),
+    "summary": ("Australia deployed soldiers with machine guns against ~20,000 emus and effectively lost."),
 }
 
 EMU_BRIEF = {
@@ -34,8 +31,7 @@ EMU_BRIEF = {
         "In late 1932 the Australian government sanctioned a military cull of "
         "emus in Western Australia using soldiers armed with Lewis machine guns.",
         "An estimated ~20,000 emus were roaming the Campion district during harvest.",
-        "After several weeks the gunners had killed only a few thousand emus; "
-        "the operation was withdrawn.",
+        "After several weeks the gunners had killed only a few thousand emus; the operation was withdrawn.",
         "Defence Minister Sir George Pearce approved deploying the soldiers and guns.",
     ],
     "dates": [
@@ -48,12 +44,10 @@ EMU_BRIEF = {
     ],
     "caveats": [
         "Emu kill counts vary by source; 'only 986 killed' is commonly cited but disputed.",
-        "Some accounts say the military was 'recalled', others that it ran out of "
-        "ammunition and funding.",
+        "Some accounts say the military was 'recalled', others that it ran out of ammunition and funding.",
     ],
     "misconceptions": [
-        "It is a myth that a formal 'war' was declared on the emus -- it was a "
-        "culling operation, not a declared war.",
+        "It is a myth that a formal 'war' was declared on the emus -- it was a culling operation, not a declared war.",
         "It is false that the government issued a surrender to the emus.",
     ],
     "sources": [
@@ -69,17 +63,13 @@ def _good_payload() -> dict:
         "angles": [
             {
                 "angle_name": "MILITARY INCOMPETENCE",
-                "setup": (
-                    "Frame it as a modern army that turned up to a fight and the "
-                    "enemy refused to cooperate."
-                ),
+                "setup": ("Frame it as a modern army that turned up to a fight and the enemy refused to cooperate."),
                 "why_it_lands": (
                     "The incongruity is mechanised warfare losing to a bird that "
                     "doesn't understand it is supposed to lose."
                 ),
                 "pitfalls": (
-                    "Don't mock the soldiers as individuals; mock the absurd gap "
-                    "between the arsenal and the outcome."
+                    "Don't mock the soldiers as individuals; mock the absurd gap between the arsenal and the outcome."
                 ),
                 "raw_material": [
                     "Lewis machine guns deployed against flightless birds",
@@ -97,10 +87,7 @@ def _good_payload() -> dict:
                     "The incongruity is the state treating a pest problem as a "
                     "military campaign requiring ministerial approval."
                 ),
-                "pitfalls": (
-                    "Keep it on the absurdity of the paperwork, not on the "
-                    "farmers' hardship."
-                ),
+                "pitfalls": ("Keep it on the absurdity of the paperwork, not on the farmers' hardship."),
                 "raw_material": [
                     "Sir George Pearce, Minister for Defence, approved the deployment",
                     "soldiers and Lewis guns dispatched to a wheat district",
@@ -127,13 +114,9 @@ def _good_payload() -> dict:
             },
             {
                 "angle_name": "MODERN PARALLEL",
-                "setup": (
-                    "Compare to any modern over-engineered solution that fails "
-                    "against a simpler problem."
-                ),
+                "setup": ("Compare to any modern over-engineered solution that fails against a simpler problem."),
                 "why_it_lands": (
-                    "The incongruity is timeless: expensive hardware, trivial "
-                    "adversary, humbling result."
+                    "The incongruity is timeless: expensive hardware, trivial adversary, humbling result."
                 ),
                 "pitfalls": (
                     "Name the parallel specifically; a vague 'like today' lands "
@@ -151,13 +134,13 @@ def _good_payload() -> dict:
             "flightless birds."
         ),
         "suggested_hook": (
-            "In 1932 the Australian government sent soldiers with machine guns "
-            "into Western Australia to cull emus."
+            "In 1932 the Australian government sent soldiers with machine guns into Western Australia to cull emus."
         ),
     }
 
 
 # --- build_angles_prompt ----------------------------------------------------
+
 
 def test_build_angles_prompt_includes_facts_and_caveats():
     prompt = build_angles_prompt(EMU_ITEM, EMU_BRIEF)
@@ -181,6 +164,7 @@ def test_build_angles_prompt_includes_item_summary():
 
 
 # --- validate_angles --------------------------------------------------------
+
 
 def test_validate_angles_accepts_good():
     payload = validate_angles(_good_payload())
@@ -214,9 +198,16 @@ def test_validate_angles_rejects_duplicate_names():
         validate_angles(payload)
 
 
-@pytest.mark.parametrize("field", [
-    "angle_name", "setup", "why_it_lands", "pitfalls", "raw_material",
-])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "angle_name",
+        "setup",
+        "why_it_lands",
+        "pitfalls",
+        "raw_material",
+    ],
+)
 def test_validate_angles_rejects_missing_field(field):
     payload = _good_payload()
     del payload["angles"][0][field]
@@ -229,9 +220,7 @@ def test_validate_angles_coerces_raw_material_string():
     payload = _good_payload()
     payload["angles"][0]["raw_material"] = "a single bare string of detail"
     validate_angles(payload)
-    assert payload["angles"][0]["raw_material"] == [
-        "a single bare string of detail"
-    ]
+    assert payload["angles"][0]["raw_material"] == ["a single bare string of detail"]
 
 
 def test_validate_angles_rejects_empty_hook():
@@ -242,6 +231,7 @@ def test_validate_angles_rejects_empty_hook():
 
 
 # --- generate_angles --------------------------------------------------------
+
 
 def test_generate_angles_retries_then_succeeds():
     bad = _good_payload()
@@ -287,6 +277,7 @@ def test_angles_system_prompt_is_meaningful():
 # --- regenerate_angles (steering on an editor note) ------------------------
 
 import json  # noqa: E402
+
 import humorhist.db as db  # noqa: E402
 from humorhist.brief import regenerate_angles  # noqa: E402
 
@@ -324,8 +315,10 @@ def test_regenerate_angles_rewrites_angles_with_steering(tmp_path):
     assert row["editor_notes"] == "lean into bureaucracy"
     # the steering note must have reached the prompt
     last = client.calls[-1]
-    assert last["user"].strip().endswith(
-        "Produce the comic angles payload now, following the system instructions exactly."
+    assert (
+        last["user"]
+        .strip()
+        .endswith("Produce the comic angles payload now, following the system instructions exactly.")
     )
     assert "EDITOR STEERING" in last["user"]
     assert "lean into bureaucracy" in last["user"]
@@ -336,4 +329,3 @@ def test_regenerate_angles_rejects_non_pending(tmp_path):
     db.set_status(conn, "drafts", "d1", "approved")
     with pytest.raises(ValueError):
         regenerate_angles(conn, StubClient([_good_payload()]), "d1")
-

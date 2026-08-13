@@ -117,9 +117,7 @@ def score_batch(client: LLMClient, items: list[dict]) -> dict[str, float]:
     result = client.complete_json(SCREEN_SYSTEM_PROMPT, prompt)
 
     if not isinstance(result, list):
-        raise LLMError(
-            f"expected a JSON array of scores, got {type(result).__name__}"
-        )
+        raise LLMError(f"expected a JSON array of scores, got {type(result).__name__}")
 
     scores: dict[str, float] = {}
     for entry in result:
@@ -137,14 +135,10 @@ def score_batch(client: LLMClient, items: list[dict]) -> dict[str, float]:
     return scores
 
 
-def _select_unscored(
-    conn: sqlite3.Connection, limit: int | None
-) -> list[dict]:
+def _select_unscored(conn: sqlite3.Connection, limit: int | None) -> list[dict]:
     """Return rows with a NULL funny_score, ordered deterministically."""
     if limit is None:
-        cur = conn.execute(
-            "SELECT * FROM pool WHERE funny_score IS NULL ORDER BY rowid"
-        )
+        cur = conn.execute("SELECT * FROM pool WHERE funny_score IS NULL ORDER BY rowid")
     else:
         cur = conn.execute(
             "SELECT * FROM pool WHERE funny_score IS NULL ORDER BY rowid LIMIT ?",

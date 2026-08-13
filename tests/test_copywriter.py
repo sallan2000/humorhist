@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-import humorhist.db as db
 import humorhist.copywriter as cw
+import humorhist.db as db
 from humorhist.llm import StubClient
 
 
@@ -41,8 +41,7 @@ def _make_draft(
         else "{}"
     )
     angles = (
-        '{"angles": [{"angle_name": "Bureaucratic revenge"}], '
-        '"suggested_hook": "A pastry shop was the casus belli"}'
+        '{"angles": [{"angle_name": "Bureaucratic revenge"}], "suggested_hook": "A pastry shop was the casus belli"}'
     )
     conn.execute(
         """INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at, editor_line)
@@ -218,19 +217,10 @@ def test_fill_post_copy_force_overwrites_existing(tmp_path, monkeypatch):
 
     # non-forced fill must NOT overwrite
     assert cw.fill_post_copy(conn, StubClient([{"post": "ignored"}]), draft_id="d1") == 0
-    assert (
-        conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"]
-        == "Original copy."
-    )
+    assert conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"] == "Original copy."
 
     # forced fill (regen) MUST overwrite
+    assert cw.fill_post_copy(conn, StubClient([{"post": "Regenerated copy."}]), draft_id="d1", force=True) == 1
     assert (
-        cw.fill_post_copy(
-            conn, StubClient([{"post": "Regenerated copy."}]), draft_id="d1", force=True
-        )
-        == 1
-    )
-    assert (
-        conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"]
-        == "Regenerated copy."
+        conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"] == "Regenerated copy."
     )

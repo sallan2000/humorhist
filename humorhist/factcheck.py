@@ -99,10 +99,11 @@ def _title_from(title_or_url: str) -> str:
         parsed = urllib.parse.urlparse(value)
         path = parsed.path
         marker = "/wiki/"
-        if marker in path:
-            value = path.split(marker, 1)[1]
-        else:
-            value = path.rsplit("/", 1)[-1]
+        value = (
+            path.split(marker, 1)[1]
+            if marker in path
+            else path.rsplit("/", 1)[-1]
+        )
         value = urllib.parse.unquote(value)
         if not value:
             raise FactCheckError(f"could not extract page title from URL: {title_or_url!r}")
@@ -110,9 +111,7 @@ def _title_from(title_or_url: str) -> str:
     return value.strip().replace(" ", "_")
 
 
-def fetch_wikipedia_extract(
-    title_or_url: str, client: httpx.Client | None = None
-) -> str:
+def fetch_wikipedia_extract(title_or_url: str, client: httpx.Client | None = None) -> str:
     """Fetch the plain-text intro extract for an English Wikipedia article.
 
     Accepts a bare page title ("Emu War") or a full en.wikipedia.org URL.
@@ -134,9 +133,7 @@ def fetch_wikipedia_extract(
             http.close()
 
     if resp.status_code != 200:
-        raise FactCheckError(
-            f"Wikipedia returned HTTP {resp.status_code} for {title!r}"
-        )
+        raise FactCheckError(f"Wikipedia returned HTTP {resp.status_code} for {title!r}")
 
     try:
         body = resp.json()
@@ -168,9 +165,7 @@ def build_factcheck_prompt(item: dict, extract: str) -> str:
     lines.append("ENCYCLOPEDIA EXTRACT:")
     lines.append(extract.strip())
     lines.append("")
-    lines.append(
-        "Produce the research brief as STRICT JSON matching the required schema."
-    )
+    lines.append("Produce the research brief as STRICT JSON matching the required schema.")
     return "\n".join(lines)
 
 
@@ -206,9 +201,7 @@ def validate_brief(brief: Any) -> dict:
             raise FactCheckError(f"missing required key: {key}")
 
     out: dict[str, Any] = {}
-    out["verified_facts"] = _as_list_of_str(
-        brief["verified_facts"], "verified_facts", required=True
-    )
+    out["verified_facts"] = _as_list_of_str(brief["verified_facts"], "verified_facts", required=True)
 
     dates = brief["dates"]
     if not isinstance(dates, dict):
@@ -222,9 +215,7 @@ def validate_brief(brief: Any) -> dict:
         raise FactCheckError("dates.event must be a non-empty string")
     precision = dates["precision"]
     if precision not in PRECISIONS:
-        raise FactCheckError(
-            f"dates.precision must be one of {', '.join(PRECISIONS)}; got {precision!r}"
-        )
+        raise FactCheckError(f"dates.precision must be one of {', '.join(PRECISIONS)}; got {precision!r}")
     out["dates"] = {"event": event.strip(), "precision": precision}
 
     for key in ("key_figures", "caveats", "misconceptions"):
@@ -232,9 +223,7 @@ def validate_brief(brief: Any) -> dict:
 
     sources = brief["sources"]
     if not isinstance(sources, list):
-        raise FactCheckError(
-            f"sources must be a list, got {type(sources).__name__}"
-        )
+        raise FactCheckError(f"sources must be a list, got {type(sources).__name__}")
     if not sources:
         raise FactCheckError("sources must have at least one entry")
     clean_sources: list[dict[str, str]] = []
@@ -284,6 +273,4 @@ def factcheck(client: LLMClient, item: dict, extract: str) -> dict:
                 "brief, with no commentary."
             )
 
-    raise FactCheckError(
-        f"fact-check failed after {_MAX_ATTEMPTS} attempts: {last_error}"
-    )
+    raise FactCheckError(f"fact-check failed after {_MAX_ATTEMPTS} attempts: {last_error}")

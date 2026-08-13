@@ -115,6 +115,7 @@ JSON.
 
 # --- Prompt construction ----------------------------------------------------
 
+
 def build_angles_prompt(item: dict, brief: dict, steering_note: str | None = None) -> str:
     """Render the item + verified brief into the user prompt for the model.
 
@@ -156,8 +157,7 @@ def build_angles_prompt(item: dict, brief: dict, steering_note: str | None = Non
     _section("KEY DATES:", brief.get("dates"))
     _section("KEY FIGURES:", brief.get("key_figures"))
     _section(
-        "CAVEATS (claims that are uncertain or partially disputed -- do not "
-        "state as fact):",
+        "CAVEATS (claims that are uncertain or partially disputed -- do not state as fact):",
         brief.get("caveats"),
     )
     _section(
@@ -172,14 +172,12 @@ def build_angles_prompt(item: dict, brief: dict, steering_note: str | None = Non
         lines.append(f"  {steering_note.strip()}")
         lines.append("")
 
-    lines.append(
-        "Produce the comic angles payload now, following the system "
-        "instructions exactly."
-    )
+    lines.append("Produce the comic angles payload now, following the system instructions exactly.")
     return "\n".join(lines)
 
 
 # --- Validation -------------------------------------------------------------
+
 
 def validate_angles(payload: Any) -> dict:
     """Validate and normalise an angles payload.
@@ -189,9 +187,7 @@ def validate_angles(payload: Any) -> dict:
     payload (a bare-string ``raw_material`` is coerced to a one-element list).
     """
     if not isinstance(payload, dict):
-        raise AnglesError(
-            f"angles payload must be a JSON object, got {type(payload).__name__}"
-        )
+        raise AnglesError(f"angles payload must be a JSON object, got {type(payload).__name__}")
 
     angles = payload.get("angles")
     if not isinstance(angles, list):
@@ -219,23 +215,15 @@ def validate_angles(payload: Any) -> dict:
                     angle[field] = [value]
                     value = angle[field]
                 if not isinstance(value, list):
-                    raise AnglesError(
-                        f"{label} 'raw_material' must be a list of strings"
-                    )
+                    raise AnglesError(f"{label} 'raw_material' must be a list of strings")
                 if len(value) == 0:
-                    raise AnglesError(
-                        f"{label} 'raw_material' must be a non-empty list"
-                    )
+                    raise AnglesError(f"{label} 'raw_material' must be a non-empty list")
                 for item in value:
                     if not isinstance(item, str) or not item.strip():
-                        raise AnglesError(
-                            f"{label} 'raw_material' entries must be non-empty strings"
-                        )
+                        raise AnglesError(f"{label} 'raw_material' entries must be non-empty strings")
             else:
                 if not isinstance(value, str) or not value.strip():
-                    raise AnglesError(
-                        f"{label} field '{field}' must be a non-empty string"
-                    )
+                    raise AnglesError(f"{label} field '{field}' must be a non-empty string")
 
         name = str(angle["angle_name"]).strip().lower()
         if name in seen_names:
@@ -254,6 +242,7 @@ def validate_angles(payload: Any) -> dict:
 
 
 # --- Generation (one LLM call, validated, with one retry) -------------------
+
 
 def generate_angles(
     client: LLMClient,
@@ -318,7 +307,6 @@ def regenerate_angles(
     Reuses the draft's existing ``brief_json``; only the angles are regenerated.
     Raises ValueError if the draft is unknown or not pending.
     """
-    import json
 
     import humorhist.db as db
 
@@ -329,9 +317,7 @@ def regenerate_angles(
     if row is None:
         raise ValueError(f"no draft with id {draft_id!r}")
     if row["status"] != "pending":
-        raise ValueError(
-            f"draft {draft_id!r} has status {row['status']!r}; only pending drafts can regenerate angles"
-        )
+        raise ValueError(f"draft {draft_id!r} has status {row['status']!r}; only pending drafts can regenerate angles")
 
     item = _row_to_item(db.get_pool_item(conn, row["pool_id"]))
     brief = json.loads(row["brief_json"] or "{}")

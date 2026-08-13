@@ -24,9 +24,7 @@ import humorhist.db as db
 # works regardless of the current working directory.
 # File lives at <repo_root>/humorhist/harvest/seed.py, so repo root is three
 # levels up from __file__.
-_DEFAULT_CSV = (
-    Path(__file__).resolve().parent.parent.parent / "data" / "seed_events.csv"
-)
+_DEFAULT_CSV = Path(__file__).resolve().parent.parent.parent / "data" / "seed_events.csv"
 
 
 def load_seed(

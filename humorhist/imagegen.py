@@ -111,7 +111,7 @@ IMAGE_PROMPT_SYSTEM = (
     "  - Be concrete and visual: subject, setting, action, composition, mood.\n"
     "  - Do NOT request text/lettering in the image.\n"
     "  - Keep it to ~3-5 sentences, no preamble.\n"
-    "Return a JSON object: {\"prompt\": \"<the image prompt>\"}.\n"
+    'Return a JSON object: {"prompt": "<the image prompt>"}.\n'
 )
 
 
@@ -156,7 +156,6 @@ def generate_image_prompt(
     ``client`` is an ``LLMClient`` (see ``humorhist.llm``). Raises ``ImageError``
     on a bad model response or any transport error.
     """
-    from humorhist.llm import extract_json
 
     user = _build_prompt_user(draft, pool)
     style = image_style()
@@ -167,11 +166,9 @@ def generate_image_prompt(
     )
 
     last_err: Exception | None = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
-            result = client.complete_json(
-                system, user, max_tokens=1024, reasoning_off=True
-            )
+            result = client.complete_json(system, user, max_tokens=1024, reasoning_off=True)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             continue
@@ -186,8 +183,6 @@ def generate_image_prompt(
             last_err = ValueError(f"degenerate image prompt rejected: {text!r}")
             continue
         return text
-
-    from humorhist.llm import LLMError
 
     raise ImageError(f"image prompt generation failed: {last_err}")
 
@@ -213,17 +208,13 @@ class FalClient:
         max_retries: int = 2,
     ) -> None:
         self.api_key = api_key or os.environ.get("HUMORHIST_IMAGE_API_KEY", "")
-        self.model = model or os.environ.get(
-            "HUMORHIST_IMAGE_MODEL", "fal-ai/flux/dev"
-        )
+        self.model = model or os.environ.get("HUMORHIST_IMAGE_MODEL", "fal-ai/flux/dev")
         self.timeout = timeout
         self.max_retries = max_retries
 
     def generate(self, prompt: str) -> bytes:
         if not self.api_key:
-            raise ImageError(
-                "no API key: set HUMORHIST_IMAGE_API_KEY or pass api_key explicitly"
-            )
+            raise ImageError("no API key: set HUMORHIST_IMAGE_API_KEY or pass api_key explicitly")
 
         base = "https://queue.fal.run"
         url = f"{base}/{self.model.lstrip('/')}"
@@ -257,14 +248,12 @@ class FalClient:
             except Exception as exc:  # noqa: BLE001 - retry transient failures
                 last_error = exc
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
 
         raise ImageError(f"image generation failed after retries: {last_error}")
 
     @staticmethod
-    def _wait_for_result(
-        client: httpx.Client, headers: dict, status_url: str
-    ) -> str:
+    def _wait_for_result(client: httpx.Client, headers: dict, status_url: str) -> str:
         """Poll ``status_url`` until the FAL job is complete; return the image URL."""
         for _ in range(60):  # up to ~5 min at 5s cadence
             resp = client.get(status_url, headers=headers)
@@ -319,10 +308,7 @@ def resilient_image_client(
     """
     key = os.environ.get("HUMORHIST_IMAGE_API_KEY")
     if not key:
-        raise ImageUnavailable(
-            "no image credential available — set HUMORHIST_IMAGE_API_KEY to enable "
-            "story images"
-        )
+        raise ImageUnavailable("no image credential available — set HUMORHIST_IMAGE_API_KEY to enable story images")
     return FalClient(api_key=key, timeout=timeout, max_retries=max_retries)
 
 
@@ -393,7 +379,7 @@ def generate_image_for_queue(
 
     img_client = None
     try:
-        from humorhist.imagegen import ImageUnavailable, resilient_image_client
+        from humorhist.imagegen import resilient_image_client
 
         img_client = resilient_image_client()
     except Exception:  # noqa: BLE001 - ImageUnavailable or any setup failure
@@ -406,14 +392,15 @@ def generate_image_for_queue(
             from humorhist.llm import default_client
 
             llm_client = default_client()
-        draft_row = dict(
-            conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
-        )
+        draft_row = dict(conn.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone())
         pool_row = db.get_pool_item(conn, draft_row["pool_id"])
         path, prompt = generate_image(
-            llm_client, img_client, draft_row,
+            llm_client,
+            img_client,
+            draft_row,
             dict(pool_row) if pool_row else None,
-            out_dir=out_dir, draft_id=draft_id,
+            out_dir=out_dir,
+            draft_id=draft_id,
         )
         db.set_image(conn, draft_id, image_prompt=prompt, image_path=path)
         return path, prompt

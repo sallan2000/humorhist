@@ -32,9 +32,7 @@ def _brief() -> dict:
         "key_figures": ["Sir George Pearce", "Major G.P.W. Meredith"],
         "caveats": ["Kill counts vary by source."],
         "misconceptions": ["No formal war was declared on the emus."],
-        "sources": [
-            {"title": "Wikipedia: Emu War", "url": "https://en.wikipedia.org/wiki/Emu_War"}
-        ],
+        "sources": [{"title": "Wikipedia: Emu War", "url": "https://en.wikipedia.org/wiki/Emu_War"}],
     }
 
 
@@ -56,12 +54,8 @@ def _angles() -> dict:
             _angle("ONE RIDICULOUS DETAIL"),
             _angle("MODERN PARALLEL"),
         ],
-        "strongest_single_detail": (
-            "The army deployed machine guns and withdrew having failed to beat birds."
-        ),
-        "suggested_hook": (
-            "In 1932 Australia sent soldiers with machine guns to cull emus."
-        ),
+        "strongest_single_detail": ("The army deployed machine guns and withdrew having failed to beat birds."),
+        "suggested_hook": ("In 1932 Australia sent soldiers with machine guns to cull emus."),
     }
 
 
@@ -101,6 +95,7 @@ def _stub_extract(monkeypatch, fn=None):
 
 # --- select_candidates ------------------------------------------------------
 
+
 def test_select_candidates_respects_min_score(conn):
     _add(conn, "a", score=3)
     _add(conn, "b", score=6)
@@ -137,9 +132,7 @@ def test_select_candidates_samples_from_window(conn):
 
     seen: set[str] = set()
     for seed in range(20):
-        rows = drafting.select_candidates(
-            conn, count=2, min_score=7.0, rng=random.Random(seed)
-        )
+        rows = drafting.select_candidates(conn, count=2, min_score=7.0, rng=random.Random(seed))
         assert len(rows) == 2
         seen.update(r["id"] for r in rows)
     # Sampling from a window must not always yield the same top-N.
@@ -147,6 +140,7 @@ def test_select_candidates_samples_from_window(conn):
 
 
 # --- draft_one --------------------------------------------------------------
+
 
 def test_draft_one_writes_draft_row(conn, monkeypatch):
     _stub_extract(monkeypatch)
@@ -205,6 +199,7 @@ def test_draft_exists_for_pool(conn):
 
 # --- draft_candidates -------------------------------------------------------
 
+
 def test_draft_candidates_continues_on_failure(conn, monkeypatch):
     _add(conn, "bad", score=9.9)
     _add(conn, "ok1", score=9.0)
@@ -229,9 +224,7 @@ def test_draft_candidates_continues_on_failure(conn, monkeypatch):
 def test_draft_candidates_returns_summary_shape(conn, monkeypatch):
     _stub_extract(monkeypatch)
     _add(conn, "one", score=9)
-    result = drafting.draft_candidates(
-        conn, StubClient([_brief(), _angles()]), count=1, min_score=7.0
-    )
+    result = drafting.draft_candidates(conn, StubClient([_brief(), _angles()]), count=1, min_score=7.0)
     assert set(result) == {"selected", "drafted", "failed", "draft_ids", "failures"}
     assert result["drafted"] == 1
     assert len(result["draft_ids"]) == 1

@@ -7,8 +7,6 @@ used to test actual persistence (no in-memory DB).
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 import humorhist.db as db
@@ -189,7 +187,9 @@ def test_add_suggested_pool_item_is_idempotent(tmp_path):
 
 def test_defer_draft_sets_defer_until(tmp_path):
     conn = _fresh_db(tmp_path)
-    db.upsert_pool_item(conn, id="p1", title="t", year=None, date_hint=None, summary=None, source_url=None, source_name=None)
+    db.upsert_pool_item(
+        conn, id="p1", title="t", year=None, date_hint=None, summary=None, source_url=None, source_name=None
+    )
     conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1','p1','pending')")
     conn.commit()
     db.defer_draft(conn, "d1", days=30)
@@ -212,13 +212,30 @@ def test_upsert_merges_same_event_different_source(tmp_path):
     conn = _fresh_db(tmp_path)
     a = db.make_id("wikipedia:List", "War of Jenkins' Ear")
     b = db.make_id("seed", "War of Jenkins' Ear")
-    assert db.upsert_pool_item(conn, id=a, title="War of Jenkins' Ear",
-                               year=1739, date_hint=None, summary="war",
-                               source_url="u1", source_name="wikipedia:List")
+    assert db.upsert_pool_item(
+        conn,
+        id=a,
+        title="War of Jenkins' Ear",
+        year=1739,
+        date_hint=None,
+        summary="war",
+        source_url="u1",
+        source_name="wikipedia:List",
+    )
     # second insert is the same event under a different source id -> merged
-    assert db.upsert_pool_item(conn, id=b, title="War of Jenkins' Ear",
-                               year=1739, date_hint=None, summary=None,
-                               source_url=None, source_name="seed") is False
+    assert (
+        db.upsert_pool_item(
+            conn,
+            id=b,
+            title="War of Jenkins' Ear",
+            year=1739,
+            date_hint=None,
+            summary=None,
+            source_url=None,
+            source_name="seed",
+        )
+        is False
+    )
     assert db.counts(conn)["pool"] == 1
 
 
@@ -226,12 +243,26 @@ def test_upsert_merges_different_spelling(tmp_path):
     conn = _fresh_db(tmp_path)
     a = db.make_id("w", "Moroccan War of Succession")
     b = db.make_id("w", "moroccan war of succession ")  # casing + trailing space
-    db.upsert_pool_item(conn, id=a, title="Moroccan War of Succession",
-                        year=None, date_hint=None, summary=None,
-                        source_url=None, source_name="w")
-    db.upsert_pool_item(conn, id=b, title="moroccan war of succession ",
-                        year=1727, date_hint=None, summary="war",
-                        source_url="u", source_name="w")
+    db.upsert_pool_item(
+        conn,
+        id=a,
+        title="Moroccan War of Succession",
+        year=None,
+        date_hint=None,
+        summary=None,
+        source_url=None,
+        source_name="w",
+    )
+    db.upsert_pool_item(
+        conn,
+        id=b,
+        title="moroccan war of succession ",
+        year=1727,
+        date_hint=None,
+        summary="war",
+        source_url="u",
+        source_name="w",
+    )
     assert db.counts(conn)["pool"] == 1
     row = conn.execute("SELECT * FROM pool").fetchone()
     # the richer (later) insert filled the empty fields without clobbering
@@ -241,9 +272,19 @@ def test_upsert_merges_different_spelling(tmp_path):
 
 def test_upsert_drops_junk_title(tmp_path):
     conn = _fresh_db(tmp_path)
-    assert db.upsert_pool_item(conn, id="x", title="[http://junk]",
-                               year=None, date_hint=None, summary=None,
-                               source_url=None, source_name="w") is False
+    assert (
+        db.upsert_pool_item(
+            conn,
+            id="x",
+            title="[http://junk]",
+            year=None,
+            date_hint=None,
+            summary=None,
+            source_url=None,
+            source_name="w",
+        )
+        is False
+    )
     assert db.counts(conn)["pool"] == 0
 
 
@@ -252,17 +293,35 @@ def test_upsert_tie_breaker_protects_drafted_row(tmp_path):
     conn = _fresh_db(tmp_path)
     drafted_id = db.make_id("w", "Emu War")
     new_id = db.make_id("seed", "Emu War")
-    db.upsert_pool_item(conn, id=drafted_id, title="Emu War", year=1932,
-                        date_hint=None, summary="emus", source_url="u",
-                        source_name="w", funny_score=9.0)
+    db.upsert_pool_item(
+        conn,
+        id=drafted_id,
+        title="Emu War",
+        year=1932,
+        date_hint=None,
+        summary="emus",
+        source_url="u",
+        source_name="w",
+        funny_score=9.0,
+    )
     db.set_status(conn, "pool", drafted_id, "drafted")
-    conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1',?, 'pending')",
-                 (drafted_id,))
+    conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1',?, 'pending')", (drafted_id,))
     conn.commit()
     # newer twin arrives, scored lower
-    assert db.upsert_pool_item(conn, id=new_id, title="Emu War", year=1932,
-                               date_hint=None, summary=None, source_url=None,
-                               source_name="seed", funny_score=4.0) is False
+    assert (
+        db.upsert_pool_item(
+            conn,
+            id=new_id,
+            title="Emu War",
+            year=1932,
+            date_hint=None,
+            summary=None,
+            source_url=None,
+            source_name="seed",
+            funny_score=4.0,
+        )
+        is False
+    )
     assert db.counts(conn)["pool"] == 1
     row = conn.execute("SELECT * FROM pool").fetchone()
     # the drafted/survivor row keeps its higher score (not clobbered)
@@ -275,9 +334,16 @@ def test_upsert_tie_breaker_protects_drafted_row(tmp_path):
 def test_suggest_merges_into_existing_event(tmp_path):
     """/suggest for an event that already exists folds into that row, no twin."""
     conn = _fresh_db(tmp_path)
-    db.upsert_pool_item(conn, id="w1", title="Pastry War",
-                        year=1838, date_hint=None, summary="mexico",
-                        source_url="u", source_name="wikipedia:List")
+    db.upsert_pool_item(
+        conn,
+        id="w1",
+        title="Pastry War",
+        year=1838,
+        date_hint=None,
+        summary="mexico",
+        source_url="u",
+        source_name="wikipedia:List",
+    )
     db.set_status(conn, "pool", "w1", "drafted")
     suggested_id = db.add_suggested_pool_item(conn, title="pastry war", note="lean into bureaucracy")
     assert suggested_id == "w1"  # folded into the existing row, same id
@@ -312,31 +378,42 @@ def test_migrate_runs_dedup_and_index(tmp_path):
     """migrate() collapses duplicate normalized titles; the UNIQUE index can then
     be added safely via the public helper (it must not fail once dups are gone)."""
     conn = _fresh_db(tmp_path)
-    db.upsert_pool_item(conn, id="a", title="Tunguska Event", year=1908,
-                        date_hint=None, summary=None, source_url=None, source_name="w")
-    db.upsert_pool_item(conn, id="b", title="Tunguska event", year=1908,
-                        date_hint=None, summary=None, source_url=None, source_name="seed")
+    db.upsert_pool_item(
+        conn, id="a", title="Tunguska Event", year=1908, date_hint=None, summary=None, source_url=None, source_name="w"
+    )
+    db.upsert_pool_item(
+        conn,
+        id="b",
+        title="Tunguska event",
+        year=1908,
+        date_hint=None,
+        summary=None,
+        source_url=None,
+        source_name="seed",
+    )
     # re-run migrate (as on app start) must not error and must keep one row
     db.migrate(conn)
     assert db.counts(conn)["pool"] == 1
     # once duplicates are gone, the safety-net UNIQUE index can be created
     db._ensure_pool_norm_index(conn)
-    idx = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pool_norm'"
-    ).fetchone()
+    idx = conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pool_norm'").fetchone()
     assert idx is not None
 
 
 def test_source_link_roundtrip_and_shorten(tmp_path):
     """queue.source_link persists via set/get; shorten_url truncates in the middle."""
     conn = _fresh_db(tmp_path)
-    db.upsert_pool_item(conn, id="p1", title="Emu War", year=1932,
-                        date_hint=None, summary=None,
-                        source_url="https://en.wikipedia.org/wiki/The_Great_Emu_War",
-                        source_name="w")
-    conn.execute(
-        "INSERT INTO drafts (id, pool_id, status) VALUES ('d1', 'p1', 'approved')"
+    db.upsert_pool_item(
+        conn,
+        id="p1",
+        title="Emu War",
+        year=1932,
+        date_hint=None,
+        summary=None,
+        source_url="https://en.wikipedia.org/wiki/The_Great_Emu_War",
+        source_name="w",
     )
+    conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1', 'p1', 'approved')")
     conn.execute("INSERT INTO queue (draft_id, published) VALUES ('d1', 0)")
     conn.commit()
 
@@ -359,22 +436,27 @@ def test_source_link_roundtrip_and_shorten(tmp_path):
 def test_enqueue_approved_populates_link_best_effort(tmp_path, monkeypatch):
     """review.enqueue_approved persists a 'learn more' link from pool.source_url
     even when no image dir is supplied (image skipped, link still set)."""
+    from humorhist import review as review
     from humorhist.imagegen import ImageUnavailable
     from humorhist.llm import StubClient
-    from humorhist import review as review
 
     monkeypatch.setattr("humorhist.llm.default_client", lambda: StubClient([{"post": "x"}]))
-    monkeypatch.setattr("humorhist.imagegen.resilient_image_client",
-                        lambda: (_ for _ in ()).throw(ImageUnavailable("no key")))
+    monkeypatch.setattr(
+        "humorhist.imagegen.resilient_image_client", lambda: (_ for _ in ()).throw(ImageUnavailable("no key"))
+    )
 
     conn = _fresh_db(tmp_path)
-    db.upsert_pool_item(conn, id="p1", title="Emu War", year=1932,
-                        date_hint=None, summary=None,
-                        source_url="https://en.wikipedia.org/wiki/The_Great_Emu_War",
-                        source_name="w")
-    conn.execute(
-        "INSERT INTO drafts (id, pool_id, status) VALUES ('d1', 'p1', 'approved')"
+    db.upsert_pool_item(
+        conn,
+        id="p1",
+        title="Emu War",
+        year=1932,
+        date_hint=None,
+        summary=None,
+        source_url="https://en.wikipedia.org/wiki/The_Great_Emu_War",
+        source_name="w",
     )
+    conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1', 'p1', 'approved')")
     conn.commit()
 
     n = review.enqueue_approved(conn, image_dir=None)
@@ -384,4 +466,3 @@ def test_enqueue_approved_populates_link_best_effort(tmp_path, monkeypatch):
     info = db.get_image(conn, "d1")
     assert info is not None
     assert info["image_path"] is None
-

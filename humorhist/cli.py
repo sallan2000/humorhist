@@ -11,21 +11,18 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
 
 import humorhist.db as db
+import humorhist.env as env  # noqa: F401  (loads local .env into os.environ)
 import humorhist.render as render
 from humorhist.buffer import ESCALATE_THRESHOLD, NUDGE_THRESHOLD
-import humorhist.env as env  # noqa: F401  (loads local .env into os.environ)
 
 env.load_env()
 
-DEFAULT_DB = os.environ.get(
-    "HUMORHIST_DB", str(Path.home() / "projects" / "humorhist" / "data" / "humorhist.sqlite")
-)
+DEFAULT_DB = os.environ.get("HUMORHIST_DB", str(Path.home() / "projects" / "humorhist" / "data" / "humorhist.sqlite"))
 
 
 def _open_db(path: str):
@@ -63,9 +60,7 @@ def cmd_screen(args: argparse.Namespace) -> int:
     result = screen_pool(conn, client, batch_size=args.batch_size, limit=args.limit)
     print("Result:", result)
 
-    cur = conn.execute(
-        "SELECT count(*) AS n, round(avg(funny_score),2) AS avg FROM pool WHERE funny_score IS NOT NULL"
-    )
+    cur = conn.execute("SELECT count(*) AS n, round(avg(funny_score),2) AS avg FROM pool WHERE funny_score IS NOT NULL")
     row = cur.fetchone()
     print(f"Scored so far: {row['n']} (avg {row['avg']})")
     return 0
@@ -78,9 +73,7 @@ def cmd_draft(args: argparse.Namespace) -> int:
     conn = _open_db(args.db)
     client = default_client()
     print(f"Drafting {args.count} candidates (min score {args.min_score})...")
-    result = draft_candidates(
-        conn, client, count=args.count, min_score=args.min_score
-    )
+    result = draft_candidates(conn, client, count=args.count, min_score=args.min_score)
     print("Result:", result)
     return 0
 
@@ -110,18 +103,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  5 - 7    : {bands['band5'] or 0}")
     print(f"  < 5      : {bands['below5'] or 0}")
 
-    drafts = conn.execute(
-        "SELECT status, count(*) AS n FROM drafts GROUP BY status"
-    ).fetchall()
+    drafts = conn.execute("SELECT status, count(*) AS n FROM drafts GROUP BY status").fetchall()
     print("\nDrafts by status:")
     if not drafts:
         print("  (none yet)")
     for d in drafts:
         print(f"  {d['status']:10s}: {d['n']}")
 
-    queued = conn.execute(
-        "SELECT count(*) AS n FROM queue WHERE published = 0"
-    ).fetchone()["n"]
+    queued = conn.execute("SELECT count(*) AS n FROM queue WHERE published = 0").fetchone()["n"]
     print(f"\nApproved and queued (unpublished): {queued}")
     if queued < ESCALATE_THRESHOLD:
         print("  ** BUFFER CRITICAL ** draft more / review now")
@@ -134,13 +123,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     stuck = review.stuck_captures(conn)
     if stuck:
-        print(
-            f"\n⚠️ Stuck captures ({len(stuck)}): approved + queued but the "
-            f"one-line joke was never filled:"
-        )
+        print(f"\n⚠️ Stuck captures ({len(stuck)}): approved + queued but the one-line joke was never filled:")
         for s in stuck:
             print(f"  • {s['draft_id']} {s['title']}")
-        print("  Fix with: humorhist setjoke <id> \"<joke>\"")
+        print('  Fix with: humorhist setjoke <id> "<joke>"')
     return 0
 
 
@@ -207,13 +193,9 @@ def _render_draft_with_pool(row, pool) -> str:
 def cmd_show(args: argparse.Namespace) -> int:
     conn = _open_db(args.db)
     if args.draft_id:
-        row = conn.execute(
-            "SELECT * FROM drafts WHERE id = ?", (args.draft_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM drafts WHERE id = ?", (args.draft_id,)).fetchone()
     else:
-        row = conn.execute(
-            "SELECT * FROM drafts ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT * FROM drafts ORDER BY created_at DESC LIMIT 1").fetchone()
 
     if row is None:
         print("No draft found.")
@@ -460,9 +442,7 @@ def _copy_get_row(conn, draft_id: str):
     ).fetchone()
     if draft is None:
         return None, None
-    q = conn.execute(
-        "SELECT post_copy, post_copy_at FROM queue WHERE draft_id = ?", (draft_id,)
-    ).fetchone()
+    q = conn.execute("SELECT post_copy, post_copy_at FROM queue WHERE draft_id = ?", (draft_id,)).fetchone()
     return dict(draft), dict(q) if q else None
 
 
@@ -497,7 +477,7 @@ def _launch_editor(initial: str) -> str | None:
     Returns None if no usable editor is available (caller falls back to prompt).
     """
     import os
-    import subprocess
+    import subprocess  # nosec B404 - used only below, fixed arg list, no shell
     import tempfile
 
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
@@ -507,7 +487,7 @@ def _launch_editor(initial: str) -> str | None:
         tf.write(initial)
         path = tf.name
     try:
-        rc = subprocess.run([editor, path], check=False).returncode
+        rc = subprocess.run([editor, path], check=False).returncode  # nosec B603 - fixed args, no shell, editor from user env
         if rc != 0:
             return None
         with open(path) as fh:
@@ -576,9 +556,7 @@ def cmd_copy_regen(args: argparse.Namespace) -> int:
             "edit it with `copy edit` or delete the copy first.)"
         )
         return 0
-    row = conn.execute(
-        "SELECT post_copy FROM queue WHERE draft_id = ?", (args.draft_id,)
-    ).fetchone()
+    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id = ?", (args.draft_id,)).fetchone()
     limit = _char_limit()
     print(f"Regenerated ({len(row['post_copy'])}/{limit} chars):")
     print(row["post_copy"])
@@ -597,9 +575,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     conn = _open_db(args.db)
     if args.enqueue:
-        img_dir = os.environ.get("HUMORHIST_IMAGE_DIR") or str(
-            Path(args.db).resolve().parent / "images"
-        )
+        img_dir = os.environ.get("HUMORHIST_IMAGE_DIR") or str(Path(args.db).resolve().parent / "images")
         n = review.enqueue_approved(conn, scheduled_for=args.scheduled_for, image_dir=img_dir)
         print(f"Enqueued {n} approved draft(s) into queue.")
         # B+ handoff: generate initial post copy for anything that just entered
@@ -666,7 +642,9 @@ def build_parser() -> argparse.ArgumentParser:
     ro.set_defaults(func=cmd_reopen)
 
     rn = sub.add_parser("reviewnow", help="bring a deferred (/later) draft back for review")
-    rn.add_argument("draft_id", nargs="?", default=None, help="single deferred draft id; omit to bring ALL deferred forward")
+    rn.add_argument(
+        "draft_id", nargs="?", default=None, help="single deferred draft id; omit to bring ALL deferred forward"
+    )
     rn.set_defaults(func=cmd_reviewnow)
 
     sj = sub.add_parser("setjoke", help="set the one-line joke on an approved draft (fix a blank capture)")

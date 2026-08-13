@@ -8,10 +8,8 @@ be stored as notes, and the bot must send one message per pending draft.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 import humorhist.db as db
 import humorhist.review as review
@@ -26,9 +24,7 @@ def _fresh_db(tmp_path: Path):
 
 
 def _seed_pending(conn, draft_id: str = "d1") -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pool X', 'drafted')"
-    )
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pool X', 'drafted')")
     conn.execute(
         """INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at)
            VALUES (?, 'pool-x', '{}', '{}', 'pending', '2026-01-01T00:00:00+00:00')""",
@@ -78,12 +74,16 @@ def _approve_and_confirm(conn, stub, draft_id="d1"):
     ``note_message_id`` + ``stage`` so the editor_line can be captured).
     """
     tg.handle_callback(
-        conn, stub, "chat",
+        conn,
+        stub,
+        "chat",
         _callback_update(1, "cb1", "approve", draft_id),
     )
     # the confirm callback returns the editor_line prompt metadata
     return tg.handle_callback(
-        conn, stub, "chat",
+        conn,
+        stub,
+        "chat",
         _confirm_update(2, "cb2", "approve", draft_id),
     )
 
@@ -115,8 +115,7 @@ def test_send_pending_drafts_sends_one_message_per_pending(tmp_path):
     for s in stub.sent:
         kb = s["reply_markup"]["inline_keyboard"][0]
         cbs = {b["callback_data"] for b in kb}
-        assert cbs == {"approve:d1", "reject:d1", "later:d1"} or \
-               cbs == {"approve:d2", "reject:d2", "later:d2"}
+        assert cbs == {"approve:d1", "reject:d1", "later:d1"} or cbs == {"approve:d2", "reject:d2", "later:d2"}
 
 
 def test_send_pending_drafts_empty_when_none_pending(tmp_path):
@@ -181,7 +180,20 @@ def test_handle_callback_approve_cancel_is_noop(tmp_path):
     assert res.get("cancelled") is True
     row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
     assert row["status"] == "pending"
-    assert review.pending_drafts(conn) == [{"id": "d1", "pool_id": "pool-x", "brief_json": "{}", "angles_json": "{}", "status": "pending", "created_at": "2026-01-01T00:00:00+00:00", "editor_line": None, "editor_notes": None, "reviewed_at": None, "defer_until": None}]
+    assert review.pending_drafts(conn) == [
+        {
+            "id": "d1",
+            "pool_id": "pool-x",
+            "brief_json": "{}",
+            "angles_json": "{}",
+            "status": "pending",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "editor_line": None,
+            "editor_notes": None,
+            "reviewed_at": None,
+            "defer_until": None,
+        }
+    ]
 
 
 def test_handle_callback_reject_calls_apply_review(tmp_path):
@@ -239,9 +251,7 @@ def test_handle_text_captures_editor_line_then_optional_notes(tmp_path):
 
     # second reply -> optional notes, must NOT clobber the editor_line
     notes_msg_id = awaiting["d1"]["note_message_id"]
-    res2 = tg.handle_text(
-        conn, stub, "chat", awaiting, _text_update(3, "tighten the third angle", notes_msg_id)
-    )
+    res2 = tg.handle_text(conn, stub, "chat", awaiting, _text_update(3, "tighten the third angle", notes_msg_id))
     assert res2.get("noted") == "d1"
     row = conn.execute("SELECT editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
     assert row["editor_line"] == "The bear was a tax dodge."
@@ -288,7 +298,7 @@ def test_handle_text_skip_clears_awaiting(tmp_path):
     cb_res = _approve_and_confirm(conn, stub, "d1")
     awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
 
-    res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", cb_res["note_message_id"]))
+    tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", cb_res["note_message_id"]))
     # skipping the editor_line moves to the notes stage, not out
     assert awaiting["d1"]["stage"] == "notes"
     # now skip notes too -> cleared
@@ -315,10 +325,12 @@ def test_run_review_bot_once_pumps_callback(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     # GAP 3: an approve now needs a separate confirm tap
-    stub = tg.StubTelegram(updates=[
-        _callback_update(1, "cb1", "approve", "d1"),
-        _confirm_update(2, "cb2", "approve", "d1"),
-    ])
+    stub = tg.StubTelegram(
+        updates=[
+            _callback_update(1, "cb1", "approve", "d1"),
+            _confirm_update(2, "cb2", "approve", "d1"),
+        ]
+    )
 
     decided = tg.run_review_bot(conn, stub, "chat", once=True)
 
@@ -466,8 +478,7 @@ def test_handle_text_fallback_when_single_awaiting(tmp_path):
     conn.commit()
     stub = tg.StubTelegram()
     awaiting = {"d1": {"note_message_id": "note1"}}
-    upd = {"update_id": 5, "message": {"message_id": 10, "chat": {"id": "chat"},
-                                       "text": "tighten the third angle"}}
+    upd = {"update_id": 5, "message": {"message_id": 10, "chat": {"id": "chat"}, "text": "tighten the third angle"}}
     res = tg.handle_text(conn, stub, "chat", awaiting, upd)
     assert res == {"noted": "d1"}
     row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
@@ -486,55 +497,65 @@ class _SeqStub(tg.StubTelegram):
 
 
 def _callback_batch(draft_id, update_id=1):
-    return [{
-        "update_id": update_id,
-        "callback_query": {
-            "id": f"cb{update_id}",
-            "data": f"approve:{draft_id}",
-            "message": {"message_id": 100 + update_id},
-        },
-    }]
+    return [
+        {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"cb{update_id}",
+                "data": f"approve:{draft_id}",
+                "message": {"message_id": 100 + update_id},
+            },
+        }
+    ]
 
 
 def _reject_batch(draft_id, update_id=1):
-    return [{
-        "update_id": update_id,
-        "callback_query": {
-            "id": f"cb{update_id}",
-            "data": f"reject:{draft_id}",
-            "message": {"message_id": 100 + update_id},
-        },
-    }]
+    return [
+        {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"cb{update_id}",
+                "data": f"reject:{draft_id}",
+                "message": {"message_id": 100 + update_id},
+            },
+        }
+    ]
 
 
 def _confirm_batch(draft_id, update_id=1):
     """The second step of the GAP 3 confirm gate (confirm:<decision>:<id>)."""
-    return [{
-        "update_id": update_id,
-        "callback_query": {
-            "id": f"cb{update_id}",
-            "data": f"confirm:approve:{draft_id}",
-            "message": {"message_id": 100 + update_id},
-        },
-    }]
+    return [
+        {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"cb{update_id}",
+                "data": f"confirm:approve:{draft_id}",
+                "message": {"message_id": 100 + update_id},
+            },
+        }
+    ]
 
 
 def _confirm_reject_batch(draft_id, update_id=1):
-    return [{
-        "update_id": update_id,
-        "callback_query": {
-            "id": f"cb{update_id}",
-            "data": f"confirm:reject:{draft_id}",
-            "message": {"message_id": 100 + update_id},
-        },
-    }]
+    return [
+        {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"cb{update_id}",
+                "data": f"confirm:reject:{draft_id}",
+                "message": {"message_id": 100 + update_id},
+            },
+        }
+    ]
 
 
 def _message_batch(text, update_id=1):
-    return [{
-        "update_id": update_id,
-        "message": {"message_id": 100 + update_id, "chat": {"id": "chat"}, "text": text},
-    }]
+    return [
+        {
+            "update_id": update_id,
+            "message": {"message_id": 100 + update_id, "chat": {"id": "chat"}, "text": text},
+        }
+    ]
 
 
 def test_run_review_bot_one_by_one(tmp_path):
@@ -543,17 +564,19 @@ def test_run_review_bot_one_by_one(tmp_path):
     _seed_pending(conn, "d2")
     # realistic one-at-a-time flow: /reviewdraft, then for EACH draft a tap plus
     # its joke + /skip notes capture, before the next draft is shown.
-    stub = _SeqStub([
-        _message_batch("/reviewdraft", 1),
-        _callback_batch("d1", 2),
-        _confirm_batch("d1", 2),
-        _message_batch("joke for d1", 3),
-        _message_batch("/skip", 4),
-        _callback_batch("d2", 5),
-        _confirm_batch("d2", 5),
-        _message_batch("joke for d2", 6),
-        _message_batch("/skip", 7),
-    ])
+    stub = _SeqStub(
+        [
+            _message_batch("/reviewdraft", 1),
+            _callback_batch("d1", 2),
+            _confirm_batch("d1", 2),
+            _message_batch("joke for d1", 3),
+            _message_batch("/skip", 4),
+            _callback_batch("d2", 5),
+            _confirm_batch("d2", 5),
+            _message_batch("joke for d2", 6),
+            _message_batch("/skip", 7),
+        ]
+    )
     decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
     assert decided == 2
     # both drafts persisted as approved, in decision order
@@ -583,26 +606,32 @@ def test_review_session_waits_for_joke_before_next_draft(tmp_path):
         def __init__(self, batches):
             super().__init__(updates=[])
             self._batches = list(batches)
+
         def get_updates(self, offset=0, timeout=0):
             return self._batches.pop(0) if self._batches else []
 
     # /reviewdraft -> approve d1 -> CONFIRM d1 -> joke -> /skip notes ->
     # approve d2 -> CONFIRM d2 -> joke -> /skip
-    stub = _ScriptStub([
-        _message_batch("/reviewdraft", 1),
-        _callback_batch("d1", 2),
-        _confirm_batch("d1", 2),
-        _message_batch("the emus did nothing wrong", 3),  # editor_line reply
-        _message_batch("/skip", 4),                        # end notes capture
-        _callback_batch("d2", 5),
-        _confirm_batch("d2", 5),
-        _message_batch("and the humans lost", 6),
-        _message_batch("/skip", 7),
-    ])
+    stub = _ScriptStub(
+        [
+            _message_batch("/reviewdraft", 1),
+            _callback_batch("d1", 2),
+            _confirm_batch("d1", 2),
+            _message_batch("the emus did nothing wrong", 3),  # editor_line reply
+            _message_batch("/skip", 4),  # end notes capture
+            _callback_batch("d2", 5),
+            _confirm_batch("d2", 5),
+            _message_batch("and the humans lost", 6),
+            _message_batch("/skip", 7),
+        ]
+    )
     decided = tg.run_review_bot(conn, stub, "chat", max_iterations=60)
 
     # d1's joke was captured before any d2 button could be shown
-    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] == "the emus did nothing wrong"
+    assert (
+        conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"]
+        == "the emus did nothing wrong"
+    )
     # find button messages per draft
     d1_btn = next(i for i, m in enumerate(stub.sent) if "reply_markup" in m and "approve:d1" in str(m))
     d2_btn = next(i for i, m in enumerate(stub.sent) if "reply_markup" in m and "approve:d2" in str(m))
@@ -612,7 +641,9 @@ def test_review_session_waits_for_joke_before_next_draft(tmp_path):
     assert d1_btn < d2_btn, "d2 button raced ahead of d1"
     # both drafts fully decided, in order, with their jokes captured
     assert decided == 2
-    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d2'").fetchone()["editor_line"] == "and the humans lost"
+    assert (
+        conn.execute("SELECT editor_line FROM drafts WHERE id='d2'").fetchone()["editor_line"] == "and the humans lost"
+    )
 
 
 def test_listapproved_lists_greenlit_drafts_with_buttons(tmp_path):
@@ -677,7 +708,9 @@ def test_listapproved_opens_draft_content_with_add_notes_button(tmp_path):
     view_upd = {
         "update_id": 1,
         "callback_query": {
-            "id": "cb1", "data": "view:d1", "message": {"message_id": 100},
+            "id": "cb1",
+            "data": "view:d1",
+            "message": {"message_id": 100},
         },
     }
     res = tg.handle_callback(conn, stub, "chat", view_upd)
@@ -749,9 +782,7 @@ def test_send_long_puts_buttons_on_last_chunk():
 
 
 def _seed_approved_queued(conn, draft_id="d1", with_copy=True):
-    conn.execute(
-        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')"
-    )
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')")
     conn.execute(
         "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
         "VALUES (?, 'pool-x', '{}', '{}', 'approved', '2026-01-01T00:00:00+00:00')",
@@ -759,8 +790,7 @@ def _seed_approved_queued(conn, draft_id="d1", with_copy=True):
     )
     copy = "'France invaded Mexico over a pastry shop.'" if with_copy else "NULL"
     conn.execute(
-        f"INSERT INTO queue (draft_id, scheduled_for, published, post_copy) "
-        f"VALUES ('{draft_id}', NULL, 0, {copy})"
+        f"INSERT INTO queue (draft_id, scheduled_for, published, post_copy) VALUES ('{draft_id}', NULL, 0, {copy})"
     )
     conn.commit()
 
@@ -814,8 +844,8 @@ def test_listqueue_shows_reject_and_reopen_buttons(tmp_path):
     cbs = {b["callback_data"] for row in kb for b in row}
     assert "copy:d1" in cbs
     assert "remove:d1" in cbs
-    assert "reject:d1" in cbs   # new
-    assert "reopen:d1" in cbs   # new
+    assert "reject:d1" in cbs  # new
+    assert "reopen:d1" in cbs  # new
 
 
 def test_reject_button_from_list_unapproves_after_confirm(tmp_path):
@@ -829,9 +859,10 @@ def test_reject_button_from_list_unapproves_after_confirm(tmp_path):
     stub = tg.StubTelegram()
     # 1) tap the Reject button -> confirm gate (no commit yet)
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reject:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reject:d1", "message": {"message_id": 1}}},
     )
     assert res == {"draft_id": "d1", "decision": "reject", "confirming": True}
     # still approved + queued until confirm
@@ -840,9 +871,10 @@ def test_reject_button_from_list_unapproves_after_confirm(tmp_path):
     # 2) confirm -> rejected + dequeued; no joke prompt, no editor_line stored
     messages_before = len(stub.sent)
     res2 = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:reject:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:reject:d1", "message": {"message_id": 1}}},
     )
     assert res2 == {"draft_id": "d1", "decision": "reject"}  # no note_message_id
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "rejected"
@@ -861,15 +893,17 @@ def test_reject_in_review_session_counts_decision_without_joke_prompt(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     _seed_pending(conn, "d2")
-    stub = _SeqStub([
-        _message_batch("/reviewdraft", 1),
-        _reject_batch("d1", 2),
-        _confirm_reject_batch("d1", 2),   # confirm REJECT d1
-        _callback_batch("d2", 3),
-        _confirm_batch("d2", 3),           # confirm APPROVE d2
-        _message_batch("joke for d2", 4),
-        _message_batch("/skip", 5),
-    ])
+    stub = _SeqStub(
+        [
+            _message_batch("/reviewdraft", 1),
+            _reject_batch("d1", 2),
+            _confirm_reject_batch("d1", 2),  # confirm REJECT d1
+            _callback_batch("d2", 3),
+            _confirm_batch("d2", 3),  # confirm APPROVE d2
+            _message_batch("joke for d2", 4),
+            _message_batch("/skip", 5),
+        ]
+    )
     decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
     assert decided == 2  # both decisions counted, including the reject
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "rejected"
@@ -881,21 +915,22 @@ def test_reject_in_review_session_counts_decision_without_joke_prompt(tmp_path):
     assert not any("one-line joke" in m["text"].lower() and "d1" in m["text"] for m in stub.sent)
 
 
-
 def test_reject_button_cancel_keeps_approval(tmp_path):
     """Cancelling the reject confirm gate leaves the draft approved + queued."""
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)  # d1 approved + queued
     stub = tg.StubTelegram()
     tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reject:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reject:d1", "message": {"message_id": 1}}},
     )
     tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 2, "callback_query": {"id": "cb2", "data": "cancel:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "cancel:d1", "message": {"message_id": 1}}},
     )
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
@@ -908,10 +943,11 @@ def test_view_command_re_reads_any_draft_from_phone(tmp_path):
     re-read a pending draft outside a /reviewdraft session."""
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")  # a pending draft, not in queue/listapproved
-    stub = tg.StubTelegram(updates=[
-        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
-                                     "text": "/view d1"}},
-    ])
+    stub = tg.StubTelegram(
+        updates=[
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/view d1"}},
+        ]
+    )
     tg.run_review_bot(conn, stub, "chat", max_iterations=5)
     # the draft body was sent (rendered), incl. the topic + sources
     full = "\n".join(m["text"] for m in stub.sent)
@@ -921,20 +957,22 @@ def test_view_command_re_reads_any_draft_from_phone(tmp_path):
 
 def test_view_command_missing_id_shows_usage(tmp_path):
     conn = _fresh_db(tmp_path)
-    stub = tg.StubTelegram(updates=[
-        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
-                                     "text": "/view"}},
-    ])
+    stub = tg.StubTelegram(
+        updates=[
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/view"}},
+        ]
+    )
     tg.run_review_bot(conn, stub, "chat", max_iterations=5)
     assert any("Usage: /view <draft_id>" in m["text"] for m in stub.sent)
 
 
 def test_view_command_unknown_id_is_safe(tmp_path):
     conn = _fresh_db(tmp_path)
-    stub = tg.StubTelegram(updates=[
-        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
-                                     "text": "/view nope"}},
-    ])
+    stub = tg.StubTelegram(
+        updates=[
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/view nope"}},
+        ]
+    )
     tg.run_review_bot(conn, stub, "chat", max_iterations=5)
     assert any("No such draft" in m["text"] for m in stub.sent)
 
@@ -961,9 +999,10 @@ def test_remove_callback_pulls_draft_from_queue(tmp_path):
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "remove:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "remove:d1", "message": {"message_id": 1}}},
     )
     assert res is None
     # removed from the queue but kept approved
@@ -976,18 +1015,17 @@ def test_remove_callback_when_not_in_queue_is_safe(tmp_path):
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "remove:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "remove:d1", "message": {"message_id": 1}}},
     )
     assert res is None
     assert any("was not in the queue" in m["text"] for m in stub.sent)
 
 
 def _seed_rejected(conn, draft_id="d1"):
-    conn.execute(
-        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')"
-    )
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')")
     conn.execute(
         "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, reviewed_at) "
         "VALUES (?, 'pool-x', '{}', '{}', 'rejected', '2026-01-01T00:00:00+00:00')",
@@ -1019,10 +1057,8 @@ def test_send_rejected_list_empty_when_none(tmp_path):
 
 
 def _seed_deferred(conn, draft_id="d1", days=30):
-    conn.execute(
-        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')"
-    )
-    future = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')")
+    future = (datetime.now(UTC) + timedelta(days=days)).isoformat()
     conn.execute(
         "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at, defer_until) "
         "VALUES (?, 'pool-x', '{}', '{}', 'pending', '2026-01-01T00:00:00+00:00', ?)",
@@ -1060,9 +1096,10 @@ def test_reviewnow_callback_brings_draft_forward(tmp_path):
     _seed_deferred(conn, "d1")
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reviewnow:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reviewnow:d1", "message": {"message_id": 1}}},
     )
     assert res is None
     # defer cleared -> back in the review surface
@@ -1075,9 +1112,10 @@ def test_reviewnow_callback_when_not_deferred_is_safe(tmp_path):
     _seed_pending(conn, "d1")  # not deferred
     stub = tg.StubTelegram()
     tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reviewnow:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reviewnow:d1", "message": {"message_id": 1}}},
     )
     # a clean "Cannot bring forward" message, no crash
     assert any("Cannot bring forward" in m["text"] for m in stub.sent)
@@ -1090,16 +1128,19 @@ def test_setjoke_callback_opens_editor_line_prompt(tmp_path):
     review.apply_review(conn, "d1", decision="approve")  # approved + queued, no joke
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "setjoke:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "setjoke:d1", "message": {"message_id": 1}}},
     )
     assert res["stage"] == "editor_line"
     assert res.get("setjoke") is True
     # reply with the joke -> set via set_editor_line (no status/queue change)
     note_id = res["note_message_id"]
     tg.handle_text(
-        conn, stub, "chat",
+        conn,
+        stub,
+        "chat",
         {"d1": {"note_message_id": note_id, "stage": "editor_line", "decision": "approve", "setjoke": True}},
         _text_update(2, "the bear was a tax dodge", note_id),
     )
@@ -1114,17 +1155,16 @@ def test_reopen_callback_sends_draft_back_to_pending(tmp_path):
     _seed_rejected(conn, "d1")
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reopen:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reopen:d1", "message": {"message_id": 1}}},
     )
     assert res is None
     # status flipped back to pending
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "pending"
     # decision fields cleared
-    row = conn.execute(
-        "SELECT reviewed_at, editor_line, editor_notes FROM drafts WHERE id='d1'"
-    ).fetchone()
+    row = conn.execute("SELECT reviewed_at, editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
     assert row["reviewed_at"] is None and row["editor_line"] is None
     assert any("back to pending" in m["text"] for m in stub.sent)
 
@@ -1134,9 +1174,10 @@ def test_reopen_callback_when_not_rejected_is_safe(tmp_path):
     _seed_pending(conn, "d1")  # already pending -> nothing to reopen
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reopen:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reopen:d1", "message": {"message_id": 1}}},
     )
     assert res is None
     assert any("Cannot reopen" in m["text"] for m in stub.sent)
@@ -1157,10 +1198,11 @@ def test_reopen_draft_removes_from_queue(tmp_path):
 def test_listrejected_command_dispatches(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_rejected(conn, "d1")
-    stub = tg.StubTelegram(updates=[
-        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
-                                     "text": "/listrejected"}},
-    ])
+    stub = tg.StubTelegram(
+        updates=[
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/listrejected"}},
+        ]
+    )
     tg.run_review_bot(conn, stub, "chat", max_iterations=5)
     assert any("Pastry War" in m["text"] for m in stub.sent)
 
@@ -1190,9 +1232,10 @@ def test_regencopy_without_llm_sends_clean_unavailable(tmp_path, monkeypatch):
     _seed_approved_queued(conn)
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1", "message": {"message_id": 1}}},
     )
     assert res is None  # no crash; action skipped gracefully
     assert any("LLM unavailable" in m["text"] for m in stub.sent)
@@ -1216,22 +1259,23 @@ def test_editor_line_approve_without_llm_skips_copy_gracefully(tmp_path, monkeyp
     stub = tg.StubTelegram()
     # initial tap opens the confirm gate (no commit)
     tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "approve:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "approve:d1", "message": {"message_id": 1}}},
     )
     # confirm tap commits
-    res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1",
-                                            "message": {"message_id": 1}}},
+    tg.handle_callback(
+        conn,
+        stub,
+        "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1", "message": {"message_id": 1}}},
     )
     # draft approved + queued despite no LLM for the copy step
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
     # the joke-prompt was sent (so the review flow continues normally)
     assert any("one-line joke" in m["text"] for m in stub.sent)
-
 
 
 def test_enqueue_generates_story_image_and_persists(tmp_path, monkeypatch):
@@ -1244,7 +1288,9 @@ def test_enqueue_generates_story_image_and_persists(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "humorhist.llm.default_client",
-        lambda: StubClient([{"prompt": "a wry period scene of the tax-dodge bear"}, {"post": "The bear was a tax dodge."}]),
+        lambda: StubClient(
+            [{"prompt": "a wry period scene of the tax-dodge bear"}, {"post": "The bear was a tax dodge."}]
+        ),
     )
     img_client = ig.StubImageClient([b"\x89PNG\r\n\x1a\n fake-png-bytes"])
     monkeypatch.setattr("humorhist.imagegen.resilient_image_client", lambda: img_client)
@@ -1256,7 +1302,7 @@ def test_enqueue_generates_story_image_and_persists(tmp_path, monkeypatch):
     # approve first (apply_review auto-enqueues WITHOUT an image dir, so no image
     # is generated yet — it is deferred to the explicit publish/enqueue step)
     tg.handle_callback(conn, tg.StubTelegram(), "chat", _callback_update(1, "cb1", "approve", "d1"))
-    cb_res = tg.handle_callback(conn, tg.StubTelegram(), "chat", _confirm_update(2, "cb2", "approve", "d1"))
+    tg.handle_callback(conn, tg.StubTelegram(), "chat", _confirm_update(2, "cb2", "approve", "d1"))
     assert db.get_image(conn, "d1")["image_path"] is None
 
     # now the publish/enqueue step generates the image via the backfill path
@@ -1277,22 +1323,25 @@ def test_enqueue_sets_learn_more_source_link(tmp_path, monkeypatch):
     from humorhist.llm import StubClient
 
     monkeypatch.setattr("humorhist.llm.default_client", lambda: StubClient([{"post": "x"}]))
+
     # No image client available: enqueue must still set the link, just skip image.
     def _no_img():
         raise ImageUnavailable("no key")
+
     monkeypatch.setattr("humorhist.imagegen.resilient_image_client", _no_img)
 
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     conn.execute("UPDATE drafts SET status='approved' WHERE id='d1'")
-    conn.execute("UPDATE pool SET source_url='https://en.wikipedia.org/wiki/The_Great_Emu_War', source_name='Wikipedia'")
+    conn.execute(
+        "UPDATE pool SET source_url='https://en.wikipedia.org/wiki/The_Great_Emu_War', source_name='Wikipedia'"
+    )
     conn.commit()
     import humorhist.review as review
 
     review.enqueue_approved(conn, image_dir=None)
     link = db.get_source_link(conn, "d1")
     assert link == "https://en.wikipedia.org/wiki/The_Great_Emu_War"
-
 
 
 def test_approve_skips_image_when_no_image_client(tmp_path, monkeypatch):
@@ -1317,7 +1366,11 @@ def test_approve_skips_image_when_no_image_client(tmp_path, monkeypatch):
     awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
 
     tg.handle_text(
-        conn, stub, "chat", awaiting, _text_update(3, "The bear was a tax dodge.", cb_res["note_message_id"]),
+        conn,
+        stub,
+        "chat",
+        awaiting,
+        _text_update(3, "The bear was a tax dodge.", cb_res["note_message_id"]),
         image_dir=str(tmp_path / "images"),
     )
     # no photo sent
@@ -1334,31 +1387,35 @@ def test_callback_copy_opens_copy_content(tmp_path):
     _seed_approved_queued(conn)
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "copy:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "copy:d1", "message": {"message_id": 1}}},
     )
     assert res is None
     assert any("POST COPY" in m["text"] for m in stub.sent)
 
 
 def test_callback_editcopy_prompts_and_handle_text_saves(tmp_path):
-    from humorhist.copywriter import set_post_copy
 
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "editcopy:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "editcopy:d1", "message": {"message_id": 1}}},
     )
     assert res["editcopy_message_id"] is not None
     prompt_id = res["editcopy_message_id"]
     awaiting = {"d1": {"editcopy_message_id": prompt_id}}
 
     out = tg.handle_text(
-        conn, stub, "chat", awaiting,
+        conn,
+        stub,
+        "chat",
+        awaiting,
         _text_update(2, "My hand-edited version.", prompt_id),
     )
     assert out.get("editcopy_saved") == "d1"
@@ -1372,13 +1429,17 @@ def test_callback_editcopy_cancel_keeps_copy(tmp_path):
     _seed_approved_queued(conn)
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "editcopy:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "editcopy:d1", "message": {"message_id": 1}}},
     )
     awaiting = {"d1": {"editcopy_message_id": res["editcopy_message_id"]}}
     out = tg.handle_text(
-        conn, stub, "chat", awaiting,
+        conn,
+        stub,
+        "chat",
+        awaiting,
         _text_update(2, "/cancel", res["editcopy_message_id"]),
     )
     assert out.get("editcopy_cancelled") == "d1"
@@ -1394,8 +1455,10 @@ def test_callback_regencopy_regenerates(tmp_path, monkeypatch):
 
     def fake_fill(conn, client, draft_id=None, limit=None, **kwargs):
         return real_fill(
-            conn, StubClient([{"post": "A regenerated pastry-war quip."}]),
-            draft_id=draft_id, **kwargs,
+            conn,
+            StubClient([{"post": "A regenerated pastry-war quip."}]),
+            draft_id=draft_id,
+            **kwargs,
         )
 
     monkeypatch.setattr("humorhist.copywriter.fill_post_copy", fake_fill)
@@ -1407,9 +1470,10 @@ def test_callback_regencopy_regenerates(tmp_path, monkeypatch):
     _seed_approved_queued(conn)
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1", "message": {"message_id": 1}}},
     )
     assert res is None
     row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
@@ -1435,9 +1499,10 @@ def test_handle_callback_later_defers_draft(tmp_path):
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "later:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "later:d1", "message": {"message_id": 1}}},
     )
     assert res and res.get("deferred") is True
     row = conn.execute("SELECT defer_until, status FROM drafts WHERE id='d1'").fetchone()
@@ -1449,9 +1514,11 @@ def test_handle_callback_later_defers_draft(tmp_path):
 def test_run_review_bot_later_command(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
-    stub = tg.StubTelegram(updates=[
-        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/later d1"}},
-    ])
+    stub = tg.StubTelegram(
+        updates=[
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/later d1"}},
+        ]
+    )
     tg.run_review_bot(conn, stub, "chat", max_iterations=5)
     row = conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()
     assert row["defer_until"] is not None
@@ -1463,12 +1530,18 @@ def test_run_review_bot_later_command(tmp_path):
 
 def test_run_review_bot_suggest_command(tmp_path):
     conn = _fresh_db(tmp_path)
-    stub = tg.StubTelegram(updates=[
-        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"},
-                                      "text": "/suggest The Dancing Plague of 1518"}},
-    ])
+    stub = tg.StubTelegram(
+        updates=[
+            {
+                "update_id": 1,
+                "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/suggest The Dancing Plague of 1518"},
+            },
+        ]
+    )
     tg.run_review_bot(conn, stub, "chat", max_iterations=5)
-    row = conn.execute("SELECT title, status, source_name FROM pool WHERE title='The Dancing Plague of 1518'").fetchone()
+    row = conn.execute(
+        "SELECT title, status, source_name FROM pool WHERE title='The Dancing Plague of 1518'"
+    ).fetchone()
     assert row is not None
     assert row["status"] == "new"
     assert row["source_name"] == "editor-suggestion"
@@ -1480,6 +1553,7 @@ def test_run_review_bot_suggest_command(tmp_path):
 
 def test_notes_on_pending_draft_regenerates_angles(tmp_path, monkeypatch):
     import json
+
     import humorhist.llm as llm
     from humorhist.llm import StubClient
 
@@ -1487,12 +1561,9 @@ def test_notes_on_pending_draft_regenerates_angles(tmp_path, monkeypatch):
     def _angles():
         return {
             "angles": [
-                {"angle_name": "A", "setup": "s", "why_it_lands": "w",
-                 "pitfalls": "p", "raw_material": ["r"]},
-                {"angle_name": "B", "setup": "s", "why_it_lands": "w",
-                 "pitfalls": "p", "raw_material": ["r"]},
-                {"angle_name": "C", "setup": "s", "why_it_lands": "w",
-                 "pitfalls": "p", "raw_material": ["r"]},
+                {"angle_name": "A", "setup": "s", "why_it_lands": "w", "pitfalls": "p", "raw_material": ["r"]},
+                {"angle_name": "B", "setup": "s", "why_it_lands": "w", "pitfalls": "p", "raw_material": ["r"]},
+                {"angle_name": "C", "setup": "s", "why_it_lands": "w", "pitfalls": "p", "raw_material": ["r"]},
             ],
             "strongest_single_detail": "d",
             "suggested_hook": "h",
@@ -1511,16 +1582,21 @@ def test_notes_on_pending_draft_regenerates_angles(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([_angles()]))
     stub = tg.StubTelegram()
     res = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "notes:d1",
-                                            "message": {"message_id": 1}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "notes:d1", "message": {"message_id": 1}}},
     )
     assert res and res.get("regenerate_angles") is True
     note_msg_id = res["note_message_id"]
-    awaiting = {"d1": {"note_message_id": note_msg_id, "stage": "notes",
-                        "decision": "approve", "regenerate_angles": True}}
+    awaiting = {
+        "d1": {"note_message_id": note_msg_id, "stage": "notes", "decision": "approve", "regenerate_angles": True}
+    }
     out = tg.handle_text(
-        conn, stub, "chat", awaiting,
+        conn,
+        stub,
+        "chat",
+        awaiting,
         _text_update(2, "lean into bureaucracy", note_msg_id),
     )
     assert out.get("angles_regenerated") == "d1"
@@ -1535,9 +1611,7 @@ def test_notes_on_pending_draft_regenerates_angles(tmp_path, monkeypatch):
 
 def test_harvest_command_runs_and_reports(tmp_path, monkeypatch):
     conn = _fresh_db(tmp_path)
-    monkeypatch.setattr(
-        "humorhist.harvest.seed.load_seed", lambda c: 3, raising=False
-    )
+    monkeypatch.setattr("humorhist.harvest.seed.load_seed", lambda c: 3, raising=False)
     monkeypatch.setattr(
         "humorhist.harvest.wikipedia_lists.harvest_wikipedia_lists",
         lambda c: 5,
@@ -1563,7 +1637,6 @@ def test_screen_command_skips_without_llm(tmp_path, monkeypatch):
 
 
 def test_draft_command_runs_and_reports(tmp_path, monkeypatch):
-    import json
     import humorhist.llm as llm
     from humorhist.llm import StubClient
 
@@ -1572,9 +1645,7 @@ def test_draft_command_runs_and_reports(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
 
     def fake_draft(conn2, client, count=3, min_score=7.0, **kw):
-        conn2.execute(
-            "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p1','X','drafted')"
-        )
+        conn2.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p1','X','drafted')")
         conn2.execute(
             "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
             "VALUES ('nd1','p1','{}','{}','pending','2026-01-01T00:00:00+00:00')"
@@ -1629,9 +1700,7 @@ def test_proactive_nudge_on_new_pending_draft(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
 
     def fake_draft(conn2, client, count=3, min_score=7.0, **kw):
-        conn2.execute(
-            "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p1','X','drafted')"
-        )
+        conn2.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('p1','X','drafted')")
         conn2.execute(
             "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
             "VALUES ('nd1','p1','{}','{}','pending','2026-01-01T00:00:00+00:00')"
@@ -1696,5 +1765,3 @@ def test_queue_remove_pulls_draft_back(tmp_path, monkeypatch):
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
     # draft stays approved (not deleted)
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
-
-

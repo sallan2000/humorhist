@@ -30,9 +30,7 @@ BRIEF = {
     "key_figures": ["Sir George Pearce"],
     "caveats": ["Kill counts are disputed."],
     "misconceptions": ["No war was formally declared."],
-    "sources": [
-        {"title": "Wikipedia: Emu War", "url": "https://en.wikipedia.org/wiki/Emu_War"}
-    ],
+    "sources": [{"title": "Wikipedia: Emu War", "url": "https://en.wikipedia.org/wiki/Emu_War"}],
 }
 
 ANGLES = {
@@ -59,6 +57,7 @@ ANGLES = {
 
 # --- parser -----------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -80,6 +79,7 @@ def test_build_parser_subcommands(argv):
 
 
 # --- status -----------------------------------------------------------------
+
 
 def test_status_on_empty_db(dbpath, capsys):
     rc = main(["--db", dbpath, "status"])
@@ -119,6 +119,7 @@ def test_status_reports_score_bands(dbpath, capsys):
 
 
 # --- show -------------------------------------------------------------------
+
 
 def test_show_with_no_drafts_returns_1(dbpath, capsys):
     rc = main(["--db", dbpath, "show"])
@@ -196,8 +197,6 @@ def _run_review(dbpath, inputs, monkeypatch, capsys):
     """Drive cmd_review with a sequence of simulated stdin lines."""
     import io
 
-    from humorhist.cli import cmd_review
-
     conn = db.connect(dbpath)
     # cmd_review builds its own connection via _open_db; feed stdin instead.
     monkeypatch.setattr("sys.stdin", io.StringIO("\n".join(inputs) + "\n"))
@@ -225,9 +224,7 @@ def test_review_reject_writes_status(dbpath, monkeypatch, capsys):
     rc, out = _run_review(dbpath, ["r", "", "too dark"], monkeypatch, capsys)
     assert rc == 0
     conn = db.connect(dbpath)
-    row = conn.execute(
-        "SELECT status, editor_line, editor_notes FROM drafts WHERE id='d1'"
-    ).fetchone()
+    row = conn.execute("SELECT status, editor_line, editor_notes FROM drafts WHERE id='d1'").fetchone()
     conn.close()
     assert row["status"] == "rejected"
     assert row["editor_line"] is None

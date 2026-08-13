@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 import humorhist.db as db
 from humorhist.harvest import seed
 

@@ -53,17 +53,13 @@ def good_brief() -> dict:
 
 @respx.mock
 def test_fetch_extract_from_title():
-    respx.get(SUMMARY_URL).mock(
-        return_value=httpx.Response(200, json={"extract": EXTRACT})
-    )
+    respx.get(SUMMARY_URL).mock(return_value=httpx.Response(200, json={"extract": EXTRACT}))
     assert fetch_wikipedia_extract("Emu War") == EXTRACT
 
 
 @respx.mock
 def test_fetch_extract_from_url():
-    route = respx.get(SUMMARY_URL).mock(
-        return_value=httpx.Response(200, json={"extract": EXTRACT})
-    )
+    route = respx.get(SUMMARY_URL).mock(return_value=httpx.Response(200, json={"extract": EXTRACT}))
     assert fetch_wikipedia_extract("https://en.wikipedia.org/wiki/Emu_War") == EXTRACT
     assert route.called
     assert route.calls[0].request.url.path == "/api/rest_v1/page/summary/Emu_War"
@@ -78,9 +74,7 @@ def test_fetch_extract_raises_on_404():
 
 @respx.mock
 def test_fetch_extract_sends_user_agent():
-    route = respx.get(SUMMARY_URL).mock(
-        return_value=httpx.Response(200, json={"extract": EXTRACT})
-    )
+    route = respx.get(SUMMARY_URL).mock(return_value=httpx.Response(200, json={"extract": EXTRACT}))
     fetch_wikipedia_extract("Emu War")
     ua = route.calls[0].request.headers["User-Agent"]
     assert ua == "humorhist/0.1 (personal history project; contact: stevie@local)"

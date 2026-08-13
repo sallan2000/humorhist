@@ -15,8 +15,40 @@ dependencies = [
 dev = [
     "pytest",
     "respx",
+    "ruff",
+    "bandit",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["humorhist*"]
+
+# --- Linting (ruff) ---------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["humorhist.egg-info", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "B008",  # function call in default argument (used by click-style patterns)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "SIM", "E501"]
+
+# --- Security scan (bandit) --------------------------------------------------
+[tool.bandit]
+exclude_dirs = ["tests", "humorhist.egg-info", ".venv"]
+# B608 (hardcoded SQL): all SQL here is either parameterized or built from a
+# fixed, non-user-controlled table-name tuple in db.counts(); not exploitable.
+skips = ["B608"]

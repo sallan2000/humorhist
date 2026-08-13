@@ -17,11 +17,11 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import humorhist.db as db
 from humorhist.brief import generate_angles
-from humorhist.factcheck import fetch_wikipedia_extract, factcheck
+from humorhist.factcheck import factcheck, fetch_wikipedia_extract
 from humorhist.llm import LLMClient
 
 # Candidates are drawn from a window this many times larger than the number
@@ -41,7 +41,7 @@ def select_candidates(
     Selection samples from a larger window of top-scoring candidates so the
     same handful of items are not drafted every time.
     """
-    rng = rng or random.Random()
+    rng = rng or random.Random()  # nosec B311 - selection sampling, not crypto
     window = max(count * SELECTION_WINDOW_MULTIPLIER, count)
     rows = conn.execute(
         """
@@ -95,14 +95,12 @@ def draft_one(
     if db.draft_exists_for_pool(conn, item["id"]):
         return db.make_id("draft", item["id"])
 
-    extract = fetch_wikipedia_extract(
-        item["source_url"] or item["title"], client=http_client
-    )
+    extract = fetch_wikipedia_extract(item["source_url"] or item["title"], client=http_client)
     brief = factcheck(client, item, extract)
     angles = generate_angles(client, item, brief)
 
     draft_id = db.make_id("draft", item["id"])
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     conn.execute(
         """
         INSERT INTO drafts

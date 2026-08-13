@@ -7,7 +7,7 @@ both call apply_review(), so this is where the behaviour lives and is tested.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -57,9 +57,7 @@ def test_pending_drafts_returns_only_pending(tmp_path):
 def test_pending_drafts_ordered_by_created_at(tmp_path):
     conn = _fresh_db(tmp_path)
     _make_draft(conn, "older", "pending")
-    conn.execute(
-        "UPDATE drafts SET created_at = '2026-01-01T00:00:00+00:00' WHERE id='older'"
-    )
+    conn.execute("UPDATE drafts SET created_at = '2026-01-01T00:00:00+00:00' WHERE id='older'")
     conn.execute(
         "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at)"
         " VALUES ('newer', 'pool-x', '{}', '{}', 'pending', '2026-02-01T00:00:00+00:00')"
@@ -234,7 +232,7 @@ def test_pending_drafts_orders_deferred_last(tmp_path):
     _make_draft(conn, "normal", "pending")
     _make_draft(conn, "deferred", "pending")
     # defer one far into the future
-    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
     conn.execute("UPDATE drafts SET defer_until = ? WHERE id='deferred'", (future,))
     conn.commit()
     pend = review.pending_drafts(conn)
@@ -246,7 +244,7 @@ def test_pending_drafts_orders_deferred_last(tmp_path):
 
 
 def _defer(conn, draft_id: str, days: int = 30) -> None:
-    when = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    when = (datetime.now(UTC) + timedelta(days=days)).isoformat()
     conn.execute("UPDATE drafts SET defer_until = ? WHERE id = ?", (when, draft_id))
     conn.commit()
 
@@ -361,4 +359,3 @@ def test_set_editor_line_rejects_unknown(tmp_path):
         pass
     else:
         raise AssertionError("expected ValueError for unknown draft")
-

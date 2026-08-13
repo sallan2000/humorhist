@@ -29,17 +29,13 @@ AUTO_DRAFT_COUNT = 10
 
 def buffer_depth(conn: sqlite3.Connection) -> int:
     """Number of unpublished queued drafts — i.e. days of publishing buffer."""
-    row = conn.execute(
-        "SELECT count(*) AS n FROM queue WHERE published = 0"
-    ).fetchone()
+    row = conn.execute("SELECT count(*) AS n FROM queue WHERE published = 0").fetchone()
     return int(row["n"])
 
 
 def pending_count(conn: sqlite3.Connection) -> int:
     """Number of drafts still awaiting a review decision."""
-    row = conn.execute(
-        "SELECT count(*) AS n FROM drafts WHERE status = 'pending'"
-    ).fetchone()
+    row = conn.execute("SELECT count(*) AS n FROM drafts WHERE status = 'pending'").fetchone()
     return int(row["n"])
 
 
@@ -85,11 +81,8 @@ def health_message(health: dict, will_draft: bool | None = None) -> str:
         f"  • Approved + queued (unpublished): {depth} day(s) of buffer",
         f"  • Pending review: {pending} draft(s)",
     ]
-    if (will_draft if will_draft is not None else health["auto_draft"]):
-        lines.append(
-            f"  • Auto-drafting {AUTO_DRAFT_COUNT} more candidates (pending < "
-            f"{AUTO_DRAFT_PENDING_FLOOR})."
-        )
+    if will_draft if will_draft is not None else health["auto_draft"]:
+        lines.append(f"  • Auto-drafting {AUTO_DRAFT_COUNT} more candidates (pending < {AUTO_DRAFT_PENDING_FLOOR}).")
     return "\n".join(lines)
 
 

@@ -18,6 +18,7 @@ Config (env, never in the repo):
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 import time
@@ -53,7 +54,7 @@ def _resolve_image_dir(image_dir: str | None) -> str | None:
         return None
 
 
-def _get_llm(chat_id: str, client: "TelegramTransport", *, silent: bool = False):
+def _get_llm(chat_id: str, client: TelegramTransport, *, silent: bool = False):
     """Return a resilient LLM client, or ``None`` if none is available.
 
     On unavailability it DMs a clean "LLM unavailable" message (unless
@@ -77,7 +78,7 @@ def _get_llm(chat_id: str, client: "TelegramTransport", *, silent: bool = False)
         return None
 
 
-def _get_image_client(chat_id: str, client: "TelegramTransport", *, silent: bool = False):
+def _get_image_client(chat_id: str, client: TelegramTransport, *, silent: bool = False):
     """Return a resilient image client, or ``None`` if none is available.
 
     Mirrors ``_get_llm``: missing ``HUMORHIST_IMAGE_API_KEY`` yields ``None``
@@ -108,13 +109,9 @@ class TelegramTransport(Protocol):
 
     def get_updates(self, offset: int, timeout: int) -> list[dict]: ...
 
-    def send_message(
-        self, chat_id: str, text: str, reply_markup: dict | None = None
-    ) -> dict: ...
+    def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> dict: ...
 
-    def send_photo(
-        self, chat_id: str, photo: bytes | str, caption: str | None = None
-    ) -> dict: ...
+    def send_photo(self, chat_id: str, photo: bytes | str, caption: str | None = None) -> dict: ...
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict: ...
 
@@ -137,9 +134,7 @@ class StubTelegram:
     def get_updates(self, offset: int = 0, timeout: int = 0) -> list[dict]:
         return self._updates
 
-    def send_message(
-        self, chat_id: str, text: str, reply_markup: dict | None = None
-    ) -> dict:
+    def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> dict:
         self._mid += 1
         msg: dict[str, Any] = {
             "message_id": self._mid,
@@ -155,9 +150,7 @@ class StubTelegram:
         self.answered.add(callback_query_id)
         return {}
 
-    def send_photo(
-        self, chat_id: str, photo: bytes | str, caption: str | None = None
-    ) -> dict:
+    def send_photo(self, chat_id: str, photo: bytes | str, caption: str | None = None) -> dict:
         self._mid += 1
         msg: dict[str, Any] = {
             "message_id": self._mid,
@@ -189,9 +182,7 @@ class TelegramClient:
 
     def _call(self, method: str, params: dict) -> dict:
         if not self.token:
-            raise TelegramError(
-                "no bot token: set HUMORHIST_TELEGRAM_BOT_TOKEN or pass token="
-            )
+            raise TelegramError("no bot token: set HUMORHIST_TELEGRAM_BOT_TOKEN or pass token=")
         url = f"{API_BASE}/bot{self.token}/{method}"
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -206,7 +197,7 @@ class TelegramClient:
             except Exception as exc:  # noqa: BLE001 - retry transient failures
                 last = exc
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
         raise TelegramError(f"Telegram call {method} failed: {last}")
 
     def get_updates(self, offset: int = 0, timeout: int = 0) -> list[dict]:
@@ -219,17 +210,13 @@ class TelegramClient:
             },
         )
 
-    def send_message(
-        self, chat_id: str, text: str, reply_markup: dict | None = None
-    ) -> dict:
+    def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> dict:
         params: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         return self._call("sendMessage", params)
 
-    def send_photo(
-        self, chat_id: str, photo: bytes | str, caption: str | None = None
-    ) -> dict:
+    def send_photo(self, chat_id: str, photo: bytes | str, caption: str | None = None) -> dict:
         params: dict[str, Any] = {"chat_id": chat_id}
         # ``photo`` may be raw bytes (we send multipart) or a file_id / URL
         # (we send as a string param). Telegram's sendPhoto takes either.
@@ -239,9 +226,7 @@ class TelegramClient:
                 params["caption"] = caption
             # _call only does JSON; do a small multipart POST here.
             if not self.token:
-                raise TelegramError(
-                    "no bot token: set HUMORHIST_TELEGRAM_BOT_TOKEN or pass token="
-                )
+                raise TelegramError("no bot token: set HUMORHIST_TELEGRAM_BOT_TOKEN or pass token=")
             url = f"{API_BASE}/bot{self.token}/sendPhoto"
             last: Exception | None = None
             for attempt in range(self.max_retries + 1):
@@ -256,7 +241,7 @@ class TelegramClient:
                 except Exception as exc:  # noqa: BLE001
                     last = exc
                     if attempt < self.max_retries:
-                        time.sleep(2 ** attempt)
+                        time.sleep(2**attempt)
             raise TelegramError(f"Telegram sendPhoto failed: {last}")
         params["photo"] = photo
         if caption is not None:
@@ -264,9 +249,7 @@ class TelegramClient:
         return self._call("sendPhoto", params)
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict:
-        return self._call(
-            "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text}
-        )
+        return self._call("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
 
 def _keyboard(draft_id: str) -> dict:
@@ -322,9 +305,7 @@ def _chunk_text(text: str, limit: int = 4000) -> list[str]:
     return chunks
 
 
-def _send_long(
-    client: TelegramTransport, chat_id: str, text: str, reply_markup: dict | None = None
-) -> list[dict]:
+def _send_long(client: TelegramTransport, chat_id: str, text: str, reply_markup: dict | None = None) -> list[dict]:
     """Send `text` as one or more messages; attach `reply_markup` to the last."""
     chunks = _chunk_text(text)
     sent: list[dict] = []
@@ -343,9 +324,7 @@ def _pending_ids(conn: sqlite3.Connection) -> set[str]:
     return {d["id"] for d in review.pending_drafts(conn)}
 
 
-def _send_one(
-    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, row: dict
-) -> list[dict]:
+def _send_one(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, row: dict) -> list[dict]:
     """Send a single draft (chunked) with Approve/Reject buttons on the last chunk."""
     pool = db.get_pool_item(conn, row["pool_id"])
     text = render.render_draft(row, pool)
@@ -356,9 +335,7 @@ def _send_one(
         return []
 
 
-def send_pending_drafts(
-    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str
-) -> list[dict]:
+def send_pending_drafts(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str) -> list[dict]:
     """Send every pending draft (one message series each) with Approve/Reject buttons.
 
     Used by the ``--once`` dump mode. The default review loop sends drafts
@@ -370,9 +347,7 @@ def send_pending_drafts(
     return sent
 
 
-def handle_callback(
-    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, update: dict
-) -> dict | None:
+def handle_callback(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, update: dict) -> dict | None:
     """Process an inline-button tap.
 
     - ``approve:<id>`` / ``reject:<id>``: record the decision, then prompt for
@@ -505,13 +480,10 @@ def handle_callback(
         if removed:
             client.send_message(
                 chat_id,
-                f"↩️ `#{draft_id}` removed from the queue (kept approved). "
-                f"List it again with /listqueue.",
+                f"↩️ `#{draft_id}` removed from the queue (kept approved). List it again with /listqueue.",
             )
         else:
-            client.send_message(
-                chat_id, f"⚠️ `#{draft_id}` was not in the queue."
-            )
+            client.send_message(chat_id, f"⚠️ `#{draft_id}` was not in the queue.")
         return None
     if data.startswith("reopen:"):
         _, _, draft_id = data.partition(":")
@@ -523,8 +495,7 @@ def handle_callback(
             return None
         client.send_message(
             chat_id,
-            f"↩️ `#{draft_id}` sent back to pending for re-review. "
-            f"List it with /reviewdraft.",
+            f"↩️ `#{draft_id}` sent back to pending for re-review. List it with /reviewdraft.",
         )
         return None
     if data.startswith("reviewnow:"):
@@ -565,8 +536,7 @@ def handle_callback(
         client.answer_callback_query(cq["id"], text="editing copy")
         prompt = client.send_message(
             chat_id,
-            f"Reply with the new post copy for `{draft_id}` "
-            f"(or send /cancel to keep the current version):",
+            f"Reply with the new post copy for `{draft_id}` (or send /cancel to keep the current version):",
         )
         return {"draft_id": draft_id, "editcopy_message_id": prompt["message_id"]}
     if data.startswith("regencopy:"):
@@ -687,8 +657,7 @@ def handle_text(
         # secondary optional notes step
         note = client.send_message(
             chat_id,
-            f"Got it. Optionally reply with longer notes for `{draft_id}` "
-            f"(or /skip to finish):",
+            f"Got it. Optionally reply with longer notes for `{draft_id}` (or /skip to finish):",
         )
         awaiting[draft_id] = {
             "note_message_id": note["message_id"],
@@ -718,8 +687,7 @@ def handle_text(
         awaiting.pop(draft_id, None)
         client.send_message(
             chat_id,
-            f"🔄 Angles regenerated for `{draft_id}` using your note as steering. "
-            f"Review them with /reviewdraft.",
+            f"🔄 Angles regenerated for `{draft_id}` using your note as steering. Review them with /reviewdraft.",
         )
         return {"angles_regenerated": draft_id}
     # merge=True keeps the editor_line we just captured; only notes change.
@@ -789,9 +757,7 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
                 {"text": f"❌ Reject {did}", "callback_data": f"reject:{did}"},
             ]
         )
-    client.send_message(
-        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
-    )
+    client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
 
@@ -811,12 +777,8 @@ def send_rejected_list(conn: sqlite3.Connection, client: TelegramTransport, chat
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
         lines.append(f"  • #{did} {title}")
-        keyboard.append(
-            [{"text": f"↩️ Reopen #{did}", "callback_data": f"reopen:{did}"}]
-        )
-    client.send_message(
-        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
-    )
+        keyboard.append([{"text": f"↩️ Reopen #{did}", "callback_data": f"reopen:{did}"}])
+    client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
 
@@ -837,18 +799,12 @@ def send_deferred_list(conn: sqlite3.Connection, client: TelegramTransport, chat
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
         lines.append(f"  • #{did} {title}")
-        keyboard.append(
-            [{"text": f"⏩ Review now #{did}", "callback_data": f"reviewnow:{did}"}]
-        )
-    client.send_message(
-        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
-    )
+        keyboard.append([{"text": f"⏩ Review now #{did}", "callback_data": f"reviewnow:{did}"}])
+    client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
 
-def send_draft_content(
-    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str
-) -> list[dict]:
+def send_draft_content(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str) -> list[dict]:
     """Send a single draft's full content (chunked), with an 'Add notes' button.
 
     Used when the reviewer opens an approved draft from /listapproved. The last
@@ -866,21 +822,13 @@ def send_draft_content(
     pool = db.get_pool_item(conn, row["pool_id"])
     text = render.render_draft(row, pool)
 
-    q = conn.execute(
-        "SELECT post_copy FROM queue WHERE draft_id = ?", (draft_id,)
-    ).fetchone()
+    q = conn.execute("SELECT post_copy FROM queue WHERE draft_id = ?", (draft_id,)).fetchone()
     limit = char_limit()
     copy = (dict(q) if q else {}).get("post_copy") if q else None
     if copy:
-        copy_block = (
-            f"\n\n📝 POST COPY ({len(copy)}/{limit} chars):\n{copy}\n"
-            "(tap 📝 Copy to edit or regenerate)"
-        )
+        copy_block = f"\n\n📝 POST COPY ({len(copy)}/{limit} chars):\n{copy}\n(tap 📝 Copy to edit or regenerate)"
     else:
-        copy_block = (
-            f"\n\n📝 POST COPY: (none yet — 0/{limit} chars)\n"
-            "(tap 📝 Copy to generate / edit)"
-        )
+        copy_block = f"\n\n📝 POST COPY: (none yet — 0/{limit} chars)\n(tap 📝 Copy to generate / edit)"
     text = text + copy_block
 
     # 'Learn more' link: a shortened reader-facing pointer to the source article.
@@ -914,7 +862,8 @@ def send_draft_content(
             if Path(img_path).is_file():
                 with open(img_path, "rb") as fh:
                     client.send_photo(
-                        chat_id, fh.read(),
+                        chat_id,
+                        fh.read(),
                         caption=f"🖼️ Story image for `{draft_id}`"
                         + (f" — prompt: {info['image_prompt']}" if info.get("image_prompt") else ""),
                     )
@@ -974,15 +923,11 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
                 {"text": f"↩️ Reopen {did}", "callback_data": f"reopen:{did}"},
             ]
         )
-    client.send_message(
-        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
-    )
+    client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
 
-def send_copy_content(
-    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str
-) -> list[dict]:
+def send_copy_content(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str) -> list[dict]:
     """Send a queued draft's post copy with inline Edit + Regenerate buttons.
 
     Tapping 'Edit' (callback ``editcopy:<id>``) prompts the reviewer to reply
@@ -997,9 +942,7 @@ def send_copy_content(
     if row is None:
         client.send_message(chat_id, f"No such draft: {draft_id}")
         return []
-    q = conn.execute(
-        "SELECT post_copy, post_copy_at FROM queue WHERE draft_id = ?", (draft_id,)
-    ).fetchone()
+    q = conn.execute("SELECT post_copy, post_copy_at FROM queue WHERE draft_id = ?", (draft_id,)).fetchone()
     limit = char_limit()
     copy = (dict(q) if q else {}).get("post_copy") if q else None
 
@@ -1054,9 +997,7 @@ def telegram_harvest(conn, client, chat_id, *, seed: bool = True, wikipedia: boo
     )
 
 
-def telegram_screen(
-    conn, client, chat_id, *, batch_size: int = 20, limit: int | None = None
-) -> None:
+def telegram_screen(conn, client, chat_id, *, batch_size: int = 20, limit: int | None = None) -> None:
     """Inbound /screen: LLM-score unscored pool candidates."""
     from humorhist.harvest.screen import screen_pool
 
@@ -1085,14 +1026,10 @@ def telegram_buffer(conn, client, chat_id, *, enqueue: bool = False, auto_draft:
         client.send_message(chat_id, f"📥 Enqueued {n} approved draft(s) into the queue.")
 
     llm = _get_llm(chat_id, client) if auto_draft else None
-    result = buf.run_buffer_check(
-        conn, client=llm, auto_draft=bool(llm), chat_id=None, telegram=None
-    )
+    result = buf.run_buffer_check(conn, client=llm, auto_draft=bool(llm), chat_id=None, telegram=None)
     client.send_message(chat_id, buf.health_message(result, will_draft=bool(llm)))
     if result.get("drafted"):
-        client.send_message(
-            chat_id, f"✍️ Auto-drafted {result['drafted']} candidate(s). Send /reviewdraft."
-        )
+        client.send_message(chat_id, f"✍️ Auto-drafted {result['drafted']} candidate(s). Send /reviewdraft.")
     if result.get("draft_error"):
         client.send_message(chat_id, f"⚠️ Auto-draft error: {result['draft_error']}")
 
@@ -1121,9 +1058,7 @@ def telegram_queue(conn, client, chat_id, *, action: str = "list", draft_id: str
         send_queue_list(conn, client, chat_id)
 
 
-def telegram_draft(
-    conn, client, chat_id, *, count: int = 3, min_score: float = 7.0
-) -> None:
+def telegram_draft(conn, client, chat_id, *, count: int = 3, min_score: float = 7.0) -> None:
     """Inbound /draft: fact-check + generate angles for top pool candidates.
 
     This is the upstream hole for a Telegram-only editor: it's the only way to
@@ -1134,9 +1069,7 @@ def telegram_draft(
     llm = _get_llm(chat_id, client)
     if llm is None:
         return
-    client.send_message(
-        chat_id, f"✍️ Drafting {count} candidate(s) (min score {min_score})…"
-    )
+    client.send_message(chat_id, f"✍️ Drafting {count} candidate(s) (min score {min_score})…")
     try:
         result = draft_candidates(conn, llm, count=count, min_score=min_score)
     except Exception as exc:  # noqa: BLE001
@@ -1146,8 +1079,7 @@ def telegram_draft(
     drafted = result.get("drafted", 0)
     client.send_message(
         chat_id,
-        f"✍️ Drafted {drafted} new draft(s). {pending} pending total — "
-        f"send /reviewdraft to review them.",
+        f"✍️ Drafted {drafted} new draft(s). {pending} pending total — send /reviewdraft to review them.",
     )
 
 
@@ -1199,9 +1131,7 @@ def run_review_session(
                     return res["draft_id"]
                 return res["draft_id"]
             elif res and "editcopy_message_id" in res:
-                awaiting[res["draft_id"]] = {
-                    "editcopy_message_id": res["editcopy_message_id"]
-                }
+                awaiting[res["draft_id"]] = {"editcopy_message_id": res["editcopy_message_id"]}
         elif "message" in upd:
             handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
         return None
@@ -1315,9 +1245,7 @@ def run_review_bot(
                 awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
             elif res and "editcopy_message_id" in res:
                 # post-copy edit prompt: register so the next reply is captured
-                awaiting[res["draft_id"]] = {
-                    "editcopy_message_id": res["editcopy_message_id"]
-                }
+                awaiting[res["draft_id"]] = {"editcopy_message_id": res["editcopy_message_id"]}
             return
         msg = upd.get("message")
         if not msg:
@@ -1333,8 +1261,13 @@ def run_review_bot(
         cmd = text.split()[0].lower()
         if cmd == "/reviewdraft":
             decided += run_review_session(
-                conn, client, chat_id, awaiting, offset_ref,
-                poll_timeout=poll_timeout, max_iterations=max_iterations,
+                conn,
+                client,
+                chat_id,
+                awaiting,
+                offset_ref,
+                poll_timeout=poll_timeout,
+                max_iterations=max_iterations,
             )
         elif cmd == "/listapproved":
             send_approved_list(conn, client, chat_id)
@@ -1392,8 +1325,7 @@ def run_review_bot(
                 else:
                     client.send_message(
                         chat_id,
-                        f"⏩ `#{did}` brought forward — it's back in the review "
-                        f"queue. Send /reviewdraft to see it.",
+                        f"⏩ `#{did}` brought forward — it's back in the review queue. Send /reviewdraft to see it.",
                     )
         elif cmd == "/setjoke":
             rest = text.split(maxsplit=1)
@@ -1440,10 +1372,8 @@ def run_review_bot(
             if len(bits) >= 1 and bits[0].isdigit():
                 count = int(bits[0])
             if len(bits) >= 2:
-                try:
+                with contextlib.suppress(ValueError):
                     min_score = float(bits[1])
-                except ValueError:
-                    pass
             telegram_draft(conn, client, chat_id, count=count, min_score=min_score)
         elif cmd == "/buffer":
             # optional /buffer enqueue
@@ -1502,7 +1432,6 @@ def run_review_bot(
             time.sleep(5)
 
 
-
 def notify_new_drafts(conn: db.Connection, client: TelegramTransport, chat_id: str) -> int:
     """DM the reviewer how many drafts are awaiting review. Returns that count.
 
@@ -1513,7 +1442,7 @@ def notify_new_drafts(conn: db.Connection, client: TelegramTransport, chat_id: s
         return 0
     client.send_message(
         chat_id,
-        f"\U0001F4DD {n} draft(s) awaiting review. Run `review` or check Telegram to decide.",
+        f"\U0001f4dd {n} draft(s) awaiting review. Run `review` or check Telegram to decide.",
     )
     return n
 
@@ -1534,21 +1463,19 @@ def format_reviewed_summary(summary: dict) -> str:
         lines.append(f"\n✅ Approved ({approved['count']}):")
         lines.extend(f"  • {t}" for t in approved["titles"])
     else:
-        lines.append(f"\n✅ Approved: 0")
+        lines.append("\n✅ Approved: 0")
 
     if rejected["titles"]:
         lines.append(f"\n❌ Rejected ({rejected['count']}):")
         lines.extend(f"  • {t}" for t in rejected["titles"])
     else:
-        lines.append(f"\n❌ Rejected: 0")
+        lines.append("\n❌ Rejected: 0")
 
     lines.append(f"\n⏳ Pending: {pending['count']}")
     return "\n".join(lines)
 
 
-def send_reviewed_summary(
-    conn: db.Connection, client: TelegramTransport, chat_id: str
-) -> str:
+def send_reviewed_summary(conn: db.Connection, client: TelegramTransport, chat_id: str) -> str:
     """DM the reviewer the approved/rejected/pending breakdown. Returns the text.
 
     Also nudges on GAP 4b "stuck captures" — approved+queued drafts whose

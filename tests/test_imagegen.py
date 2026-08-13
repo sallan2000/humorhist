@@ -7,10 +7,12 @@ disk, and the prompt + path come back, plus the resilience/error paths.
 
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
 
+import pytest
+
 import humorhist.db as db
+import humorhist.imagegen as ig
 from humorhist.imagegen import (
     ImageError,
     ImageUnavailable,
@@ -22,8 +24,6 @@ from humorhist.imagegen import (
 )
 from humorhist.llm import StubClient
 
-import humorhist.imagegen as ig
-
 
 def _fresh_db(tmp_path):
     conn = db.connect(str(tmp_path / "test.sqlite"))
@@ -32,9 +32,7 @@ def _fresh_db(tmp_path):
 
 
 def _seed(conn, draft_id="d1"):
-    conn.execute(
-        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'The Tax-Dodge Bear', 'drafted')"
-    )
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'The Tax-Dodge Bear', 'drafted')")
     conn.execute(
         """INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at)
            VALUES (?, 'pool-x',
@@ -85,8 +83,12 @@ def test_generate_image_writes_file_and_returns_prompt_path(tmp_path, monkeypatc
     img_client = StubImageClient([b"\x89PNG fake"])
     out_dir = tmp_path / "images"
     path, prompt = generate_image(
-        llm, img_client, _draft_row(conn), _pool_row(conn),
-        out_dir=out_dir, draft_id="d1",
+        llm,
+        img_client,
+        _draft_row(conn),
+        _pool_row(conn),
+        out_dir=out_dir,
+        draft_id="d1",
     )
     assert path.endswith("d1.png")
     assert prompt == "bold meme of a bear doing taxes"
@@ -127,18 +129,17 @@ def test_generate_image_for_queue_persists_and_returns(tmp_path, monkeypatch):
     _seed(conn)
 
     # No image client -> returns None, nothing persisted, no crash.
-    monkeypatch.setattr("humorhist.imagegen.resilient_image_client",
-                        lambda: (_ for _ in ()).throw(ImageUnavailable("no key")))
+    monkeypatch.setattr(
+        "humorhist.imagegen.resilient_image_client", lambda: (_ for _ in ()).throw(ImageUnavailable("no key"))
+    )
     assert ig.generate_image_for_queue(conn, "d1", out_dir=tmp_path / "images") is None
     none_info = db.get_image(conn, "d1")
     assert none_info is not None
     assert none_info["image_path"] is None
 
     # With a client -> generates + persists + returns.
-    monkeypatch.setattr("humorhist.llm.default_client",
-                        lambda: StubClient([{"prompt": "a wry period scene"}]))
-    monkeypatch.setattr("humorhist.imagegen.resilient_image_client",
-                        lambda: StubImageClient([b"\x89PNG generated"]))
+    monkeypatch.setattr("humorhist.llm.default_client", lambda: StubClient([{"prompt": "a wry period scene"}]))
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client", lambda: StubImageClient([b"\x89PNG generated"]))
     out_dir = tmp_path / "images"
     res = ig.generate_image_for_queue(conn, "d1", out_dir=out_dir)
     assert res is not None

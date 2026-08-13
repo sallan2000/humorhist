@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
-import respx
 
 import humorhist.db as db
 from humorhist.harvest import wikipedia_lists
@@ -240,23 +239,17 @@ def test_harvest_inserts_into_pool(respx_mock):
         assert summary["pages_failed"] == 0
         assert db.counts(conn)["pool"] == 8
         # rows carry the correct source_name
-        rows = conn.execute(
-            "SELECT source_name FROM pool WHERE source_name='wikipedia:Page1'"
-        ).fetchall()
+        rows = conn.execute("SELECT source_name FROM pool WHERE source_name='wikipedia:Page1'").fetchall()
         assert len(rows) == 4
 
 
 def test_harvest_continues_on_page_failure(respx_mock):
-    respx_mock.get(API_URL).mock(
-        side_effect=_page_router({"BadPage": _ERROR_MARKER, "GoodPage": PAGE_ONE})
-    )
+    respx_mock.get(API_URL).mock(side_effect=_page_router({"BadPage": _ERROR_MARKER, "GoodPage": PAGE_ONE}))
     import tempfile
 
     with tempfile.TemporaryDirectory() as d:
         conn = _fresh_db(Path(d))
-        summary = harvest_wikipedia_lists(
-            conn, pages=["BadPage", "GoodPage"], sleep_seconds=0
-        )
+        summary = harvest_wikipedia_lists(conn, pages=["BadPage", "GoodPage"], sleep_seconds=0)
         # the failed page is counted as a failure, not as fetched
         assert summary["pages_failed"] == 1
         assert summary["pages_fetched"] == 1
@@ -293,26 +286,17 @@ def test_default_pages_is_sane():
 # Redirect following
 # --------------------------------------------------------------------------- #
 
-REAL_WIKITEXT = (
-    "* [[Emu War]] (1932) fought in [[Australia]]; soldiers lost to birds "
-    "in a ridiculous campaign.\n"
-)
+REAL_WIKITEXT = "* [[Emu War]] (1932) fought in [[Australia]]; soldiers lost to birds in a ridiculous campaign.\n"
 
 
 def test_follows_redirect(respx_mock):
-    respx_mock.get(API_URL).mock(
-        side_effect=_page_router(
-            {"PageA": "#REDIRECT [[Page B]]\n", "Page B": REAL_WIKITEXT}
-        )
-    )
+    respx_mock.get(API_URL).mock(side_effect=_page_router({"PageA": "#REDIRECT [[Page B]]\n", "Page B": REAL_WIKITEXT}))
     assert fetch_page_wikitext("PageA") == REAL_WIKITEXT
 
 
 def test_redirect_loop_raises(respx_mock):
     respx_mock.get(API_URL).mock(
-        side_effect=_page_router(
-            {"PageA": "#REDIRECT [[PageB]]\n", "PageB": "#REDIRECT [[PageA]]\n"}
-        )
+        side_effect=_page_router({"PageA": "#REDIRECT [[PageB]]\n", "PageB": "#REDIRECT [[PageA]]\n"})
     )
     try:
         fetch_page_wikitext("PageA")
@@ -347,19 +331,13 @@ def test_section_year_fallback():
 
 
 def test_inline_year_beats_section_year():
-    wt = (
-        "== 1991 ==\n"
-        "* In 1975 someone did a thing that was documented at considerable length here.\n"
-    )
+    wt = "== 1991 ==\n* In 1975 someone did a thing that was documented at considerable length here.\n"
     items = parse_list_items(wt, "List_of_foo")
     assert items[0]["year"] == 1975
 
 
 def test_non_year_heading_ignored():
-    wt = (
-        "== Physics ==\n"
-        "* Someone did a thing with no year at all but plenty of words to keep it.\n"
-    )
+    wt = "== Physics ==\n* Someone did a thing with no year at all but plenty of words to keep it.\n"
     items = parse_list_items(wt, "List_of_foo")
     assert len(items) == 1
     assert items[0]["year"] is None
@@ -384,10 +362,7 @@ def test_title_strips_nested_templates():
 
 
 def test_title_strips_html_comments():
-    line = (
-        "* Something with <!-- a comment --> inside it that is definitely "
-        "long enough to keep"
-    )
+    line = "* Something with <!-- a comment --> inside it that is definitely long enough to keep"
     items = parse_list_items(line, "P")
     assert len(items) == 1
     title = items[0]["title"]
@@ -397,10 +372,7 @@ def test_title_strips_html_comments():
 
 
 def test_nested_template_removal():
-    line = (
-        "* {{outer|{{inner}}|x}}The Great Fire of Nowhere burned down a very "
-        "large and quite unusual building."
-    )
+    line = "* {{outer|{{inner}}|x}}The Great Fire of Nowhere burned down a very large and quite unusual building."
     items = parse_list_items(line, "P")
     assert len(items) == 1
     for field in ("title", "summary"):
@@ -411,13 +383,13 @@ def test_nested_template_removal():
 
 def test_no_markup_residue_in_any_field():
     line = (
-        "* [[Link|Display]] \'\'\'bold\'\'\' \'\'italic\'\' <ref>x</ref> "
-        "<ref name=\"y\"/> {{tmpl|a|b}} <!-- c --> and a good deal of extra "
+        "* [[Link|Display]] '''bold''' ''italic'' <ref>x</ref> "
+        '<ref name="y"/> {{tmpl|a|b}} <!-- c --> and a good deal of extra '
         "text so the entry is long enough to survive filtering."
     )
     items = parse_list_items(line, "P")
     assert len(items) == 1
     for field in ("title", "summary"):
         val = items[0][field]
-        for bad in ("{{", "}}", "<ref", "<!--", "\'\'\'"):
+        for bad in ("{{", "}}", "<ref", "<!--", "'''"):
             assert bad not in val, (field, bad, val)

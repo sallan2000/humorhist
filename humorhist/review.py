@@ -9,7 +9,7 @@ be unit-tested without a network or a tty.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import humorhist.db as db
 
@@ -32,7 +32,7 @@ def pending_drafts(conn: sqlite3.Connection) -> list[dict]:
     window opens. Drafts whose defer window has already passed sort as normal
     pending (the /later window expired).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     return [
         dict(r)
         for r in conn.execute(
@@ -105,20 +105,16 @@ def apply_review(
     """
     decision = (decision or "").strip().lower()
     if decision not in _VALID_DECISIONS:
-        raise ValueError(
-            f"decision must be one of {sorted(_VALID_DECISIONS)}, got {decision!r}"
-        )
+        raise ValueError(f"decision must be one of {sorted(_VALID_DECISIONS)}, got {decision!r}")
 
     row = conn.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,)).fetchone()
     if row is None:
         raise ValueError(f"no draft with id {draft_id!r}")
     if row["status"] not in _REVIEWABLE_STATUSES:
-        raise ValueError(
-            f"draft {draft_id!r} has status {row['status']!r}; not reviewable"
-        )
+        raise ValueError(f"draft {draft_id!r} has status {row['status']!r}; not reviewable")
 
     new_status = "approved" if decision == APPROVE else "rejected"
-    reviewed_at = datetime.now(timezone.utc).isoformat()
+    reviewed_at = datetime.now(UTC).isoformat()
 
     # Resolve the field values to write. A plain apply (merge=False) overwrites
     # both fields with whatever was passed (None => cleared). A merge applies
@@ -194,13 +190,8 @@ def enqueue_approved(
     credential or generation failure is logged and skipped, never blocking the
     enqueue.
     """
-    approved = conn.execute(
-        "SELECT id FROM drafts WHERE status = 'approved'"
-    ).fetchall()
-    already = {
-        r["draft_id"]
-        for r in conn.execute("SELECT draft_id FROM queue")
-    }
+    approved = conn.execute("SELECT id FROM drafts WHERE status = 'approved'").fetchall()
+    already = {r["draft_id"] for r in conn.execute("SELECT draft_id FROM queue")}
     inserted = 0
     for r in approved:
         draft_id = r["id"]
@@ -222,16 +213,12 @@ def enqueue_approved(
     # or an image/link was skipped). This keeps the publish step idempotent and
     # makes it the single place images are generated.
     if image_dir:
-        for r in conn.execute(
-            "SELECT draft_id FROM queue WHERE image_path IS NULL"
-        ).fetchall():
+        for r in conn.execute("SELECT draft_id FROM queue WHERE image_path IS NULL").fetchall():
             _populate_publish_artifacts(conn, r["draft_id"], image_dir=image_dir)
     return inserted
 
 
-def _populate_publish_artifacts(
-    conn: sqlite3.Connection, draft_id: str, *, image_dir: str | None = None
-) -> None:
+def _populate_publish_artifacts(conn: sqlite3.Connection, draft_id: str, *, image_dir: str | None = None) -> None:
     """Best-effort: persist a 'learn more' source link (always, if a source
     exists) and a story image (only if ``image_dir`` is given and image is
     available).
@@ -285,7 +272,7 @@ def deferred_drafts(conn: sqlite3.Connection) -> list[dict]:
     the missing "review now" shortcut for a ``/later`` defer (GAP 4). Ordered
     by how soon each defer window opens (soonest first).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     return [
         dict(r)
         for r in conn.execute(
@@ -308,27 +295,18 @@ def bring_forward(conn: sqlite3.Connection, draft_id: str | None = None) -> int:
 
     When ``draft_id`` is given, clears just that draft (raising ValueError if
     it's unknown or not deferred). When ``None``, clears every currently
-    deferred draft. Returns the number of drafts brought forward.
+    deferred draft in a single UPDATE. Returns the number of drafts brought
+    forward.
     """
     if draft_id is not None:
-        row = conn.execute(
-            "SELECT status, defer_until FROM drafts WHERE id = ?", (draft_id,)
-        ).fetchone()
+        row = conn.execute("SELECT status, defer_until FROM drafts WHERE id = ?", (draft_id,)).fetchone()
         if row is None:
             raise ValueError(f"no draft with id {draft_id!r}")
         if not row["defer_until"]:
             raise ValueError(f"draft {draft_id!r} is not deferred")
         db.clear_defer(conn, draft_id)
         return 1
-    cleared = 0
-    now = datetime.now(timezone.utc).isoformat()
-    for r in conn.execute(
-        "SELECT id FROM drafts WHERE status='pending' AND defer_until IS NOT NULL AND defer_until > ?",
-        (now,),
-    ).fetchall():
-        db.clear_defer(conn, r["id"])
-        cleared += 1
-    return cleared
+    return db.clear_deferred(conn)
 
 
 def approved_drafts(conn: sqlite3.Connection) -> list[dict]:

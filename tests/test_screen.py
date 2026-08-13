@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 import humorhist.db as db
 from humorhist.harvest import screen
 from humorhist.llm import LLMError, StubClient
@@ -49,10 +47,7 @@ def _insert_rows(conn, n: int, *, scored: list[int] | None = None) -> list[str]:
 
 def _batch_response(n_items: int, score: float = 5.0) -> list[dict]:
     """A well-formed LLM response array for ``n_items`` numbered items."""
-    return [
-        {"n": i + 1, "score": score, "reason": "ok"}
-        for i in range(n_items)
-    ]
+    return [{"n": i + 1, "score": score, "reason": "ok"} for i in range(n_items)]
 
 
 # --- build_batch_prompt -----------------------------------------------------
@@ -189,9 +184,7 @@ def test_screen_pool_only_scores_null(tmp_path):
 def test_screen_pool_batches(tmp_path):
     conn = _fresh_db(tmp_path)
     _insert_rows(conn, 25)
-    stub = StubClient(
-        [_batch_response(10), _batch_response(10), _batch_response(5)]
-    )
+    stub = StubClient([_batch_response(10), _batch_response(10), _batch_response(5)])
     result = screen.screen_pool(conn, stub, batch_size=10)
     assert result["batches"] == 3
     assert len(stub.calls) == 3
@@ -203,17 +196,13 @@ def test_screen_pool_continues_on_batch_failure(tmp_path):
     conn = _fresh_db(tmp_path)
     _insert_rows(conn, 15)
     # batch 1 (10 rows) fails twice (exhausting the retry); batch 2 (5) succeeds
-    stub = StubClient(
-        [LLMError("boom"), LLMError("boom"), _batch_response(5)]
-    )
+    stub = StubClient([LLMError("boom"), LLMError("boom"), _batch_response(5)])
     result = screen.screen_pool(conn, stub, batch_size=10)
     assert result["failed_batches"] == 1
     assert result["scored"] == 5
     assert len(stub.calls) == 3
     # batch 1's 10 rows remain unscored; batch 2's 5 are scored
-    null_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM pool WHERE funny_score IS NULL"
-    ).fetchone()["n"]
+    null_count = conn.execute("SELECT COUNT(*) AS n FROM pool WHERE funny_score IS NULL").fetchone()["n"]
     assert null_count == 10
 
 
@@ -246,8 +235,6 @@ def test_screen_prompt_no_death_taste_penalty():
     ]
     prompt_lower = prompt.lower()
     for term in forbidden:
-        assert term.lower() not in prompt_lower, (
-            f"screen prompt still contains taste-filter wording: {term!r}"
-        )
+        assert term.lower() not in prompt_lower, f"screen prompt still contains taste-filter wording: {term!r}"
     # Sanity: the absurdity-reward guidance is still present.
     assert "reward" in prompt_lower

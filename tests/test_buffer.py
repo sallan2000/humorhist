@@ -9,10 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
-import humorhist.db as db
 import humorhist.buffer as buf
+import humorhist.db as db
 from humorhist.llm import StubClient
 
 
@@ -70,7 +68,7 @@ def test_buffer_health_levels(tmp_path):
 
     # drain to 2 -> escalate
     for i in range(3):
-        conn.execute("DELETE FROM queue WHERE draft_id=?", (f"d{i+2}",))
+        conn.execute("DELETE FROM queue WHERE draft_id=?", (f"d{i + 2}",))
     conn.commit()
     assert buf.buffer_health(conn)["level"] == "escalate"
 
@@ -117,10 +115,7 @@ def test_run_buffer_check_auto_drafts_when_pending_low(tmp_path, monkeypatch):
     # 1 day of buffer + zero pending -> should auto-draft
     _make_draft(conn, "d1", status="approved", queued=True)
     # seed a draftable pool candidate (status 'new', scored)
-    conn.execute(
-        "INSERT OR IGNORE INTO pool (id, title, status, funny_score) "
-        "VALUES ('cand', 'Candidate', 'new', 9.0)"
-    )
+    conn.execute("INSERT OR IGNORE INTO pool (id, title, status, funny_score) VALUES ('cand', 'Candidate', 'new', 9.0)")
     conn.commit()
 
     captured = {}
@@ -137,9 +132,7 @@ def test_run_buffer_check_auto_drafts_when_pending_low(tmp_path, monkeypatch):
 
     monkeypatch.setattr(drafting, "draft_candidates", fake_draft_candidates)
     stub = _StubTelegram()
-    result = buf.run_buffer_check(
-        conn, client=StubClient([{}]), auto_draft=True, chat_id="chat", telegram=stub
-    )
+    result = buf.run_buffer_check(conn, client=StubClient([{}]), auto_draft=True, chat_id="chat", telegram=stub)
     assert result["drafted"] == 1
     assert captured.get("count") == buf.AUTO_DRAFT_COUNT
 

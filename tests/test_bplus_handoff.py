@@ -14,8 +14,6 @@ import io
 import json
 from pathlib import Path
 
-import pytest
-
 import humorhist.db as db
 import humorhist.telegram as tg
 from humorhist.llm import StubClient
@@ -85,8 +83,8 @@ def test_cli_approve_generates_post_copy(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_approve_skips_copy_when_no_client(tmp_path, monkeypatch, capsys):
-    from humorhist.cli import cmd_review
     import humorhist.llm as llm
+    from humorhist.cli import cmd_review
 
     # default_client() with no key raises LLMError; the loop must catch it and
     # still approve + enqueue, just without copy.
@@ -111,8 +109,8 @@ def test_cli_approve_skips_copy_when_no_client(tmp_path, monkeypatch, capsys):
 
 
 def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
-    from humorhist.copywriter import fill_post_copy
     import humorhist.llm as llm
+    from humorhist.copywriter import fill_post_copy
 
     real_fill = fill_post_copy
 
@@ -146,9 +144,10 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
     # Copy is generated once the editor_line reply arrives (so the human joke
     # can steer the copy).
     res2 = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1",
-                                            "message": {"message_id": 10}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1", "message": {"message_id": 10}}},
     )
     assert res2["note_message_id"] is not None
     row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
@@ -159,8 +158,14 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
         stub,
         "chat",
         {"d1": {"note_message_id": note_msg_id, "stage": "editor_line", "decision": "approve"}},
-        {"update_id": 2, "message": {"message_id": 20, "text": "The bear was a tax dodge.",
-                                     "reply_to_message": {"message_id": note_msg_id}}},
+        {
+            "update_id": 2,
+            "message": {
+                "message_id": 20,
+                "text": "The bear was a tax dodge.",
+                "reply_to_message": {"message_id": note_msg_id},
+            },
+        },
     )
 
     row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
@@ -189,10 +194,12 @@ def test_telegram_approve_skips_copy_when_no_client(tmp_path, monkeypatch):
     assert res is not None
     # second tap (confirm) commits the approve
     res2 = tg.handle_callback(
-        conn, stub, "chat",
-        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1",
-                                            "message": {"message_id": 10}}},
+        conn,
+        stub,
+        "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1", "message": {"message_id": 10}}},
     )
+    assert res2 is not None and res2.get("decision") == "approve"
     status = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
     copy = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
     assert status["status"] == "approved"
