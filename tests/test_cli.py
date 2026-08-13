@@ -425,3 +425,134 @@ def test_copy_parser_registered():
     assert args.copy_command == "show"
     assert args.draft_id == "d1"
     assert callable(args.func)
+
+
+# --- reopen / reviewnow / setjoke / suggest (GAP 3/4 CLI surface) ------------
+
+
+def _seed_approved(dbpath):
+    conn = db.connect(dbpath)
+    db.upsert_pool_item(
+        conn,
+        id="p1",
+        title="The Emu War",
+        year=1932,
+        date_hint=None,
+        summary=None,
+        source_url=None,
+        source_name=None,
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1','{}','{}','approved','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_reopen_sends_draft_back_to_pending(dbpath, capsys):
+    from humorhist.cli import cmd_reopen
+
+    _seed_approved(dbpath)
+    rc = cmd_reopen(argparse.Namespace(db=dbpath, draft_id="d1"))
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
+    conn.close()
+    assert row["status"] == "pending"
+
+
+def test_reopen_unknown_draft_returns_1(dbpath, capsys):
+    from humorhist.cli import cmd_reopen
+
+    rc = cmd_reopen(argparse.Namespace(db=dbpath, draft_id="ghost"))
+    assert rc == 1
+    assert "error" in capsys.readouterr().out.lower()
+
+
+def test_reviewnow_clears_defer(dbpath, capsys):
+    import humorhist.db as db
+    from humorhist.cli import cmd_reviewnow
+
+    conn = db.connect(dbpath)
+    db.upsert_pool_item(
+        conn, id="p1", title="X", year=None, date_hint=None,
+        summary=None, source_url=None, source_name=None,
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1','{}','{}','pending','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    db.defer_draft(conn, "d1", days=30)
+    row = conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()
+    assert row["defer_until"] is not None
+    conn.close()
+
+    rc = cmd_reviewnow(argparse.Namespace(db=dbpath, draft_id="d1"))
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()
+    conn.close()
+    assert row["defer_until"] is None
+
+
+def test_setjoke_sets_editor_line(dbpath, capsys):
+    import humorhist.review as review
+    from humorhist.cli import cmd_setjoke
+
+    _seed_approved(dbpath)
+    rc = cmd_setjoke(argparse.Namespace(db=dbpath, draft_id="d1", joke="the emus won"))
+    assert rc == 0
+    conn = db.connect(dbpath)
+    # status unchanged (approved), joke stored
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert review.stuck_captures(conn) == []  # no longer a stuck capture
+    conn.close()
+
+
+def test_setjoke_unknown_draft_returns_1(dbpath, capsys):
+    from humorhist.cli import cmd_setjoke
+
+    rc = cmd_setjoke(argparse.Namespace(db=dbpath, draft_id="ghost", joke="x"))
+    assert rc == 1
+    assert "error" in capsys.readouterr().out.lower()
+
+
+def test_suggest_adds_pool_item(dbpath, capsys):
+    from humorhist.cli import cmd_suggest
+
+    rc = cmd_suggest(
+        argparse.Namespace(
+            db=dbpath,
+            topic="The Dancing Plague of 1518",
+            note="weird one",
+            source_url="https://example.com",
+            year=1518,
+        )
+    )
+    assert rc == 0
+    conn = db.connect(dbpath)
+    row = conn.execute(
+        "SELECT title, source_name, status FROM pool WHERE title='The Dancing Plague of 1518'"
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["status"] == "new"
+    assert row["source_name"] == "editor-suggestion"
+
+
+def test_buffer_health_reports_on_empty(dbpath, capsys):
+    from humorhist.cli import cmd_buffer
+
+    # health-only path (no --auto-draft, no --notify) must run cleanly
+    rc = cmd_buffer(argparse.Namespace(db=dbpath, auto_draft=False, notify=False, chat_id=None))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "BUFFER" in out
+
+
+def test_main_dispatches_command_rc(dbpath, capsys):
+    # main() should return the command's rc, not swallow it.
+    rc = main(["--db", dbpath, "show", "nope"])
+    assert rc == 1  # show with no matching draft returns 1

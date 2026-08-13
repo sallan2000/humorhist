@@ -426,7 +426,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-299 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed).
+324 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed; the real Telegram/FAL HTTP transports are mocked with respx).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -538,4 +538,4 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
         weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
         fill_approved_copy.py  one-shot: generate post copy for approved+queued drafts
-    tests/                  pytest suite (299 tests)
+    tests/                  pytest suite (324 tests)
