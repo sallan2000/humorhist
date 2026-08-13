@@ -764,18 +764,86 @@ def test_send_queue_list_empty_when_no_queue(tmp_path):
     assert "empty" in stub.sent[-1]["text"].lower()
 
 
-def test_listapproved_shows_draft_id_in_text_and_button(tmp_path):
+def test_listapproved_shows_reject_button(tmp_path):
+    """An approved draft listed in /listapproved carries a confirm-gated
+    Reject button so it can be un-approved from Telegram (closes the
+    approve-then-change-mind gap)."""
     conn = _seed_with_statuses(tmp_path)  # d1 approved
     stub = tg.StubTelegram()
     n = tg.send_approved_list(conn, stub, "chat")
     assert n == 1
-    text = stub.sent[-1]["text"]
-    # the numeric draft id is shown so the user can type it into /later etc.
-    assert "#d1" in text
-    # and the view button label also carries the id
-    btns = stub.sent[-1]["reply_markup"]["inline_keyboard"]
-    assert btns[0][0]["text"].startswith("👁 #d1")
-    assert btns[0][0]["callback_data"] == "view:d1"
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0]
+    cbs = {b["callback_data"] for b in kb}
+    assert "view:d1" in cbs
+    assert "reject:d1" in cbs  # the new un-approve button
+    assert any(b["text"].startswith("❌ Reject") for b in kb)
+
+
+def test_listqueue_shows_reject_and_reopen_buttons(tmp_path):
+    """/listqueue rows now expose Reject (confirm-gated) and Reopen
+    (back-to-pending) buttons so an approved+queued draft can be fully
+    un-approved from Telegram without the CLI."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)  # d1 approved + queued
+    stub = tg.StubTelegram()
+    n = tg.send_queue_list(conn, stub, "chat")
+    assert n == 1
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"]
+    cbs = {b["callback_data"] for row in kb for b in row}
+    assert "copy:d1" in cbs
+    assert "remove:d1" in cbs
+    assert "reject:d1" in cbs   # new
+    assert "reopen:d1" in cbs   # new
+
+
+def test_reject_button_from_list_unapproves_after_confirm(tmp_path):
+    """End-to-end: the reject:d1 tap opens the confirm gate (GAP 3); the
+    confirm:reject:d1 tap flips the approved draft to rejected and pulls it
+    out of the publish queue."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)  # d1 approved + queued
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+    stub = tg.StubTelegram()
+    # 1) tap the Reject button -> confirm gate (no commit yet)
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reject:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res == {"draft_id": "d1", "decision": "reject", "confirming": True}
+    # still approved + queued until confirm
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+    # 2) confirm -> rejected + dequeued
+    res2 = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:reject:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res2["decision"] == "reject"
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "rejected"
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
+    assert any("reject" in m["text"].lower() for m in stub.sent)
+
+
+def test_reject_button_cancel_keeps_approval(tmp_path):
+    """Cancelling the reject confirm gate leaves the draft approved + queued."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)  # d1 approved + queued
+    stub = tg.StubTelegram()
+    tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reject:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "cancel:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
+    assert any("cancelled" in m["text"] for m in stub.sent)
 
 
 def test_view_command_re_reads_any_draft_from_phone(tmp_path):

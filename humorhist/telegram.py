@@ -735,8 +735,11 @@ HELP_TEXT = (
     "    /reviewnow [<id>] - bring a deferred draft (or ALL) back for review\n"
     "    /setjoke <id> - set the one-line joke on an approved draft (blank-capture fix)\n"
     "/listapproved - list approved drafts with their #id; tap one to open it\n"
+    "    each row also has a ❌ Reject button (confirm-gated) to un-approve it\n"
     "/listrejected - list rejected drafts; tap one to reopen for re-review\n"
-    "/listqueue - list queued drafts with their #id, copy + a Remove button\n"
+    "/listqueue - list queued drafts with their #id, copy + Remove/Reject/Reopen\n"
+    "    each row: ✏️ Edit copy, ↩️ Remove (keep approved),\n"
+    "             ❌ Reject (with confirm), ↩️ Reopen (back to pending)\n"
     "    /queue remove <id> pulls a draft out of the queue (kept approved)\n"
     "/view <id> - re-read any draft's full content (pending/approved/rejected)\n"
     "    (use the #id shown by /listapproved or /listqueue)\n"
@@ -770,7 +773,10 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
         did = r["draft_id"]
         lines.append(f"  • #{did} {title}")
         keyboard.append(
-            [{"text": f"👁 #{did} {title[:24]}", "callback_data": f"view:{did}"}]
+            [
+                {"text": f"👁 #{did} {title[:20]}", "callback_data": f"view:{did}"},
+                {"text": f"❌ Reject {did}", "callback_data": f"reject:{did}"},
+            ]
         )
     client.send_message(
         chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
@@ -945,8 +951,16 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
             lines.append(f"    🔗 {db.shorten_url(link, shorten=False)}")
         keyboard.append(
             [
-                {"text": f"✏️ #{did} {title[:20]}", "callback_data": f"copy:{did}"},
+                {"text": f"✏️ #{did} {title[:18]}", "callback_data": f"copy:{did}"},
                 {"text": "↩️ Remove", "callback_data": f"remove:{did}"},
+            ]
+        )
+        # Second row: reject (with confirm gate) + reopen-to-pending, so an
+        # approved draft can be un-approved entirely from Telegram without the CLI.
+        keyboard.append(
+            [
+                {"text": f"❌ Reject {did}", "callback_data": f"reject:{did}"},
+                {"text": f"↩️ Reopen {did}", "callback_data": f"reopen:{did}"},
             ]
         )
     client.send_message(

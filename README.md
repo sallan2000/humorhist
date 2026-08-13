@@ -195,9 +195,9 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /reviewnow [<id>]  bring a deferred (/later) draft — or ALL — back for review
     /setjoke <id> set the one-line joke on an approved draft (fixes a blank capture)
     /later <id>    defer a pending draft 30 days
-    /listapproved  list drafts you've greenlit; tap one to open it
+    /listapproved  list drafts you've greenlit; tap to open, or ❌ Reject
     /listrejected  list rejected drafts; tap one to reopen for re-review
-    /listqueue     list approved+queued drafts and their post copy
+    /listqueue     list approved+queued drafts; ✏️ copy, ↩️ Remove, ❌ Reject, ↩️ Reopen per row
     /viewcopy <id> open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)
     /queue         list the publish queue (approved+queued drafts)
     /queue enqueue  sweep approved drafts into the queue
@@ -261,11 +261,13 @@ the weekly timer, etc.) — you don't have to remember to poll it.
            (No status/queue change — just fills the blank human voice.)
 
     /listapproved
-        → list of greenlit drafts, each with a 👁 button to open its content.
+        → list of greenlit drafts, each with a 👁 button to open its content
+          and a ❌ Reject button (confirm-gated) to un-approve it on the spot.
 
     /listqueue
-        → "📋 Queued drafts (3) — edit copy before publishing:" with one
-           ✏️ <title> button per row.
+        → "📋 Queued drafts (3) — edit copy before publishing:" with one row
+          per draft: ✏️ <title> (open copy), ↩️ Remove (keep approved), ❌ Reject
+          (with confirm — fully un-approves), and ↩️ Reopen (back to pending).
 
     /viewcopy d4f1a2b3
         → the post copy + N/280 count + ✏️ Edit / 🔄 Regenerate buttons.
@@ -420,7 +422,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-263 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed).
+300 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -520,4 +522,4 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
         weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
         fill_approved_copy.py  one-shot: generate post copy for approved+queued drafts
-    tests/                  pytest suite (251 tests)
+    tests/                  pytest suite (300 tests)
