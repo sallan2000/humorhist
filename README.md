@@ -189,24 +189,26 @@ the weekly timer, etc.) — you don't have to remember to poll it.
 **Commands**
 
     /reviewdraft   review pending drafts one by one (✅ Approve / ❌ Reject / ⏸ Later)
-                  on Approve the bot asks for your one-line joke, then optional notes
-    /queue enqueue  move approved drafts into the publish queue — if HUMORHIST_IMAGE_API_KEY
-                  is set, this also generates a story image + a "learn more" source link
-                  for each (both skipped silently if no key)
-    /harvest       top up the candidate pool from seed + Wikipedia lists
-    /screen [limit]  LLM-score unscored pool candidates
-    /draft [count] [min_score]  fact-check + generate angles for top candidates
-    /suggest <topic>  add an editor-suggested event to the pool
+                  a tap opens a Confirm/Cancel gate so a fat-finger can't commit;
+                  on Approve confirm, the bot asks for your one-line joke, then notes
+    /listlater    list deferred drafts; tap one to bring it forward now
+    /reviewnow [<id>]  bring a deferred (/later) draft — or ALL — back for review
+    /setjoke <id> set the one-line joke on an approved draft (fixes a blank capture)
     /later <id>    defer a pending draft 30 days
     /listapproved  list drafts you've greenlit; tap one to open it
+    /listrejected  list rejected drafts; tap one to reopen for re-review
     /listqueue     list approved+queued drafts and their post copy
     /viewcopy <id> open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)
     /queue         list the publish queue (approved+queued drafts)
     /queue enqueue  sweep approved drafts into the queue
     /queue remove <id>  pull a draft back out of the queue (kept approved)
+    /harvest       top up the candidate pool from seed + Wikipedia lists
+    /screen [limit]  LLM-score unscored pool candidates
+    /draft [count] [min_score]  fact-check + generate angles for top candidates
+    /suggest <topic>  add an editor-suggested event to the pool
     /buffer        buffer health report + on-demand top-up
     /buffer enqueue  also sweep approved drafts into the queue
-    /status        approved / rejected / pending breakdown
+    /status        approved / rejected / pending breakdown (+ stuck-capture nudge)
     /help          this list
 
 **Examples** (what you type → what happens)
@@ -217,7 +219,7 @@ the weekly timer, etc.) — you don't have to remember to poll it.
 
     /screen 50
         → "🔍 Scoring the pool with the LLM (batch 20)…" then "🔍 Screened.
-           {'scored': 50, 'skipped': 0}". (Needs HUMORHIST_LLM_API_KEY.)
+           {'scored': 50, 'skipped': 0}. (Needs HUMORHIST_LLM_API_KEY.)"
 
     /draft 4 8.0
         → "✍️ Drafting 4 candidate(s) (min score 8.0)…" then "✍️ Drafted 4 new
@@ -230,15 +232,33 @@ the weekly timer, etc.) — you don't have to remember to poll it.
 
     /reviewdraft
         → 📊 progress block, then one draft at a time with ✅/❌/⏸ buttons.
-        Tapping ✅ → bot asks "Reply with the one-line joke (the human voice)…";
-        you send it → "📝 Saved. Optional notes? (or /skip)" → /skip.
-        The story image + "learn more" link are generated later, at the publish
-        step (`/queue enqueue` or `/buffer enqueue`) — see below.
+        Tapping ✅ (or ❌) opens a **Confirm / Cancel** gate — nothing is
+        committed until you tap "Yes, Approve"/"Yes, Reject" (↩️ Cancel backs
+        out with no change). After a confirmed Approve the bot asks for your
+        one-line joke (the human voice); you send it → "📝 Saved. Optional notes?"
+        → /skip. The story image + "learn more" link are generated later, at the
+        publish step (`/queue enqueue` or `/buffer enqueue`) — see below.
         On a *pending* draft, send /notes then your steer ("lean into the
         bureaucracy") to regenerate the angles with that as steering.
 
     /later d4f1a2b3
         → "⏸ `d4f1a2b3` deferred 30 days." (drops out of review until then.)
+        List deferred drafts with /listlater; bring one (or all) back with
+        /reviewnow [<id>].
+
+    /listlater
+        → "⏸ Deferred drafts (tap to bring one forward for review):" with a
+           ⏩ Review now button per row; tapping clears the defer and returns
+           the draft to the review queue.
+
+    /reviewnow
+        → "⏩ Brought forward N deferred draft(s) — they're back in the review
+           queue." (or /reviewnow d4f1a2b3 for just one).
+
+    /setjoke d4f1a2b3
+        → prompts for the one-line joke on an already-approved draft whose joke
+           was never captured (a "stuck capture"), then you reply with it.
+           (No status/queue change — just fills the blank human voice.)
 
     /listapproved
         → list of greenlit drafts, each with a 👁 button to open its content.
@@ -256,6 +276,11 @@ the weekly timer, etc.) — you don't have to remember to poll it.
         → "📥 Enqueued 2 approved draft(s) into the queue." + the queue list.
     /queue remove d4f1a2b3
         → "↩️ Removed `d4f1a2b3` from the queue (kept approved)."
+
+    /status
+        → approved / rejected / pending breakdown + buffer level; if any
+           approved+queued draft is missing its one-line joke, a ⚠️ stuck-capture
+           nudge lists them (fix with /setjoke <id>).
 
     /buffer
         → buffer health (pending/queued counts, level) + on-demand top-up if
@@ -279,10 +304,14 @@ for unattended use).
    messages (Telegram caps a message at 4096 chars, so long drafts are split);
    the **✅ Approve** / **❌ Reject** buttons are on the last message of that
    draft. Tap one.
-3. Tapping a button saves the decision to the database immediately. The bot then
-   asks for **optional notes** — type a short edit note and send it, or reply
-   `/skip` to leave no note. (The note is attached to the draft as
-   `editor_notes`; it does not change the decision.)
+3. Tapping a button does **not** commit instantly. It opens a **Confirm /
+   Cancel** gate — tap **Yes, Approve** / **Yes, Reject** to commit, or
+   **↩️ Cancel** to back out with no change (this stops a fat-finger tap from
+   enqueuing a draft before you can reconsider). After a confirmed Approve the
+   bot asks for your **one-line joke** (the human voice), then optional notes —
+   type the joke and send it, or reply `/skip` to leave it blank. (The joke is
+   attached as `editor_line` and steers the generated post copy.) On a *pending*
+   draft you can also send **/notes** to steer the angles with your note.
 4. **Only after you've decided that draft does the next one arrive.** One at a
    time — no wall of drafts. When all are done you get "✅ All caught up". If new
    drafts are generated later (by the weekly timer, `/draft`, or `/harvest`), the

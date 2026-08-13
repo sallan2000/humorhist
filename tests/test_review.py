@@ -241,3 +241,124 @@ def test_pending_drafts_orders_deferred_last(tmp_path):
     ids = [d["id"] for d in pend]
     assert ids == ["normal", "deferred"]  # deferred sorts after the window
 
+
+# --- deferred_drafts / bring_forward (GAP 4) --------------------------------
+
+
+def _defer(conn, draft_id: str, days: int = 30) -> None:
+    when = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    conn.execute("UPDATE drafts SET defer_until = ? WHERE id = ?", (when, draft_id))
+    conn.commit()
+
+
+def test_deferred_drafts_lists_only_future_deferred(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    _make_draft(conn, "d2", "pending")
+    # d1 deferred into the future; d2 not deferred
+    _defer(conn, "d1")
+    rows = review.deferred_drafts(conn)
+    assert [r["draft_id"] for r in rows] == ["d1"]
+
+
+def test_deferred_drafts_excludes_expired_and_nonpending(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    _make_draft(conn, "d2", "pending")
+    _make_draft(conn, "d3", "approved")
+    # d1 deferred in the PAST (expired) -> excluded
+    _defer(conn, "d1", days=-1)
+    # d2 deferred in the future -> included
+    _defer(conn, "d2")
+    # d3 is approved -> not pending -> excluded even if deferred
+    _defer(conn, "d3")
+    rows = review.deferred_drafts(conn)
+    assert [r["draft_id"] for r in rows] == ["d2"]
+
+
+def test_bring_forward_one_clears_defer(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    _defer(conn, "d1")
+    n = review.bring_forward(conn, "d1")
+    assert n == 1
+    assert conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()["defer_until"] is None
+    # now appears in the normal review surface
+    assert [d["id"] for d in review.pending_drafts(conn)] == ["d1"]
+
+
+def test_bring_forward_one_rejects_if_not_deferred(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    # not deferred -> ValueError
+    try:
+        review.bring_forward(conn, "d1")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for a non-deferred draft")
+
+
+def test_bring_forward_all_clears_every_deferred(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    _make_draft(conn, "d2", "pending")
+    _make_draft(conn, "d3", "pending")
+    _defer(conn, "d1")
+    _defer(conn, "d2")
+    # d3 not deferred
+    n = review.bring_forward(conn)  # no id -> all deferred
+    assert n == 2
+    remaining = {r["draft_id"] for r in review.deferred_drafts(conn)}
+    assert remaining == set()
+
+
+# --- stuck_captures / set_editor_line (GAP 4b) -------------------------------
+
+
+def _queue(conn, draft_id: str) -> None:
+    conn.execute("INSERT INTO queue (draft_id, published) VALUES (?, 0)", (draft_id,))
+    conn.commit()
+
+
+def test_stuck_captures_finds_approved_queued_without_joke(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    review.apply_review(conn, "d1", decision="approve")  # approves + enqueues
+    # d1 is approved + queued but has no editor_line yet
+    stuck = review.stuck_captures(conn)
+    assert [s["draft_id"] for s in stuck] == ["d1"]
+
+
+def test_stuck_captures_excludes_joke_present_and_pending(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    _make_draft(conn, "d2", "pending")
+    review.apply_review(conn, "d1", decision="approve", editor_line="already joked")
+    # d2 stays pending (never approved) -> not a stuck capture
+    stuck = review.stuck_captures(conn)
+    assert stuck == []
+
+
+def test_set_editor_line_fills_then_status_unchanged(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    review.apply_review(conn, "d1", decision="approve")  # approved + queued
+    review.set_editor_line(conn, "d1", "the bear was a tax dodge")
+    row = conn.execute("SELECT editor_line, status FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] == "the bear was a tax dodge"
+    assert row["status"] == "approved"  # status untouched
+    # no longer a stuck capture
+    assert review.stuck_captures(conn) == []
+
+
+def test_set_editor_line_rejects_unknown(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "pending")
+    try:
+        review.set_editor_line(conn, "nope", "x")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for unknown draft")
+

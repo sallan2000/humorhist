@@ -129,6 +129,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("  ** BUFFER LOW ** run a review session soon")
     else:
         print("  (healthy — a week+ of buffer)")
+
+    import humorhist.review as review
+
+    stuck = review.stuck_captures(conn)
+    if stuck:
+        print(
+            f"\n⚠️ Stuck captures ({len(stuck)}): approved + queued but the "
+            f"one-line joke was never filled:"
+        )
+        for s in stuck:
+            print(f"  • {s['draft_id']} {s['title']}")
+        print("  Fix with: humorhist setjoke <id> \"<joke>\"")
     return 0
 
 
@@ -296,6 +308,50 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         print(f"error: {exc}")
         return 1
     print(f"Reopened {args.draft_id} for re-review (status -> pending).")
+    return 0
+
+
+def cmd_reviewnow(args: argparse.Namespace) -> int:
+    """Bring deferred (GAP 4 /later) drafts back into the review surface.
+
+    With <draft_id> only that draft is brought forward; with no id every
+    currently-deferred draft is cleared. Deferred drafts sort after their window
+    in the review queue, so this is the missing "review now" shortcut.
+    """
+    import humorhist.review as review
+
+    conn = _open_db(args.db)
+    try:
+        n = review.bring_forward(conn, args.draft_id)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
+    if args.draft_id:
+        print(f"Brought forward {args.draft_id} (defer cleared).")
+    else:
+        print(f"Brought forward {n} deferred draft(s) (defer cleared).")
+    return 0
+
+
+def cmd_setjoke(args: argparse.Namespace) -> int:
+    """Set the human one-line joke (editor_line) on an approved draft.
+
+    Fixes a GAP 4b "stuck capture": a draft that was approved (committed) but
+    whose joke was never filled, so it sits in the publish queue with a blank
+    human voice. Does NOT change status or touch the queue.
+    """
+    import humorhist.review as review
+
+    conn = _open_db(args.db)
+    try:
+        review.set_editor_line(conn, args.draft_id, args.joke)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
+    if args.joke:
+        print(f"Set joke for {args.draft_id}.")
+    else:
+        print(f"Cleared joke for {args.draft_id}.")
     return 0
 
 
@@ -608,6 +664,15 @@ def build_parser() -> argparse.ArgumentParser:
     ro = sub.add_parser("reopen", help="reopen a rejected/approved draft for re-review")
     ro.add_argument("draft_id", help="the draft id to send back to pending")
     ro.set_defaults(func=cmd_reopen)
+
+    rn = sub.add_parser("reviewnow", help="bring a deferred (/later) draft back for review")
+    rn.add_argument("draft_id", nargs="?", default=None, help="single deferred draft id; omit to bring ALL deferred forward")
+    rn.set_defaults(func=cmd_reviewnow)
+
+    sj = sub.add_parser("setjoke", help="set the one-line joke on an approved draft (fix a blank capture)")
+    sj.add_argument("draft_id", help="the approved draft id")
+    sj.add_argument("joke", nargs="*", default=[], help="the joke text (omit to clear)")
+    sj.set_defaults(func=cmd_setjoke)
 
     sg = sub.add_parser("suggest", help="add an editor-suggested event to the pool")
     sg.add_argument("topic", help="the event/topic to suggest")

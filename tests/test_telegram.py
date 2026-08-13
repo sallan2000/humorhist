@@ -8,6 +8,7 @@ be stored as notes, and the bot must send one message per pending draft.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,46 @@ def _callback_update(update_id, cb_id, decision, draft_id, msg_id=10):
             "message": {"message_id": msg_id},
         },
     }
+
+
+def _confirm_update(update_id, cb_id, decision, draft_id, msg_id=10):
+    """A *confirmed* approve/reject tap (the second step of the GAP 3 gate)."""
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": cb_id,
+            "data": f"confirm:{decision}:{draft_id}",
+            "message": {"message_id": msg_id},
+        },
+    }
+
+
+def _cancel_update(update_id, cb_id, draft_id, msg_id=10):
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": cb_id,
+            "data": f"cancel:{draft_id}",
+            "message": {"message_id": msg_id},
+        },
+    }
+
+
+def _approve_and_confirm(conn, stub, draft_id="d1"):
+    """Drive a pending draft through the full approve + confirm gate.
+
+    Returns the ``handle_callback`` result of the *confirm* step (which carries
+    ``note_message_id`` + ``stage`` so the editor_line can be captured).
+    """
+    tg.handle_callback(
+        conn, stub, "chat",
+        _callback_update(1, "cb1", "approve", draft_id),
+    )
+    # the confirm callback returns the editor_line prompt metadata
+    return tg.handle_callback(
+        conn, stub, "chat",
+        _confirm_update(2, "cb2", "approve", draft_id),
+    )
 
 
 def _text_update(update_id, text, reply_to, msg_id=20):
@@ -89,24 +130,58 @@ def test_send_pending_drafts_empty_when_none_pending(tmp_path):
 # --- handle_callback ---------------------------------------------------------
 
 
-def test_handle_callback_approve_calls_apply_review(tmp_path):
+def test_handle_callback_approve_opens_confirm_gate(tmp_path):
+    """GAP 3: an initial approve tap does NOT commit — it opens a confirm gate."""
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
 
     res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
 
+    # returns a 'confirming' marker, not the committed editor_line prompt
     assert res is not None
     assert res["draft_id"] == "d1"
+    assert res["decision"] == "approve"
+    assert res.get("confirming") is True
+    # NOTHING committed yet
+    row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
+    assert row["status"] == "pending"
+    # a confirm/cancel message was sent
+    assert any("Confirm" in m["text"] for m in stub.sent)
+
+
+def test_handle_callback_approve_confirm_commits(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+
+    # first tap -> gate; second tap -> commit
+    tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    res = tg.handle_callback(conn, stub, "chat", _confirm_update(2, "cb2", "approve", "d1"))
+
     assert res["decision"] == "approve"
     row = conn.execute("SELECT status, reviewed_at FROM drafts WHERE id='d1'").fetchone()
     assert row["status"] == "approved"
     assert row["reviewed_at"] is not None
-    # callback was answered and an editor_line prompt was sent
-    assert "cb1" in stub.answered
+    # callback answered + editor_line prompt sent
+    assert "cb2" in stub.answered
     assert any("one-line joke" in m["text"] for m in stub.sent)
-    # the prompt carries the new stage metadata so handle_text captures editor_line
     assert res["stage"] == "editor_line"
+
+
+def test_handle_callback_approve_cancel_is_noop(tmp_path):
+    """GAP 3: cancelling the gate leaves the draft untouched."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+
+    tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    res = tg.handle_callback(conn, stub, "chat", _cancel_update(2, "cb2", "d1"))
+
+    assert res.get("cancelled") is True
+    row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
+    assert row["status"] == "pending"
+    assert review.pending_drafts(conn) == [{"id": "d1", "pool_id": "pool-x", "brief_json": "{}", "angles_json": "{}", "status": "pending", "created_at": "2026-01-01T00:00:00+00:00", "editor_line": None, "editor_notes": None, "reviewed_at": None, "defer_until": None}]
 
 
 def test_handle_callback_reject_calls_apply_review(tmp_path):
@@ -114,7 +189,9 @@ def test_handle_callback_reject_calls_apply_review(tmp_path):
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
 
-    res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "reject", "d1"))
+    # reject also goes through the confirm gate
+    tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "reject", "d1"))
+    res = tg.handle_callback(conn, stub, "chat", _confirm_update(2, "cb2", "reject", "d1"))
 
     assert res["decision"] == "reject"
     row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
@@ -140,7 +217,7 @@ def test_handle_text_captures_editor_line_then_optional_notes(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
-    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    cb_res = _approve_and_confirm(conn, stub, "d1")
     editor_line_msg_id = cb_res["note_message_id"]
     awaiting = {
         "d1": {
@@ -175,7 +252,7 @@ def test_handle_text_editor_line_skip_then_notes(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
-    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    cb_res = _approve_and_confirm(conn, stub, "d1")
     awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
 
     res1 = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", cb_res["note_message_id"]))
@@ -208,7 +285,7 @@ def test_handle_text_skip_clears_awaiting(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
-    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    cb_res = _approve_and_confirm(conn, stub, "d1")
     awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
 
     res = tg.handle_text(conn, stub, "chat", awaiting, _text_update(2, "/skip", cb_res["note_message_id"]))
@@ -237,7 +314,11 @@ def test_handle_text_ignores_unrelated_message(tmp_path):
 def test_run_review_bot_once_pumps_callback(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
-    stub = tg.StubTelegram(updates=[_callback_update(1, "cb1", "approve", "d1")])
+    # GAP 3: an approve now needs a separate confirm tap
+    stub = tg.StubTelegram(updates=[
+        _callback_update(1, "cb1", "approve", "d1"),
+        _confirm_update(2, "cb2", "approve", "d1"),
+    ])
 
     decided = tg.run_review_bot(conn, stub, "chat", once=True)
 
@@ -415,6 +496,18 @@ def _callback_batch(draft_id, update_id=1):
     }]
 
 
+def _confirm_batch(draft_id, update_id=1):
+    """The second step of the GAP 3 confirm gate (confirm:<decision>:<id>)."""
+    return [{
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb{update_id}",
+            "data": f"confirm:approve:{draft_id}",
+            "message": {"message_id": 100 + update_id},
+        },
+    }]
+
+
 def _message_batch(text, update_id=1):
     return [{
         "update_id": update_id,
@@ -431,9 +524,11 @@ def test_run_review_bot_one_by_one(tmp_path):
     stub = _SeqStub([
         _message_batch("/reviewdraft", 1),
         _callback_batch("d1", 2),
+        _confirm_batch("d1", 2),
         _message_batch("joke for d1", 3),
         _message_batch("/skip", 4),
         _callback_batch("d2", 5),
+        _confirm_batch("d2", 5),
         _message_batch("joke for d2", 6),
         _message_batch("/skip", 7),
     ])
@@ -445,10 +540,14 @@ def test_run_review_bot_one_by_one(tmp_path):
     # jokes captured
     assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] == "joke for d1"
     assert conn.execute("SELECT editor_line FROM drafts WHERE id='d2'").fetchone()["editor_line"] == "joke for d2"
-    # only TWO drafts were sent (one at a time), not dumped all at once up front:
-    # count messages that carry a reply_markup (the button messages)
+    # one draft shown at a time (not dumped all at once up front). With the
+    # GAP 3 confirm gate each draft yields TWO button messages (the Approve
+    # tap, then the Confirm/Cancel gate) = 4 total for two drafts.
     button_msgs = [m for m in stub.sent if "reply_markup" in m]
-    assert len(button_msgs) == 2  # one per draft, not 8 simultaneously
+    assert len(button_msgs) == 4  # 2 drafts x (approve + confirm), not 8 simultaneously
+    # and the confirm gate was actually shown for each
+    assert sum("confirm:approve:d1" in str(m) for m in button_msgs) == 1
+    assert sum("confirm:approve:d2" in str(m) for m in button_msgs) == 1
 
 
 def test_review_session_waits_for_joke_before_next_draft(tmp_path):
@@ -465,13 +564,16 @@ def test_review_session_waits_for_joke_before_next_draft(tmp_path):
         def get_updates(self, offset=0, timeout=0):
             return self._batches.pop(0) if self._batches else []
 
-    # /reviewdraft -> approve d1 -> joke -> /skip notes -> approve d2 -> joke -> /skip
+    # /reviewdraft -> approve d1 -> CONFIRM d1 -> joke -> /skip notes ->
+    # approve d2 -> CONFIRM d2 -> joke -> /skip
     stub = _ScriptStub([
         _message_batch("/reviewdraft", 1),
         _callback_batch("d1", 2),
+        _confirm_batch("d1", 2),
         _message_batch("the emus did nothing wrong", 3),  # editor_line reply
         _message_batch("/skip", 4),                        # end notes capture
         _callback_batch("d2", 5),
+        _confirm_batch("d2", 5),
         _message_batch("and the humans lost", 6),
         _message_batch("/skip", 7),
     ])
@@ -792,6 +894,97 @@ def test_send_rejected_list_empty_when_none(tmp_path):
     assert "No rejected" in stub.sent[-1]["text"]
 
 
+def _seed_deferred(conn, draft_id="d1", days=30):
+    conn.execute(
+        "INSERT OR IGNORE INTO pool (id, title, status) VALUES ('pool-x', 'Pastry War', 'drafted')"
+    )
+    future = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at, defer_until) "
+        "VALUES (?, 'pool-x', '{}', '{}', 'pending', '2026-01-01T00:00:00+00:00', ?)",
+        (draft_id, future),
+    )
+    conn.commit()
+
+
+def test_send_deferred_list_shows_reviewnow_button(tmp_path):
+    """GAP 4: /listlater lists deferred drafts each with a bring-forward button."""
+    conn = _fresh_db(tmp_path)
+    _seed_deferred(conn, "d1")
+    stub = tg.StubTelegram()
+    n = tg.send_deferred_list(conn, stub, "chat")
+    assert n == 1
+    text = stub.sent[-1]["text"]
+    assert "#d1" in text
+    assert "Pastry War" in text
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0][0]
+    assert kb["callback_data"] == "reviewnow:d1"
+    assert kb["text"].startswith("⏩ Review now")
+
+
+def test_send_deferred_list_empty_when_none(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    n = tg.send_deferred_list(conn, stub, "chat")
+    assert n == 0
+    assert "No deferred" in stub.sent[-1]["text"]
+
+
+def test_reviewnow_callback_brings_draft_forward(tmp_path):
+    """GAP 4: tapping the reviewnow:<id> button clears the defer + returns to review."""
+    conn = _fresh_db(tmp_path)
+    _seed_deferred(conn, "d1")
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reviewnow:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res is None
+    # defer cleared -> back in the review surface
+    assert [d["id"] for d in review.pending_drafts(conn)] == ["d1"]
+    assert [r["draft_id"] for r in review.deferred_drafts(conn)] == []
+
+
+def test_reviewnow_callback_when_not_deferred_is_safe(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")  # not deferred
+    stub = tg.StubTelegram()
+    tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "reviewnow:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    # a clean "Cannot bring forward" message, no crash
+    assert any("Cannot bring forward" in m["text"] for m in stub.sent)
+
+
+def test_setjoke_callback_opens_editor_line_prompt(tmp_path):
+    """GAP 4b: setjoke:<id> re-opens the joke prompt on an approved+queued draft."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    review.apply_review(conn, "d1", decision="approve")  # approved + queued, no joke
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "setjoke:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    assert res["stage"] == "editor_line"
+    assert res.get("setjoke") is True
+    # reply with the joke -> set via set_editor_line (no status/queue change)
+    note_id = res["note_message_id"]
+    tg.handle_text(
+        conn, stub, "chat",
+        {"d1": {"note_message_id": note_id, "stage": "editor_line", "decision": "approve", "setjoke": True}},
+        _text_update(2, "the bear was a tax dodge", note_id),
+    )
+    row = conn.execute("SELECT editor_line, status FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] == "the bear was a tax dodge"
+    assert row["status"] == "approved"  # unchanged
+    assert review.stuck_captures(conn) == []  # no longer stuck
+
+
 def test_reopen_callback_sends_draft_back_to_pending(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_rejected(conn, "d1")
@@ -886,7 +1079,8 @@ def test_regencopy_without_llm_sends_clean_unavailable(tmp_path, monkeypatch):
 
 def test_editor_line_approve_without_llm_skips_copy_gracefully(tmp_path, monkeypatch):
     """Approve must still succeed (and enqueue) even when no LLM key exists for
-    post-copy generation -- it just skips the copy step silently."""
+    post-copy generation -- it just skips the copy step silently. Goes through
+    the confirm gate first (GAP 3)."""
     from humorhist.llm import LLMUnavailable
 
     def _boom():
@@ -896,9 +1090,16 @@ def test_editor_line_approve_without_llm_skips_copy_gracefully(tmp_path, monkeyp
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
-    res = tg.handle_callback(
+    # initial tap opens the confirm gate (no commit)
+    tg.handle_callback(
         conn, stub, "chat",
         {"update_id": 1, "callback_query": {"id": "cb1", "data": "approve:d1",
+                                            "message": {"message_id": 1}}},
+    )
+    # confirm tap commits
+    res = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1",
                                             "message": {"message_id": 1}}},
     )
     # draft approved + queued despite no LLM for the copy step
@@ -930,7 +1131,8 @@ def test_enqueue_generates_story_image_and_persists(tmp_path, monkeypatch):
 
     # approve first (apply_review auto-enqueues WITHOUT an image dir, so no image
     # is generated yet — it is deferred to the explicit publish/enqueue step)
-    cb_res = tg.handle_callback(conn, tg.StubTelegram(), "chat", _callback_update(1, "cb1", "approve", "d1"))
+    tg.handle_callback(conn, tg.StubTelegram(), "chat", _callback_update(1, "cb1", "approve", "d1"))
+    cb_res = tg.handle_callback(conn, tg.StubTelegram(), "chat", _confirm_update(2, "cb2", "approve", "d1"))
     assert db.get_image(conn, "d1")["image_path"] is None
 
     # now the publish/enqueue step generates the image via the backfill path
@@ -985,11 +1187,13 @@ def test_approve_skips_image_when_no_image_client(tmp_path, monkeypatch):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
-    cb_res = tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    # initial tap opens the confirm gate; confirm commits + prompts the joke
+    tg.handle_callback(conn, stub, "chat", _callback_update(1, "cb1", "approve", "d1"))
+    cb_res = tg.handle_callback(conn, stub, "chat", _confirm_update(2, "cb2", "approve", "d1"))
     awaiting = {"d1": {"note_message_id": cb_res["note_message_id"], "stage": "editor_line", "decision": "approve"}}
 
     tg.handle_text(
-        conn, stub, "chat", awaiting, _text_update(2, "The bear was a tax dodge.", cb_res["note_message_id"]),
+        conn, stub, "chat", awaiting, _text_update(3, "The bear was a tax dodge.", cb_res["note_message_id"]),
         image_dir=str(tmp_path / "images"),
     )
     # no photo sent

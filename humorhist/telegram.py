@@ -281,6 +281,26 @@ def _keyboard(draft_id: str) -> dict:
     }
 
 
+def _confirm_keyboard(draft_id: str, decision: str) -> dict:
+    """Confirm / cancel buttons shown after an initial approve/reject tap.
+
+    ``decision`` is ``approve`` or ``reject``. Tapping confirm commits the
+    decision (the original commit); cancel backs out with no state change.
+    """
+    verb = "Approve" if decision == "approve" else "Reject"
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": f"✅ Yes, {verb}",
+                    "callback_data": f"confirm:{decision}:{draft_id}",
+                },
+                {"text": "↩️ Cancel", "callback_data": f"cancel:{draft_id}"},
+            ]
+        ]
+    }
+
+
 def _chunk_text(text: str, limit: int = 4000) -> list[str]:
     """Split long text into <=limit-char chunks on line boundaries.
 
@@ -374,6 +394,23 @@ def handle_callback(
         decision, _, draft_id = data.partition(":")
         if decision not in ("approve", "reject"):
             return None
+        # GAP 3: a tap is a *proposal*, not a commit. Show a confirm/cancel
+        # gate so a fat-finger Approve can't enqueue + fire copy-gen before the
+        # editor can reconsider. Nothing is written to the DB yet.
+        client.answer_callback_query(cq["id"], text=f"confirm {decision}?")
+        verb = "approve" if decision == "approve" else "reject"
+        client.send_message(
+            chat_id,
+            f"⚠️ Confirm: {verb} draft `{draft_id}`?",
+            reply_markup=_confirm_keyboard(draft_id, decision),
+        )
+        return {"draft_id": draft_id, "decision": decision, "confirming": True}
+    if data.startswith("confirm:"):
+        # format: confirm:<decision>:<draft_id>
+        _, rest = data.split(":", 1)
+        decision, _, draft_id = rest.partition(":")
+        if decision not in ("approve", "reject"):
+            return None
         try:
             review.apply_review(conn, draft_id, decision=decision)
         except ValueError:
@@ -396,6 +433,15 @@ def handle_callback(
             "note_message_id": note["message_id"],
             "stage": "editor_line",
         }
+    if data.startswith("cancel:"):
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="cancelled")
+        client.send_message(
+            chat_id,
+            f"↩️ Decision for `{draft_id}` cancelled — no change made. "
+            f"Tap ✅/❌ again when you're sure, or /reviewdraft to move on.",
+        )
+        return {"draft_id": draft_id, "cancelled": True}
     if data.startswith("notes:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="add notes")
@@ -470,6 +516,39 @@ def handle_callback(
             f"List it with /reviewdraft.",
         )
         return None
+    if data.startswith("reviewnow:"):
+        # GAP 4: bring a deferred draft forward for immediate review.
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="brought forward")
+        try:
+            review.bring_forward(conn, draft_id)
+        except ValueError as exc:
+            client.send_message(chat_id, f"Cannot bring forward: {exc}")
+            return None
+        client.send_message(
+            chat_id,
+            f"⏩ `#{draft_id}` brought forward — it's back in the review queue. "
+            f"Send /reviewdraft to see it (or tap ✅/❌ next time one is shown).",
+        )
+        return None
+    if data.startswith("setjoke:"):
+        # GAP 4b: fix a "stuck capture" — an approved+queued draft whose joke
+        # (editor_line) was never filled. Re-open the editor_line prompt.
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="add joke")
+        prompt = client.send_message(
+            chat_id,
+            f"Reply with the one-line joke (editor_line) for approved draft "
+            f"`{draft_id}` — this is the human voice for the post copy "
+            f"(or /skip to leave it blank):",
+        )
+        return {
+            "draft_id": draft_id,
+            "note_message_id": prompt["message_id"],
+            "stage": "editor_line",
+            "decision": "approve",
+            "setjoke": True,
+        }
     if data.startswith("editcopy:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="editing copy")
@@ -572,6 +651,16 @@ def handle_text(
     # --- editor_line stage: capture the human joke (the product's point) ---
     if stage == "editor_line":
         editor_line = None if text == "/skip" else text
+        if (st or {}).get("setjoke"):
+            # A "stuck capture" fix: the draft is already approved + queued.
+            # Just set the joke (no re-commit, no re-enqueue, no copy regen).
+            review.set_editor_line(conn, draft_id, editor_line)
+            awaiting.pop(draft_id, None)
+            if editor_line is None:
+                client.send_message(chat_id, f"Joke left blank for `{draft_id}`.")
+            else:
+                client.send_message(chat_id, f"Joke saved for `{draft_id}`.")
+            return {"editor_line_set": draft_id}
         review.apply_review(conn, draft_id, decision=decision, editor_line=editor_line)
         # B+ handoff: on approve, generate initial post copy now that we have
         # the editor_line to steer it. Best-effort (missing LLM key => skip).
@@ -639,8 +728,12 @@ HELP_TEXT = (
     "REVIEW\n"
     "/reviewdraft - review pending drafts one by one\n"
     "    each draft has ✅ Approve / ❌ Reject / ⏸ Later buttons\n"
-    "    on Approve the bot asks for your one-line joke, then optional notes\n"
+    "    a tap opens a Confirm/Cancel gate (so a fat-finger can't commit)\n"
+    "    on Approve confirm, the bot asks for your one-line joke, then notes\n"
     "    /later <id> defers a pending draft 30 days (#id shown in /listapproved)\n"
+    "    /listlater - list deferred drafts; tap to bring one forward now\n"
+    "    /reviewnow [<id>] - bring a deferred draft (or ALL) back for review\n"
+    "    /setjoke <id> - set the one-line joke on an approved draft (blank-capture fix)\n"
     "/listapproved - list approved drafts with their #id; tap one to open it\n"
     "/listrejected - list rejected drafts; tap one to reopen for re-review\n"
     "/listqueue - list queued drafts with their #id, copy + a Remove button\n"
@@ -654,7 +747,7 @@ HELP_TEXT = (
     "/queue - list the publish queue (approved+queued drafts)\n"
     "/queue enqueue - sweep approved drafts into the queue\n"
     "/queue remove <id> - pull a draft back out of the queue (kept approved)\n"
-    "/status - approved / rejected / pending breakdown\n"
+    "/status - approved / rejected / pending breakdown (+ stuck-capture nudge)\n"
     "/help - this message\n\n"
     "The bot also nudges you with 🆕 N new draft(s) when fresh drafts appear."
 )
@@ -703,6 +796,32 @@ def send_rejected_list(conn: sqlite3.Connection, client: TelegramTransport, chat
         lines.append(f"  • #{did} {title}")
         keyboard.append(
             [{"text": f"↩️ Reopen #{did}", "callback_data": f"reopen:{did}"}]
+        )
+    client.send_message(
+        chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
+    )
+    return len(rows)
+
+
+def send_deferred_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str) -> int:
+    """DM a list of deferred drafts, each with an inline 'review now' button.
+
+    Tapping a draft clears its defer window (``/later``) and returns it to the
+    review surface immediately — the missing "review now" shortcut for a
+    deferred draft (GAP 4). Returns the count listed.
+    """
+    rows = review.deferred_drafts(conn)
+    if not rows:
+        client.send_message(chat_id, "No deferred drafts. (/later defers one 30 days.)")
+        return 0
+    lines = ["⏸ Deferred drafts (tap to bring one forward for review; #id is the draft number):"]
+    keyboard = []
+    for r in rows:
+        title = r["title"] or "(unknown)"
+        did = r["draft_id"]
+        lines.append(f"  • #{did} {title}")
+        keyboard.append(
+            [{"text": f"⏩ Review now #{did}", "callback_data": f"reviewnow:{did}"}]
         )
     client.send_message(
         chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard}
@@ -1038,7 +1157,7 @@ def run_review_session(
                 if did not in sent:
                     return None
             res = handle_callback(conn, client, chat_id, upd)
-            if res and "decision" in res:
+            if res and "decision" in res and "note_message_id" in res:
                 nonlocal decided
                 decided += 1
                 awaiting[res["draft_id"]] = {
@@ -1145,7 +1264,7 @@ def run_review_bot(
         offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
         if "callback_query" in upd:
             res = handle_callback(conn, client, chat_id, upd)
-            if res and "decision" in res:
+            if res and "decision" in res and "note_message_id" in res:
                 nonlocal decided
                 decided += 1
                 awaiting[res["draft_id"]] = {
@@ -1214,6 +1333,48 @@ def run_review_bot(
                     client.send_message(chat_id, f"Cannot defer: {exc}")
                 else:
                     client.send_message(chat_id, f"⏸ `{did}` deferred 30 days.")
+        elif cmd == "/listlater":
+            send_deferred_list(conn, client, chat_id)
+        elif cmd == "/reviewnow":
+            # /reviewnow            -> bring ALL deferred drafts forward
+            # /reviewnow <id>       -> bring one deferred draft forward
+            rest = text.split(maxsplit=1)
+            did = rest[1].strip() if len(rest) > 1 else None
+            try:
+                n = review.bring_forward(conn, did)
+            except ValueError as exc:
+                client.send_message(chat_id, f"Cannot bring forward: {exc}")
+            else:
+                if did is None:
+                    client.send_message(
+                        chat_id,
+                        f"⏩ Brought forward {n} deferred draft(s) — they're back "
+                        f"in the review queue. Send /reviewdraft to see them.",
+                    )
+                else:
+                    client.send_message(
+                        chat_id,
+                        f"⏩ `#{did}` brought forward — it's back in the review "
+                        f"queue. Send /reviewdraft to see it.",
+                    )
+        elif cmd == "/setjoke":
+            rest = text.split(maxsplit=1)
+            if len(rest) < 2:
+                client.send_message(chat_id, "Usage: /setjoke <draft_id> (then reply with the joke)")
+            else:
+                did = rest[1].strip()
+                prompt = client.send_message(
+                    chat_id,
+                    f"Reply with the one-line joke (editor_line) for approved "
+                    f"draft `{did}` — the human voice for the post copy "
+                    f"(or /skip to leave it blank):",
+                )
+                awaiting[did] = {
+                    "note_message_id": prompt["message_id"],
+                    "stage": "editor_line",
+                    "decision": "approve",
+                    "setjoke": True,
+                }
         elif cmd == "/suggest":
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
@@ -1350,7 +1511,22 @@ def format_reviewed_summary(summary: dict) -> str:
 def send_reviewed_summary(
     conn: db.Connection, client: TelegramTransport, chat_id: str
 ) -> str:
-    """DM the reviewer the approved/rejected/pending breakdown. Returns the text."""
+    """DM the reviewer the approved/rejected/pending breakdown. Returns the text.
+
+    Also nudges on GAP 4b "stuck captures" — approved+queued drafts whose
+    one-line joke (editor_line) was never filled — so a committed-but-blank
+    human voice doesn't sit silently in the publish queue.
+    """
     text = format_reviewed_summary(review.reviewed_summary(conn))
     client.send_message(chat_id, text)
+    stuck = review.stuck_captures(conn)
+    if stuck:
+        lines = [
+            f"⚠️ {len(stuck)} approved draft(s) are missing their one-line joke "
+            f"(committed but the joke was never captured):"
+        ]
+        for s in stuck:
+            lines.append(f"  • #{s['draft_id']} {s['title'] or '(unknown)'}")
+        lines.append("Fix one with /setjoke <id> (then reply with the joke).")
+        client.send_message(chat_id, "\n".join(lines))
     return text

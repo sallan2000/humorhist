@@ -142,13 +142,18 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
     assert res is not None
     assert res["decision"] == "approve"
 
-    # Tap only approves + prompts for the joke; copy is generated once the
-    # editor_line reply arrives (so the human joke can steer the copy).
-    row = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
-    assert row["post_copy"] is None
-
-    # reply with the editor_line -> triggers fill_post_copy
-    note_msg_id = res["note_message_id"]
+    # Tap only opens the confirm gate; a second tap commits + prompts the joke.
+    # Copy is generated once the editor_line reply arrives (so the human joke
+    # can steer the copy).
+    res2 = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1",
+                                            "message": {"message_id": 10}}},
+    )
+    assert res2["note_message_id"] is not None
+    row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
+    assert row["status"] == "approved"
+    note_msg_id = res2["note_message_id"]
     tg.handle_text(
         conn,
         stub,
@@ -182,6 +187,12 @@ def test_telegram_approve_skips_copy_when_no_client(tmp_path, monkeypatch):
     }
     res = tg.handle_callback(conn, stub, "chat", upd)
     assert res is not None
+    # second tap (confirm) commits the approve
+    res2 = tg.handle_callback(
+        conn, stub, "chat",
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1",
+                                            "message": {"message_id": 10}}},
+    )
     status = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
     copy = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()
     assert status["status"] == "approved"

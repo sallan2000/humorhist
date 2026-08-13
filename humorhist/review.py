@@ -277,6 +277,60 @@ def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def deferred_drafts(conn: sqlite3.Connection) -> list[dict]:
+    """Return pending drafts currently deferred (``defer_until`` in the future).
+
+    Used by the Telegram ``/listlater`` command so a deferred draft can be
+    brought forward with ``/reviewnow`` (or the ``reviewnow:<id>`` button) —
+    the missing "review now" shortcut for a ``/later`` defer (GAP 4). Ordered
+    by how soon each defer window opens (soonest first).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    return [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT d.id AS draft_id, p.title AS title, d.defer_until
+            FROM drafts d
+            LEFT JOIN pool p ON p.id = d.pool_id
+            WHERE d.status = 'pending'
+              AND d.defer_until IS NOT NULL
+              AND d.defer_until > ?
+            ORDER BY d.defer_until ASC, d.id ASC
+            """,
+            (now,),
+        )
+    ]
+
+
+def bring_forward(conn: sqlite3.Connection, draft_id: str | None = None) -> int:
+    """Clear the defer window on deferred draft(s) so they re-enter review.
+
+    When ``draft_id`` is given, clears just that draft (raising ValueError if
+    it's unknown or not deferred). When ``None``, clears every currently
+    deferred draft. Returns the number of drafts brought forward.
+    """
+    if draft_id is not None:
+        row = conn.execute(
+            "SELECT status, defer_until FROM drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no draft with id {draft_id!r}")
+        if not row["defer_until"]:
+            raise ValueError(f"draft {draft_id!r} is not deferred")
+        db.clear_defer(conn, draft_id)
+        return 1
+    cleared = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for r in conn.execute(
+        "SELECT id FROM drafts WHERE status='pending' AND defer_until IS NOT NULL AND defer_until > ?",
+        (now,),
+    ).fetchall():
+        db.clear_defer(conn, r["id"])
+        cleared += 1
+    return cleared
+
+
 def approved_drafts(conn: sqlite3.Connection) -> list[dict]:
     """Return approved drafts (greenlit), oldest first, joined to pool title.
 
@@ -357,3 +411,45 @@ def defer_draft(conn: sqlite3.Connection, draft_id: str, days: int = 30) -> None
 def clear_defer(conn: sqlite3.Connection, draft_id: str) -> None:
     """Clear a draft's defer_until (convenience over ``db.clear_defer``)."""
     db.clear_defer(conn, draft_id)
+
+
+def stuck_captures(conn: sqlite3.Connection) -> list[dict]:
+    """Return approved+queued drafts that still lack a human ``editor_line``.
+
+    These were committed (the editor tapped Approve) but they walked away
+    before sending their one-line joke, so the draft sits in the publish queue
+    with a blank human voice. Surfaced by the status surfaces (CLI ``status`` /
+    Telegram ``/status``) as a nudge, and fixed with ``set_editor_line`` (CLI
+    ``setjoke`` / Telegram ``/setjoke``).
+    """
+    return [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT d.id AS draft_id, p.title AS title
+            FROM drafts d
+            LEFT JOIN pool p ON p.id = d.pool_id
+            WHERE d.status = 'approved'
+              AND d.editor_line IS NULL
+              AND EXISTS (SELECT 1 FROM queue q WHERE q.draft_id = d.id)
+            ORDER BY d.reviewed_at ASC, d.id ASC
+            """
+        )
+    ]
+
+
+def set_editor_line(conn: sqlite3.Connection, draft_id: str, editor_line: str | None) -> None:
+    """Set (or clear, with empty/None) the human ``editor_line`` on a draft.
+
+    Does NOT change the draft's status or touch the queue — it's purely the
+    fix for a "stuck capture" (an approved draft whose joke was never filled).
+    Raises ValueError on an unknown id.
+    """
+    row = conn.execute("SELECT id FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no draft with id {draft_id!r}")
+    conn.execute(
+        "UPDATE drafts SET editor_line = ? WHERE id = ?",
+        (editor_line.strip() if editor_line else None, draft_id),
+    )
+    conn.commit()
