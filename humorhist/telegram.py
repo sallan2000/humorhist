@@ -19,6 +19,7 @@ Config (env, never in the repo):
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sqlite3
 import time
@@ -30,6 +31,8 @@ import httpx
 import humorhist.db as db
 import humorhist.render as render
 import humorhist.review as review
+
+logger = logging.getLogger("humorhist.telegram")
 
 API_BASE = "https://api.telegram.org"
 
@@ -331,7 +334,7 @@ def _send_one(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str,
     try:
         return _send_long(client, chat_id, text, reply_markup=_keyboard(row["id"]))
     except Exception as exc:  # noqa: BLE001 - one bad draft must not kill the loop
-        print(f"[telegram] failed to send draft {row['id']}: {exc}")
+        logger.error("[telegram] failed to send draft %s: %s", row["id"], exc)
         return []
 
 
@@ -653,7 +656,7 @@ def handle_text(
                 try:
                     fill_post_copy(conn, llm, draft_id=draft_id)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"[telegram] post copy not generated for {draft_id}: {exc}")
+                    logger.warning("[telegram] post copy not generated for %s: %s", draft_id, exc)
         # secondary optional notes step
         note = client.send_message(
             chat_id,
@@ -839,7 +842,7 @@ def send_draft_content(conn: sqlite3.Connection, client: TelegramTransport, chat
         if link:
             text = text + f"\n\n🔗 Learn more: {shorten_url(link, shorten=False)}"
     except Exception as exc:  # noqa: BLE001 - link is a bonus; never break the view
-        print(f"[telegram] failed to render source link for {draft_id}: {exc}")
+        logger.warning("[telegram] failed to render source link for %s: %s", draft_id, exc)
 
     notes_btn = {
         "inline_keyboard": [
@@ -852,7 +855,7 @@ def send_draft_content(conn: sqlite3.Connection, client: TelegramTransport, chat
     try:
         sent = _send_long(client, chat_id, text, reply_markup=notes_btn)
     except Exception as exc:  # noqa: BLE001
-        print(f"[telegram] failed to send draft content {draft_id}: {exc}")
+        logger.error("[telegram] failed to send draft content %s: %s", draft_id, exc)
         return []
     # A+B: show the generated story image alongside the content, if present.
     try:
@@ -868,7 +871,7 @@ def send_draft_content(conn: sqlite3.Connection, client: TelegramTransport, chat
                         + (f" — prompt: {info['image_prompt']}" if info.get("image_prompt") else ""),
                     )
     except Exception as exc:  # noqa: BLE001 - image is a bonus; never break the view
-        print(f"[telegram] failed to send story image for {draft_id}: {exc}")
+        logger.error("[telegram] failed to send story image %s: %s", draft_id, exc)
     return sent
 
 
@@ -961,7 +964,7 @@ def send_copy_content(conn: sqlite3.Connection, client: TelegramTransport, chat_
     try:
         return _send_long(client, chat_id, header + "\n" + body, reply_markup=markup)
     except Exception as exc:  # noqa: BLE001
-        print(f"[telegram] failed to send copy content {draft_id}: {exc}")
+        logger.error("[telegram] failed to send copy content %s: %s", draft_id, exc)
         return []
 
 
@@ -1101,6 +1104,11 @@ def run_review_session(
     left it idles, polling for late notes/taps and newly-generated drafts.
     """
     decided = 0
+    # Set when a /command (anything other than a reply to the active draft)
+    # arrives while we're parked waiting on a draft. Lets the user interrupt a
+    # one-by-one session (e.g. they opened it by mistake, or a tap was never
+    # confirmed) instead of the bot ignoring every subsequent command.
+    command_seen = {"flag": False}
 
     def _handle(upd: dict) -> str | None:
         offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
@@ -1133,16 +1141,25 @@ def run_review_session(
             elif res and "editcopy_message_id" in res:
                 awaiting[res["draft_id"]] = {"editcopy_message_id": res["editcopy_message_id"]}
         elif "message" in upd:
-            handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
+            text = (upd["message"].get("text") or "").strip()
+            if text.startswith("/"):
+                # A command (other than a /skip or joke reply) interrupts the
+                # parked session so the bot stays responsive.
+                command_seen["flag"] = True
+                handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
+            else:
+                handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
         return None
 
     send_reviewed_summary(conn, client, chat_id)
     sent: set[str] = set()
     caught_up = False
     iters = 0
+    max_draft_iters = 2000  # safety cap so a parked draft can't wedge the loop
     while True:
         iters += 1
         if iters > max_iterations:
+            logger.warning("run_review_session hit max_iterations; returning")
             return decided
         pending = review.pending_drafts(conn)
         draft = next((d for d in pending if d["id"] not in sent), None)
@@ -1154,7 +1171,7 @@ def run_review_session(
                 for upd in client.get_updates(offset=offset_ref[0], timeout=poll_timeout):
                     _handle(upd)
             except TelegramError as exc:
-                print(f"[telegram] {exc}; retrying in 5s")
+                logger.error("[telegram] %s; retrying in 5s", exc)
                 time.sleep(5)
             continue
 
@@ -1164,14 +1181,23 @@ def run_review_session(
         # Wait for a decision on THIS draft (approve/reject/later). On approve the
         # draft leaves `pending` immediately but leaves an `awaiting` entry for the
         # joke; the drain loop below handles that before we move on.
+        draft_iters = 0
         while draft["id"] in _pending_ids(conn):
-            iters += 1
-            if iters > max_iterations:
+            draft_iters += 1
+            if draft_iters > max_draft_iters or command_seen["flag"]:
+                logger.warning(
+                    "parked on draft %s too long (iters=%d, command_seen=%s); returning to command loop",
+                    draft["id"], draft_iters, command_seen["flag"],
+                )
+                client.send_message(
+                    chat_id,
+                    f"↩️ Stepped out of reviewing `{draft['id']}`. Send /reviewdraft to resume.",
+                )
                 return decided
             try:
                 upds = client.get_updates(offset=offset_ref[0], timeout=poll_timeout)
             except TelegramError as exc:
-                print(f"[telegram] {exc}; retrying in 5s")
+                logger.error("[telegram] %s; retrying in 5s", exc)
                 time.sleep(5)
                 continue
             for upd in upds:
@@ -1181,14 +1207,23 @@ def run_review_session(
         # Decision recorded. If a joke/notes capture is now open for this draft,
         # drain it HERE — do not present the next draft until the human has had
         # their say (the editor_line is the whole point of the product).
+        draft_iters = 0
         while draft["id"] in awaiting:
-            iters += 1
-            if iters > max_iterations:
+            draft_iters += 1
+            if draft_iters > max_draft_iters or command_seen["flag"]:
+                logger.warning(
+                    "awaiting capture for draft %s too long (iters=%d); returning to command loop",
+                    draft["id"], draft_iters,
+                )
+                client.send_message(
+                    chat_id,
+                    f"↩️ Stepped out of reviewing `{draft['id']}`. Send /reviewdraft to resume.",
+                )
                 return decided
             try:
                 upds = client.get_updates(offset=offset_ref[0], timeout=poll_timeout)
             except TelegramError as exc:
-                print(f"[telegram] {exc}; retrying in 5s")
+                logger.error("[telegram] %s; retrying in 5s", exc)
                 time.sleep(5)
                 continue
             for upd in upds:
@@ -1428,7 +1463,7 @@ def run_review_bot(
             for upd in client.get_updates(offset=offset_ref[0], timeout=poll_timeout):
                 _handle(upd)
         except TelegramError as exc:
-            print(f"[telegram] {exc}; retrying in 5s")
+            logger.error("[telegram] %s; retrying in 5s", exc)
             time.sleep(5)
 
 

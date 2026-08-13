@@ -374,7 +374,15 @@ def cmd_telegram_review(args: argparse.Namespace) -> int:
     taps. With --once it processes queued updates and exits (one-shot); without
     it, it long-polls forever (run as a durable systemd --user unit).
     """
+    import logging
+
     import humorhist.telegram as tg
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logger = logging.getLogger("humorhist.telegram")
 
     chat_id = args.chat_id or os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
     if not os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
@@ -390,8 +398,9 @@ def cmd_telegram_review(args: argparse.Namespace) -> int:
         decided = tg.run_review_bot(conn, client, chat_id, once=True)
         print(f"Telegram review (once): {decided} decision(s) processed.")
         return 0
-    print("Telegram review loop started (Ctrl-C to stop)...")
+    logger.info("Telegram review loop started (chat_id=%s)", chat_id)
     tg.run_review_bot(conn, client, chat_id)
+    logger.info("Telegram review loop stopped")
     return 0
 
 

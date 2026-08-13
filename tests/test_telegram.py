@@ -915,6 +915,33 @@ def test_reject_in_review_session_counts_decision_without_joke_prompt(tmp_path):
     assert not any("one-line joke" in m["text"].lower() and "d1" in m["text"] for m in stub.sent)
 
 
+def test_review_session_yields_to_command_while_parked(tmp_path):
+    """Regression: while parked waiting on a draft (e.g. a confirm was never
+    tapped, or a joke capture is open), an inbound /command must break the
+    session back to the command loop instead of being silently swallowed -- the
+    bug that made the bot appear to 'stop responding' after a review run."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    _seed_pending(conn, "d2")
+    stub = _SeqStub(
+        [
+            _message_batch("/reviewdraft", 1),
+            _callback_batch("d1", 2),
+            _confirm_batch("d1", 2),          # confirm APPROVE d1 -> joke prompt open
+            _message_batch("/status", 3),      # a command mid-session: must interrupt
+        ]
+    )
+    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    # the approve for d1 was committed (decided==1) but the joke capture was
+    # interrupted, so the session steps out instead of wedging.
+    assert decided == 1
+    # the /status command was actually handled, not dropped on the floor
+    assert any("Review progress" in m["text"] for m in stub.sent)
+    # d1 was approved (the confirm committed) but the bot is now responsive again
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert any("Stepped out of reviewing" in m["text"] for m in stub.sent)
+
+
 def test_reject_button_cancel_keeps_approval(tmp_path):
     """Cancelling the reject confirm gate leaves the draft approved + queued."""
     conn = _fresh_db(tmp_path)
