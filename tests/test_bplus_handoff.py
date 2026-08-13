@@ -122,7 +122,10 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr("humorhist.copywriter.fill_post_copy", fake_fill)
-    monkeypatch.setattr(llm, "default_client", lambda: StubClient([{"post": "x"}]))
+    # The Telegram copy path resolves its client via resilient_client(), not
+    # default_client -- patch the resolver it actually calls so the stubbed
+    # copy is used even when no real LLM credential is present (e.g. CI).
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{"post": "x"}]))
 
     conn = _fresh_db(tmp_path)
     _seed_pending(conn)

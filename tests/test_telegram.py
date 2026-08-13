@@ -1491,7 +1491,9 @@ def test_callback_regencopy_regenerates(tmp_path, monkeypatch):
     monkeypatch.setattr("humorhist.copywriter.fill_post_copy", fake_fill)
     import humorhist.llm as llm
 
-    monkeypatch.setattr(llm, "default_client", lambda: StubClient([{"post": "x"}]))
+    # The Telegram copy path resolves its client via resilient_client(), not
+    # default_client -- patch the resolver it actually calls.
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{"post": "x"}]))
 
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)

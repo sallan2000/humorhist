@@ -190,7 +190,8 @@ def test_draft_one_is_idempotent_by_pool_id(conn, monkeypatch):
     assert len(client2.calls) == 0
 
 
-def test_draft_exists_for_pool(conn):
+def test_draft_exists_for_pool(conn, monkeypatch):
+    _stub_extract(monkeypatch)
     _add(conn, "emu", score=9)
     assert db.draft_exists_for_pool(conn, "emu") is False
     drafting.draft_one(conn, StubClient([_brief(), _angles()]), db.get_pool_item(conn, "emu"))
