@@ -290,9 +290,6 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /buffer enqueue
         → sweep approved→queue first, then the health report.
 
-    /status
-        → approved / rejected / pending breakdown + buffer level.
-
 If an LLM-backed command has no credential, you get a clean
 "⚠️ LLM unavailable: …" message instead of a crash (set HUMORHIST_LLM_API_KEY
 for unattended use).
@@ -324,11 +321,14 @@ for unattended use).
 
 **Browse and annotate approved drafts**
 
-Send **/listapproved** to see every draft you've greenlit. Tap a draft's
-**👁** button to open its full content (rendered just like the review view).
-The content message ends with an **✏️ Add notes** button — tap it to add more notes
-later: the bot prompts, you reply (or `/skip`), and the note is saved on the
-draft. Re-saving notes is idempotent and keeps the draft in the publish queue.
+Send **/listapproved** to see every draft you've greenlit. Each row has a
+**👁** button to open its full content (rendered just like the review view)
+and a **❌ Reject** button (confirm-gated) to un-approve it on the spot — so
+a mistaken Approve is reversible from chat without the CLI. Tap **👁** to open
+the draft; the content message ends with an **✏️ Add notes** button — tap it to
+add more notes later: the bot prompts, you reply (or `/skip`), and the note is
+saved on the draft. Re-saving notes is idempotent and keeps the draft in the
+publish queue.
 
 Opening an approved draft also shows its **post copy** with a live **N/280**
 char count, plus a **📝 Copy** button that jumps straight to the edit/regenerate
@@ -356,12 +356,16 @@ available); it warns (does not block) if your edit exceeds the active limit.
 
 **Telegram**
 
-    /listqueue     list queued drafts, each with its copy + char count + open button
+    /listqueue     list queued drafts, each row with ✏️ Edit copy,
+                   ↩️ Remove (keep approved), ❌ Reject (with confirm),
+                   ↩️ Reopen (back to pending)
     /viewcopy <id> open a draft's post copy with inline ✏️ Edit / 🔄 Regenerate
 
 Tap **✏️ Edit** and reply with new copy (or `/cancel` to keep the current);
 tap **🔄 Regenerate** to overwrite it with a fresh LLM draft. The stored copy is
-updated on `queue.post_copy`.
+updated on `queue.post_copy`. The ❌ Reject and ↩️ Reopen buttons let you
+fully un-approve an approved+queued draft or send it back to pending for
+re-review — all from chat (see "What you do in Telegram" above).
 
 **One-shot generation**
 
@@ -465,6 +469,18 @@ different source or spelling/case variant collapses to ONE pool row via a
 normalized-title merge (with a tie-breaker that protects already-reviewed work),
 so it yields at most one draft to review. Cross-source/cross-spelling dedup is
 now built and the live database has been de-duplicated.
+
+**Review hardening (2026-08-13):** the Telegram review surface is now fully
+undoable from chat. Approve/Reject taps open a **Confirm/Cancel gate** (GAP 3)
+so a fat-finger can't commit before you reconsider. Deferred (`/later`) drafts
+get a bring-forward path — `/listlater` lists them with a Review-now button,
+`/reviewnow [<id>]` (and a `reviewnow:` callback) clears the defer (GAP 4a).
+Approved+queued drafts missing their one-line joke (a "stuck capture") are
+surfaced as a nudge on `/status` and fixable with `/setjoke <id>` (GAP 4b).
+And an approved draft can now be un-approved or sent back to pending entirely
+from Telegram: `/listapproved` carries a ❌ Reject button and `/listqueue` rows
+carry ❌ Reject (confirm-gated) + ↩️ Reopen buttons. The CLI equivalents
+(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 299 passing.
 
 Not yet built:
 - Phase 4 publisher: turning a `queue` row into an actual posted item and
