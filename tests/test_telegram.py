@@ -496,6 +496,17 @@ def _callback_batch(draft_id, update_id=1):
     }]
 
 
+def _reject_batch(draft_id, update_id=1):
+    return [{
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb{update_id}",
+            "data": f"reject:{draft_id}",
+            "message": {"message_id": 100 + update_id},
+        },
+    }]
+
+
 def _confirm_batch(draft_id, update_id=1):
     """The second step of the GAP 3 confirm gate (confirm:<decision>:<id>)."""
     return [{
@@ -503,6 +514,17 @@ def _confirm_batch(draft_id, update_id=1):
         "callback_query": {
             "id": f"cb{update_id}",
             "data": f"confirm:approve:{draft_id}",
+            "message": {"message_id": 100 + update_id},
+        },
+    }]
+
+
+def _confirm_reject_batch(draft_id, update_id=1):
+    return [{
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb{update_id}",
+            "data": f"confirm:reject:{draft_id}",
             "message": {"message_id": 100 + update_id},
         },
     }]
@@ -799,7 +821,8 @@ def test_listqueue_shows_reject_and_reopen_buttons(tmp_path):
 def test_reject_button_from_list_unapproves_after_confirm(tmp_path):
     """End-to-end: the reject:d1 tap opens the confirm gate (GAP 3); the
     confirm:reject:d1 tap flips the approved draft to rejected and pulls it
-    out of the publish queue."""
+    out of the publish queue. A reject must NOT prompt for the one-line joke
+    (that's an approve-only capture) and must NOT store an editor_line."""
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)  # d1 approved + queued
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
@@ -814,16 +837,49 @@ def test_reject_button_from_list_unapproves_after_confirm(tmp_path):
     # still approved + queued until confirm
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
-    # 2) confirm -> rejected + dequeued
+    # 2) confirm -> rejected + dequeued; no joke prompt, no editor_line stored
+    messages_before = len(stub.sent)
     res2 = tg.handle_callback(
         conn, stub, "chat",
         {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:reject:d1",
                                             "message": {"message_id": 1}}},
     )
-    assert res2["decision"] == "reject"
+    assert res2 == {"draft_id": "d1", "decision": "reject"}  # no note_message_id
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "rejected"
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] is None
     assert any("reject" in m["text"].lower() for m in stub.sent)
+    # the only new message after confirm is the rejection confirmation (no joke prompt)
+    new_msgs = stub.sent[messages_before:]
+    assert not any("one-line joke" in m["text"].lower() for m in new_msgs)
+
+
+def test_reject_in_review_session_counts_decision_without_joke_prompt(tmp_path):
+    """In the one-by-one /reviewdraft flow, confirming a Reject increments the
+    decided count but does NOT open a joke/notes prompt (approve-only capture),
+    so the bot moves straight on to the next pending draft."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    _seed_pending(conn, "d2")
+    stub = _SeqStub([
+        _message_batch("/reviewdraft", 1),
+        _reject_batch("d1", 2),
+        _confirm_reject_batch("d1", 2),   # confirm REJECT d1
+        _callback_batch("d2", 3),
+        _confirm_batch("d2", 3),           # confirm APPROVE d2
+        _message_batch("joke for d2", 4),
+        _message_batch("/skip", 5),
+    ])
+    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    assert decided == 2  # both decisions counted, including the reject
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "rejected"
+    assert conn.execute("SELECT status FROM drafts WHERE id='d2'").fetchone()["status"] == "approved"
+    # d1 rejected -> no editor_line; d2 approved -> joke captured
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] is None
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d2'").fetchone()["editor_line"] == "joke for d2"
+    # d1's reject produced no "one-line joke" prompt
+    assert not any("one-line joke" in m["text"].lower() and "d1" in m["text"] for m in stub.sent)
+
 
 
 def test_reject_button_cancel_keeps_approval(tmp_path):

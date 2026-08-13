@@ -417,12 +417,23 @@ def handle_callback(
             client.answer_callback_query(cq["id"], text="already handled")
             return None
         client.answer_callback_query(cq["id"], text=f"{decision}d")
+        if decision == "reject":
+            # A reject needs no human-voice capture — the joke is the point of
+            # an *approve*. Just confirm and finish (no editor_line/notes prompt,
+            # no extra round-trips). The draft is already rejected + dequeued.
+            client.send_message(
+                chat_id,
+                f"🚫 Draft `{draft_id}` rejected. It's out of the queue; "
+                f"re-list it any time with /listrejected (or /reviewdraft if "
+                f"you change your mind later).",
+            )
+            return {"draft_id": draft_id, "decision": "reject"}
         # The joke is the whole point of the product: capture the human-written
         # editor_line first. A reply to this prompt becomes editor_line (which
         # also steers B+ post-copy generation); /skip leaves it blank.
         note = client.send_message(
             chat_id,
-            f"Draft `{draft_id}` {decision}d. Reply here with your one-line "
+            f"Draft `{draft_id}` approved. Reply here with your one-line "
             f"joke (the editor_line) — or send /skip to leave it blank:",
         )
         # Stash the decision so a follow-up reply knows whether to also capture
@@ -1171,14 +1182,21 @@ def run_review_session(
                 if did not in sent:
                     return None
             res = handle_callback(conn, client, chat_id, upd)
-            if res and "decision" in res and "note_message_id" in res:
+            # A committed decision (the confirm: step) carries "decision" but
+            # not "confirming"; the initial tap carries "confirming": True and
+            # must NOT count as a decision yet.
+            if res and "decision" in res and "confirming" not in res:
                 nonlocal decided
                 decided += 1
-                awaiting[res["draft_id"]] = {
-                    "note_message_id": res["note_message_id"],
-                    "stage": res.get("stage", "editor_line"),
-                    "decision": res.get("decision", "approve"),
-                }
+                # A reject (no note_message_id) just records the decision and
+                # finishes; only an approve registers a joke/notes capture prompt.
+                if "note_message_id" in res:
+                    awaiting[res["draft_id"]] = {
+                        "note_message_id": res["note_message_id"],
+                        "stage": res.get("stage", "editor_line"),
+                        "decision": res.get("decision", "approve"),
+                    }
+                    return res["draft_id"]
                 return res["draft_id"]
             elif res and "editcopy_message_id" in res:
                 awaiting[res["draft_id"]] = {
@@ -1278,14 +1296,20 @@ def run_review_bot(
         offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
         if "callback_query" in upd:
             res = handle_callback(conn, client, chat_id, upd)
-            if res and "decision" in res and "note_message_id" in res:
+            # A committed decision (the confirm: step) carries "decision" but
+            # not "confirming"; the initial tap carries "confirming": True and
+            # must NOT count as a decision yet.
+            if res and "decision" in res and "confirming" not in res:
                 nonlocal decided
                 decided += 1
-                awaiting[res["draft_id"]] = {
-                    "note_message_id": res["note_message_id"],
-                    "stage": res.get("stage", "editor_line"),
-                    "decision": res.get("decision", "approve"),
-                }
+                # A reject (no note_message_id) just records the decision and
+                # finishes; only an approve registers a joke/notes capture prompt.
+                if "note_message_id" in res:
+                    awaiting[res["draft_id"]] = {
+                        "note_message_id": res["note_message_id"],
+                        "stage": res.get("stage", "editor_line"),
+                        "decision": res.get("decision", "approve"),
+                    }
             elif res and "note_message_id" in res:
                 # notes: button from /listapproved
                 awaiting[res["draft_id"]] = {"note_message_id": res["note_message_id"]}
