@@ -127,6 +127,24 @@ def cmd_status(args: argparse.Namespace) -> int:
         for s in stuck:
             print(f"  • {s['draft_id']} {s['title']}")
         print('  Fix with: humorhist setjoke <id> "<joke>"')
+    else:
+        print("\n✅ No stuck captures (every approved+queued draft has its one-line joke).")
+
+    # Unattended-LLM readiness: the bot + daily timers draft via resilient_client(),
+    # which needs HUMORHIST_LLM_API_KEY to run without a live Hermes session.
+    from humorhist.llm import nous_auth_token
+
+    if os.environ.get("HUMORHIST_LLM_API_KEY"):
+        print("✅ Unattended LLM: HUMORHIST_LLM_API_KEY set (bot/timers draft with no session open).")
+    elif nous_auth_token():
+        print("⚠️ Unattended LLM: relying on the Nous OAuth token — only valid while a Hermes session is live.")
+        print("   Set HUMORHIST_LLM_API_KEY for /screen, /draft, auto-draft and copy-regen to run unattended.")
+    else:
+        print(
+            "⚠️ Unattended LLM: NO credential — /screen, /draft, auto-draft and copy-regen "
+            "skip when no session is open."
+        )
+        print("   Set HUMORHIST_LLM_API_KEY (see .env.example) to make the bot fully hands-off.")
     return 0
 
 
@@ -334,6 +352,89 @@ def cmd_setjoke(args: argparse.Namespace) -> int:
         print(f"Set joke for {args.draft_id}.")
     else:
         print(f"Cleared joke for {args.draft_id}.")
+    return 0
+
+
+def cmd_llm_check(args: argparse.Namespace) -> int:
+    """Report which LLM credential the bot/timers will actually use unattended.
+
+    The product's unattended paths (Telegram bot, daily buffer timer, weekly
+    pipeline) route through ``humorhist.llm.resilient_client()``, which prefers
+    ``HUMORHIST_LLM_API_KEY`` and falls back to the Nous OAuth token in
+    ``~/.hermes/auth.json`` (only valid while a Hermes session is live, expires
+    hourly). This command makes that choice visible so the "bot won't draft
+    when I'm logged out" failure mode is diagnosable without reading code.
+    """
+    from humorhist.llm import LLMUnavailable, nous_auth_token, resilient_client
+
+    static_key = os.environ.get("HUMORHIST_LLM_API_KEY")
+    if static_key:
+        print("LLM credential: HUMORHIST_LLM_API_KEY (persistent — unattended OK)")
+        print(f"  key length: {len(static_key)} chars")
+    else:
+        token = nous_auth_token()
+        if token:
+            print("LLM credential: Nous OAuth token from ~/.hermes/auth.json")
+            print("  ⚠️  Only valid while a Hermes session is live; expires hourly.")
+            print("     Set HUMORHIST_LLM_API_KEY for the bot/timers to run unattended.")
+        else:
+            print("LLM credential: NONE")
+            print("  ❌ Neither HUMORHIST_LLM_API_KEY nor a Hermes OAuth token is present.")
+            print("     /screen, /draft, auto-draft and copy-regen will skip when no session is open.")
+
+    print(f"  model: {os.environ.get('HUMORHIST_LLM_MODEL') or 'tencent/hy3:free'}")
+
+    # Prove resilient_client() actually resolves (or explain why not).
+    try:
+        client = resilient_client()
+        print(f"  resilient_client(): resolved ({type(client).__name__})")
+        return 0
+    except LLMUnavailable as exc:
+        print(f"  resilient_client(): unavailable — {exc}")
+        return 2
+
+
+def cmd_image(args: argparse.Namespace) -> int:
+    """Generate (or regenerate) the story image for an approved/queued draft.
+
+    Thin wrapper over ``humorhist.imagegen.generate_image_for_queue``: distills
+    the image prompt from the draft + pool via the LLM, renders it via FAL FLUX,
+    writes ``data/images/<draft_id>.png``, and persists ``image_prompt`` /
+    ``image_path`` on the queue row. Best-effort: a missing image key or a
+    generation failure is reported, not fatal. Style comes from
+    ``HUMORHIST_IMAGE_STYLE`` (editorial-historical | editorial-cartoon | meme).
+    """
+    import humorhist.imagegen as ig
+
+    conn = _open_db(args.db)
+    # The draft must exist and be approved (the only drafts that carry a queue row).
+    row = conn.execute("SELECT id, status FROM drafts WHERE id = ?", (args.draft_id,)).fetchone()
+    if row is None:
+        print(f"No such draft: {args.draft_id}")
+        return 1
+    if row["status"] != "approved":
+        print(
+            f"Draft {args.draft_id} is '{row['status']}', not approved/queued. "
+            "Images are generated for approved drafts only."
+        )
+        return 1
+    if not conn.execute("SELECT 1 FROM queue WHERE draft_id = ?", (args.draft_id,)).fetchone():
+        print(f"Draft {args.draft_id} has no queue row yet — approve it (or run `queue --enqueue`) first.")
+        return 1
+
+    out_dir = os.environ.get("HUMORHIST_IMAGE_DIR") or str(Path(args.db).resolve().parent / "images")
+    try:
+        result = ig.generate_image_for_queue(conn, args.draft_id, out_dir=out_dir)
+    except Exception as exc:  # noqa: BLE001 - best-effort; report, don't crash
+        print(f"Image generation failed for {args.draft_id}: {exc}")
+        return 2
+    if result is None:
+        print("Image not generated: no HUMORHIST_IMAGE_API_KEY (story images stay skipped). Set it to enable.")
+        return 2
+    path, prompt = result
+    print(f"Image generated for {args.draft_id}:")
+    print(f"  path:   {path}")
+    print(f"  prompt: {prompt}")
     return 0
 
 
@@ -660,6 +761,13 @@ def build_parser() -> argparse.ArgumentParser:
     sj.add_argument("draft_id", help="the approved draft id")
     sj.add_argument("joke", nargs="*", default=[], help="the joke text (omit to clear)")
     sj.set_defaults(func=cmd_setjoke)
+
+    lk = sub.add_parser("llm-check", help="show which LLM credential the bot/timers use unattended")
+    lk.set_defaults(func=cmd_llm_check)
+
+    im = sub.add_parser("image", help="(re)generate the story image for an approved/queued draft")
+    im.add_argument("draft_id", help="the approved draft id to (re)image")
+    im.set_defaults(func=cmd_image)
 
     sg = sub.add_parser("suggest", help="add an editor-suggested event to the pool")
     sg.add_argument("topic", help="the event/topic to suggest")

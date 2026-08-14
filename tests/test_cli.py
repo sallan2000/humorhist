@@ -556,3 +556,141 @@ def test_main_dispatches_command_rc(dbpath, capsys):
     # main() should return the command's rc, not swallow it.
     rc = main(["--db", dbpath, "show", "nope"])
     assert rc == 1  # show with no matching draft returns 1
+
+
+# --- llm-check (B: unattended-credential diagnostics) ------------------------
+
+
+def test_llm_check_reports_unavailable_without_key(dbpath, monkeypatch, capsys):
+    from humorhist.cli import cmd_llm_check
+
+    # No static key, and no Hermes auth token -> resilient_client() must fail.
+    monkeypatch.delenv("HUMORHIST_LLM_API_KEY", raising=False)
+    monkeypatch.setattr("humorhist.llm.nous_auth_token", lambda: None)
+    rc = cmd_llm_check(argparse.Namespace(db=dbpath))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "NONE" in out
+    assert "resilient_client(): unavailable" in out
+
+
+def test_llm_check_reports_static_key(dbpath, monkeypatch, capsys):
+    from humorhist.cli import cmd_llm_check
+    from humorhist.llm import StubClient
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "sk-test-123")
+    # resilient_client() resolves to a NousClient; monkeypatch it to a stub so
+    # the command's "did it resolve?" probe doesn't hit the network.
+    monkeypatch.setattr("humorhist.llm.NousClient", lambda *a, **k: StubClient([{"post": "x"}]))
+    rc = cmd_llm_check(argparse.Namespace(db=dbpath))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "HUMORHIST_LLM_API_KEY" in out
+    assert "unattended OK" in out
+
+
+def test_llm_check_parser_registered():
+    args = build_parser().parse_args(["llm-check"])
+    assert callable(args.func)
+
+
+# --- image (C(iii): on-demand story-image regenerate) ------------------------
+
+
+def _seed_approved_queued_only(dbpath):
+    """An approved draft with a queue row but NO image yet (the re-gen target)."""
+    conn = db.connect(dbpath)
+    db.upsert_pool_item(
+        conn, id="p1", title="The Emu War", year=1932, date_hint=None,
+        summary=None, source_url=None, source_name=None,
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1','{}','{}','approved','2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO queue (draft_id, scheduled_for, published, post_copy, image_path) "
+        "VALUES ('d1', NULL, 0, 'Australia lost to emus.', NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_image_generates_and_persists(dbpath, monkeypatch, capsys):
+    from pathlib import Path
+
+    from humorhist import db as dbmod
+    from humorhist.cli import cmd_image
+    from humorhist.imagegen import StubImageClient
+
+    _seed_approved_queued_only(dbpath)
+
+    def fake_gen(conn, draft_id, *, out_dir, llm_client=None):
+        # Mirror the real generate_image_for_queue: write the PNG and persist
+        # image_path + image_prompt on the queue row, then return (path, prompt).
+        p = Path(out_dir) / f"{draft_id}.png"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"img")
+        dbmod.set_image(conn, draft_id, image_prompt="a comically defeated army of emus", image_path=str(p))
+        return (str(p), "a comically defeated army of emus")
+
+    monkeypatch.setattr("humorhist.imagegen.generate_image_for_queue", fake_gen)
+    monkeypatch.setattr("humorhist.imagegen.resilient_image_client", lambda *a, **k: StubImageClient([b"img"]))
+
+    rc = cmd_image(argparse.Namespace(db=dbpath, draft_id="d1"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Image generated for d1" in out
+    conn = db.connect(dbpath)
+    row = conn.execute("SELECT image_path, image_prompt FROM queue WHERE draft_id='d1'").fetchone()
+    conn.close()
+    assert row["image_path"] is not None
+    assert row["image_prompt"] == "a comically defeated army of emus"
+
+
+def test_image_rejects_unknown_draft(dbpath, capsys):
+    from humorhist.cli import cmd_image
+
+    rc = cmd_image(argparse.Namespace(db=dbpath, draft_id="ghost"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "No such draft" in out
+
+
+def test_image_rejects_non_approved(dbpath, capsys):
+    from humorhist.cli import cmd_image
+
+    conn = db.connect(dbpath)
+    db.upsert_pool_item(
+        conn, id="p1", title="X", year=None, date_hint=None,
+        summary=None, source_url=None, source_name=None,
+    )
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
+        "VALUES ('d1','p1','{}','{}','pending','2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    rc = cmd_image(argparse.Namespace(db=dbpath, draft_id="d1"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "pending" in out
+
+
+def test_image_skips_when_no_image_key(dbpath, monkeypatch, capsys):
+    from humorhist.cli import cmd_image
+
+    _seed_approved_queued_only(dbpath)
+    # Real generate_image_for_queue returns None on a missing credential
+    # (it swallows ImageUnavailable internally); it never raises.
+    monkeypatch.setattr("humorhist.imagegen.generate_image_for_queue", lambda *a, **k: None)
+    rc = cmd_image(argparse.Namespace(db=dbpath, draft_id="d1"))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "HUMORHIST_IMAGE_API_KEY" in out
+
+
+def test_image_parser_registered():
+    args = build_parser().parse_args(["image", "d1"])
+    assert args.draft_id == "d1"
+    assert callable(args.func)

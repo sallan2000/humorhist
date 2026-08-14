@@ -1794,3 +1794,65 @@ def test_queue_remove_pulls_draft_back(tmp_path, monkeypatch):
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
     # draft stays approved (not deleted)
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+
+
+# --- /image command --------------------------------------------------------
+
+
+def test_image_command_generates_and_sends(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    import humorhist.db as db
+    import humorhist.imagegen as ig
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+
+    def fake_gen(c, draft_id, *, out_dir, llm_client=None):
+        # Mirror the real function: write the PNG and persist, then return (path, prompt).
+        p = Path(out_dir) / f"{draft_id}.png"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"imgbytes")
+        db.set_image(c, draft_id, image_prompt="a comically defeated army of emus", image_path=str(p))
+        return (str(p), "a comically defeated army of emus")
+
+    monkeypatch.setattr("humorhist.imagegen.generate_image_for_queue", fake_gen)
+    monkeypatch.setattr(
+        "humorhist.imagegen.resilient_image_client",
+        lambda *a, **k: ig.StubImageClient([b"imgbytes"]),
+    )
+
+    stub = tg.StubTelegram(updates=_message_batch("/image d1", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    # prompt message + a sent photo
+    assert any("Image ready for `d1`" in m["text"] for m in stub.sent)
+    assert any(m.get("photo") == b"imgbytes" for m in stub.sent)
+
+
+def test_image_command_rejects_unknown_draft(tmp_path, monkeypatch):
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram(updates=_message_batch("/image ghost", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("No such draft" in m["text"] for m in stub.sent)
+
+
+def test_image_command_skips_without_key(tmp_path, monkeypatch):
+    import humorhist.llm as llm
+    from humorhist.llm import StubClient
+
+    monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    # Real generate_image_for_queue returns None on a missing credential.
+    monkeypatch.setattr("humorhist.imagegen.generate_image_for_queue", lambda *a, **k: None)
+    stub = tg.StubTelegram(updates=_message_batch("/image d1", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("HUMORHIST_IMAGE_API_KEY" in m["text"] for m in stub.sent)

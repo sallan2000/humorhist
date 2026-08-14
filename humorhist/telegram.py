@@ -732,6 +732,7 @@ HELP_TEXT = (
     "/queue - list the publish queue (approved+queued drafts)\n"
     "/queue enqueue - sweep approved drafts into the queue\n"
     "/queue remove <id> - pull a draft back out of the queue (kept approved)\n"
+    "/image <id> - (re)generate the story image for an approved+queued draft\n"
     "/status - approved / rejected / pending breakdown (+ stuck-capture nudge)\n"
     "/help - this message\n\n"
     "The bot also nudges you with 🆕 N new draft(s) when fresh drafts appear."
@@ -1014,6 +1015,60 @@ def telegram_screen(conn, client, chat_id, *, batch_size: int = 20, limit: int |
         client.send_message(chat_id, f"⚠️ Screening error: {exc}")
         return
     client.send_message(chat_id, f"🔍 Screened. {result}")
+
+
+def telegram_image(conn, client, chat_id, draft_id: str | None) -> None:
+    """Inbound /image: (re)generate the story image for an approved+queued draft.
+
+    Thin wrapper over ``humorhist.imagegen.generate_image_for_queue`` — the same
+    best-effort path the publish/enqueue step uses. Useful from the phone to
+    retry a failed/billed-out FAL call, or to regenerate with a different
+    ``HUMORHIST_IMAGE_STYLE``. No DB migration needed (the image columns already
+    exist on the queue row).
+    """
+    if not draft_id:
+        client.send_message(chat_id, "Usage: /image <draft_id>")
+        return
+    row = conn.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if row is None:
+        client.send_message(chat_id, f"⚠️ No such draft: `{draft_id}`.")
+        return
+    if row["status"] != "approved":
+        client.send_message(
+            chat_id,
+            f"⚠️ `{draft_id}` is '{row['status']}', not approved/queued. Images are generated for approved drafts only.",
+        )
+        return
+    if not conn.execute("SELECT 1 FROM queue WHERE draft_id = ?", (draft_id,)).fetchone():
+        client.send_message(
+            chat_id,
+            f"⚠️ `{draft_id}` has no queue row yet — approve it (or /queue enqueue) first.",
+        )
+        return
+    client.send_message(chat_id, f"🖼️ Generating story image for `{draft_id}`…")
+    try:
+        from humorhist import imagegen as ig
+
+        # _resolve_image_dir falls back to <repo>/data/images; the str() default
+        # covers its documented "shouldn't happen" None so we never pass None.
+        out_dir = _resolve_image_dir(None) or str(Path(__file__).resolve().parent.parent / "data" / "images")
+        result = ig.generate_image_for_queue(conn, draft_id, out_dir=out_dir)
+    except Exception as exc:  # noqa: BLE001 - report, don't crash the loop
+        client.send_message(chat_id, f"⚠️ Image generation failed for `{draft_id}`: {exc}")
+        return
+    if result is None:
+        client.send_message(
+            chat_id,
+            "🖼️ Story image skipped — no HUMORHIST_IMAGE_API_KEY set. Set it to enable images (post copy unaffected).",
+        )
+        return
+    path, prompt = result
+    client.send_message(chat_id, f"🖼️ Image ready for `{draft_id}`:\n{prompt}")
+    try:
+        with open(path, "rb") as fh:
+            client.send_photo(chat_id, fh.read(), caption=f"🖼️ Story image for `{draft_id}`")
+    except Exception as exc:  # noqa: BLE001 - photo is a bonus; the prompt + path are persisted
+        logger.warning("[telegram] failed to send image for %s: %s", draft_id, exc)
 
 
 def telegram_buffer(conn, client, chat_id, *, enqueue: bool = False, auto_draft: bool = True) -> None:
@@ -1422,6 +1477,10 @@ def run_review_bot(
                 telegram_queue(conn, client, chat_id, action="remove", draft_id=bits[1] if len(bits) > 1 else None)
             else:
                 telegram_queue(conn, client, chat_id, action=action)
+        elif cmd == "/image":
+            # /image <id>  -> (re)generate the story image for an approved+queued draft
+            rest = text.split(maxsplit=1)
+            telegram_image(conn, client, chat_id, rest[1].strip() if len(rest) > 1 else None)
         elif cmd in ("/help", "/start"):
             client.send_message(chat_id, HELP_TEXT)
         else:
