@@ -3,3 +3,5 @@ httpx
 [dev]
 pytest
 respx
+ruff
+bandit

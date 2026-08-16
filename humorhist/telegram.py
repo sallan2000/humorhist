@@ -749,7 +749,10 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     if not rows:
         client.send_message(chat_id, "No approved drafts yet.")
         return 0
-    lines = ["✅ Approved drafts (tap to open; #id is the draft number):"]
+    lines = [
+        "✅ Approved drafts (tap to open; #id is the draft number):",
+        "  👁 Open draft   ❌ Reject (confirm-gated, sends back to pending)",
+    ]
     keyboard = []
     for r in rows:
         title = r["title"] or "(unknown)"
@@ -757,8 +760,8 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
         lines.append(f"  • #{did} {title}")
         keyboard.append(
             [
-                {"text": f"👁 #{did} {title[:20]}", "callback_data": f"view:{did}"},
-                {"text": f"❌ Reject {did}", "callback_data": f"reject:{did}"},
+                {"text": f"👁 Open: {title[:18]} (#{did})", "callback_data": f"view:{did}"},
+                {"text": f"❌ Reject #{did}", "callback_data": f"reject:{did}"},
             ]
         )
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
@@ -775,13 +778,16 @@ def send_rejected_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     if not rows:
         client.send_message(chat_id, "No rejected drafts.")
         return 0
-    lines = ["❌ Rejected drafts (tap to reopen for re-review; #id is the draft number):"]
+    lines = [
+        "❌ Rejected drafts (tap to send one back to pending for re-review; #id is the draft number):",
+        "  ↩️ Reopen to pending",
+    ]
     keyboard = []
     for r in rows:
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
         lines.append(f"  • #{did} {title}")
-        keyboard.append([{"text": f"↩️ Reopen #{did}", "callback_data": f"reopen:{did}"}])
+        keyboard.append([{"text": f"↩️ Reopen: {title[:18]} (#{did})", "callback_data": f"reopen:{did}"}])
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
@@ -797,13 +803,16 @@ def send_deferred_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     if not rows:
         client.send_message(chat_id, "No deferred drafts. (/later defers one 30 days.)")
         return 0
-    lines = ["⏸ Deferred drafts (tap to bring one forward for review; #id is the draft number):"]
+    lines = [
+        "⏸ Deferred drafts (tap to clear the 30-day wait and bring one back to review now; #id is the draft number):",
+        "  ⏩ Review now",
+    ]
     keyboard = []
     for r in rows:
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
         lines.append(f"  • #{did} {title}")
-        keyboard.append([{"text": f"⏩ Review now #{did}", "callback_data": f"reviewnow:{did}"}])
+        keyboard.append([{"text": f"⏩ Review now: {title[:16]} (#{did})", "callback_data": f"reviewnow:{did}"}])
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
@@ -898,6 +907,7 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         client.send_message(chat_id, "Queue is empty (nothing approved + queued).")
         return 0
     lines = [f"📋 Queued drafts ({len(rows)}) — edit copy before publishing (#id = draft number):"]
+    lines.append("  ✏️ Edit copy   🗑 Remove from queue   ❌ Reject draft (confirm)   ↩️ Reopen to pending")
     keyboard: list[list[dict]] = []
     for r in rows:
         title = r["title"] or "(unknown)"
@@ -913,18 +923,19 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         link = db.get_source_link(conn, did)
         if link:
             lines.append(f"    🔗 {db.shorten_url(link, shorten=False)}")
+        # Row 1: edit copy + remove from queue (distinct icons; 'Remove' no longer
+        # shares the ↩️ glyph with 'Reopen').
         keyboard.append(
             [
-                {"text": f"✏️ #{did} {title[:18]}", "callback_data": f"copy:{did}"},
-                {"text": "↩️ Remove", "callback_data": f"remove:{did}"},
+                {"text": f"✏️ Edit copy #{did}", "callback_data": f"copy:{did}"},
+                {"text": f"🗑 Remove #{did}", "callback_data": f"remove:{did}"},
             ]
         )
-        # Second row: reject (with confirm gate) + reopen-to-pending, so an
-        # approved draft can be un-approved entirely from Telegram without the CLI.
+        # Row 2: reject (confirm-gated) + reopen to pending.
         keyboard.append(
             [
-                {"text": f"❌ Reject {did}", "callback_data": f"reject:{did}"},
-                {"text": f"↩️ Reopen {did}", "callback_data": f"reopen:{did}"},
+                {"text": f"❌ Reject #{did}", "callback_data": f"reject:{did}"},
+                {"text": f"↩️ Reopen #{did}", "callback_data": f"reopen:{did}"},
             ]
         )
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})

@@ -848,6 +848,53 @@ def test_listqueue_shows_reject_and_reopen_buttons(tmp_path):
     assert "reopen:d1" in cbs  # new
 
 
+def test_queue_list_buttons_are_self_explanatory(tmp_path):
+    """Label-clarity regression: every /listqueue button must carry the draft
+    title (or at least the #id) AND a verb that states its consequence, and the
+    two opposite buttons (Remove vs Reopen) must NOT share the same glyph.
+    This guards the fix for the 'wall of cryptic ID buttons' complaint."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)  # title 'Pastry War', id 'd1'
+    stub = tg.StubTelegram()
+    tg.send_queue_list(conn, stub, "chat")
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"]
+    all_text = [b["text"] for row in kb for b in row]
+    # title present somewhere on every button
+    assert all("d1" in t for t in all_text), all_text
+    assert any("Pastry War" in t or "Edit copy" in t for t in all_text)
+    # distinct glyphs: Remove no longer reuses the Reopen (↩️) glyph
+    assert any(t.startswith("🗑") for t in all_text), all_text
+    assert any(t.startswith("↩️") for t in all_text), all_text
+    # verbs spell out consequence
+    assert any("Remove" in t for t in all_text)
+    assert any("Reopen" in t for t in all_text)
+    assert any("Reject" in t for t in all_text)
+
+
+def test_listrejected_button_names_draft_and_action(tmp_path):
+    """Label-clarity regression: a /listrejected button names the draft title
+    (not just #id) and spells out 'Reopen' as the action."""
+    conn = _fresh_db(tmp_path)
+    _seed_rejected(conn)
+    stub = tg.StubTelegram()
+    tg.send_rejected_list(conn, stub, "chat")
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"]
+    all_text = [b["text"] for row in kb for b in row]
+    assert any("Reopen" in t and "d1" in t for t in all_text), all_text
+
+
+def test_listlater_button_names_draft_and_action(tmp_path):
+    """Label-clarity regression: a /listlater button names the draft title and
+    spells out 'Review now' as the action."""
+    conn = _fresh_db(tmp_path)
+    _seed_deferred(conn)
+    stub = tg.StubTelegram()
+    tg.send_deferred_list(conn, stub, "chat")
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"]
+    all_text = [b["text"] for row in kb for b in row]
+    assert any("Review now" in t and "d1" in t for t in all_text), all_text
+
+
 def test_reject_button_from_list_unapproves_after_confirm(tmp_path):
     """End-to-end: the reject:d1 tap opens the confirm gate (GAP 3); the
     confirm:reject:d1 tap flips the approved draft to rejected and pulls it
