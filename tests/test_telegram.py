@@ -571,10 +571,12 @@ def test_run_review_bot_one_by_one(tmp_path):
             _confirm_batch("d1", 2),
             _message_batch("joke for d1", 3),
             _message_batch("/skip", 4),
-            _callback_batch("d2", 5),
-            _confirm_batch("d2", 5),
-            _message_batch("joke for d2", 6),
-            _message_batch("/skip", 7),
+            # re-enter the (non-modal) review to pull the next pending draft
+            _message_batch("/reviewdraft", 5),
+            _callback_batch("d2", 6),
+            _confirm_batch("d2", 6),
+            _message_batch("joke for d2", 7),
+            _message_batch("/skip", 8),
         ]
     )
     decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
@@ -595,6 +597,41 @@ def test_run_review_bot_one_by_one(tmp_path):
     assert sum("confirm:approve:d2" in str(m) for m in button_msgs) == 1
 
 
+def test_next_button_advances_to_next_draft(tmp_path):
+    """The non-modal review: tapping the ⏭ Next button (callback next:<id>)
+    pulls the next pending draft without typing /reviewdraft again."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    _seed_pending(conn, "d2")
+    # approve d1, confirm, skip joke -> then tap Next to advance to d2
+    stub = _SeqStub(
+        [
+            _message_batch("/reviewdraft", 1),
+            _callback_batch("d1", 2),
+            _confirm_batch("d1", 2),
+            _message_batch("/skip", 3),
+            # tap the Next button (re-enters the session for the next pending draft)
+            [
+                {
+                    "update_id": 4,
+                    "callback_query": {
+                        "id": "cb4",
+                        "data": "next:d1",
+                        "message": {"message_id": 104},
+                    },
+                }
+            ],
+            _callback_batch("d2", 5),
+            _confirm_batch("d2", 5),
+            _message_batch("/skip", 6),
+        ]
+    )
+    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    assert decided == 2
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+    assert conn.execute("SELECT status FROM drafts WHERE id='d2'").fetchone()["status"] == "approved"
+
+
 def test_review_session_waits_for_joke_before_next_draft(tmp_path):
     """Approve must NOT race the next draft: d2's buttons appear only after d1's
     editor_line (joke) + notes capture is complete."""
@@ -611,7 +648,7 @@ def test_review_session_waits_for_joke_before_next_draft(tmp_path):
             return self._batches.pop(0) if self._batches else []
 
     # /reviewdraft -> approve d1 -> CONFIRM d1 -> joke -> /skip notes ->
-    # approve d2 -> CONFIRM d2 -> joke -> /skip
+    # /reviewdraft (pull next) -> approve d2 -> CONFIRM d2 -> joke -> /skip
     stub = _ScriptStub(
         [
             _message_batch("/reviewdraft", 1),
@@ -619,10 +656,11 @@ def test_review_session_waits_for_joke_before_next_draft(tmp_path):
             _confirm_batch("d1", 2),
             _message_batch("the emus did nothing wrong", 3),  # editor_line reply
             _message_batch("/skip", 4),  # end notes capture
-            _callback_batch("d2", 5),
-            _confirm_batch("d2", 5),
-            _message_batch("and the humans lost", 6),
-            _message_batch("/skip", 7),
+            _message_batch("/reviewdraft", 5),  # advance to the next pending draft
+            _callback_batch("d2", 6),
+            _confirm_batch("d2", 6),
+            _message_batch("and the humans lost", 7),
+            _message_batch("/skip", 8),
         ]
     )
     decided = tg.run_review_bot(conn, stub, "chat", max_iterations=60)
@@ -962,11 +1000,12 @@ def test_reject_in_review_session_counts_decision_without_joke_prompt(tmp_path):
     assert not any("one-line joke" in m["text"].lower() and "d1" in m["text"] for m in stub.sent)
 
 
-def test_review_session_yields_to_command_while_parked(tmp_path):
-    """Regression: while parked waiting on a draft (e.g. a confirm was never
-    tapped, or a joke capture is open), an inbound /command must break the
-    session back to the command loop instead of being silently swallowed -- the
-    bug that made the bot appear to 'stop responding' after a review run."""
+def test_review_command_while_capture_open_stays_responsive(tmp_path):
+    """Non-modal regression: while a joke capture is open (after an Approve
+    confirm), an inbound /command must be handled immediately and the bot must
+    NOT emit a 'Stepped out' message -- there is no parked loop to escape from
+    anymore. The joke capture simply waits for the reply via the idle
+    handle_text path."""
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     _seed_pending(conn, "d2")
@@ -975,18 +1014,18 @@ def test_review_session_yields_to_command_while_parked(tmp_path):
             _message_batch("/reviewdraft", 1),
             _callback_batch("d1", 2),
             _confirm_batch("d1", 2),          # confirm APPROVE d1 -> joke prompt open
-            _message_batch("/status", 3),      # a command mid-session: must interrupt
+            _message_batch("/status", 3),      # a command mid-capture: handled immediately
         ]
     )
     decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
-    # the approve for d1 was committed (decided==1) but the joke capture was
-    # interrupted, so the session steps out instead of wedging.
+    # the approve for d1 was committed
     assert decided == 1
     # the /status command was actually handled, not dropped on the floor
     assert any("Review progress" in m["text"] for m in stub.sent)
-    # d1 was approved (the confirm committed) but the bot is now responsive again
+    # d1 was approved
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
-    assert any("Stepped out of reviewing" in m["text"] for m in stub.sent)
+    # NEW: no 'Stepped out' message -- the bot is non-modal and never parks
+    assert not any("Stepped out of reviewing" in m["text"] for m in stub.sent)
 
 
 def test_reject_button_cancel_keeps_approval(tmp_path):

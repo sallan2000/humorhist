@@ -256,12 +256,31 @@ class TelegramClient:
 
 
 def _keyboard(draft_id: str) -> dict:
+    # The Next button advances the one-by-one review WITHOUT a parked modal
+    # loop: after deciding this draft the user taps Next (or sends /reviewdraft
+    # again) to pull the next pending draft from the command loop. This keeps
+    # /reviewdraft non-modal — the bot stays responsive to other commands the
+    # whole time instead of swallowing the user until every draft is done.
     return {
         "inline_keyboard": [
             [
                 {"text": "✅ Approve", "callback_data": f"approve:{draft_id}"},
                 {"text": "❌ Reject", "callback_data": f"reject:{draft_id}"},
                 {"text": "⏸ Later", "callback_data": f"later:{draft_id}"},
+            ],
+            [
+                {"text": "⏭ Next draft ▶️", "callback_data": f"next:{draft_id}"},
+            ],
+        ]
+    }
+
+
+def _next_keyboard(draft_id: str) -> dict:
+    """Keyboard for the 'no more pending' state shown after the last draft."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "⏭ Review more ▶️", "callback_data": f"next:{draft_id}"},
             ]
         ]
     }
@@ -321,10 +340,6 @@ def _send_long(client: TelegramTransport, chat_id: str, text: str, reply_markup:
 # --------------------------------------------------------------------------- #
 # Review transport logic (transport-agnostic)                                 #
 # --------------------------------------------------------------------------- #
-
-
-def _pending_ids(conn: sqlite3.Connection) -> set[str]:
-    return {d["id"] for d in review.pending_drafts(conn)}
 
 
 def _send_one(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, row: dict) -> list[dict]:
@@ -743,7 +758,8 @@ HELP_TEXT = (
     "/draft [count] [min_score] - fact-check + generate angles for top candidates\n"
     "/suggest <topic> - add an editor-suggested event to the pool\n\n"
     "REVIEW\n"
-    "/reviewdraft - review pending drafts one by one (each tap opens a Confirm/Cancel gate)\n"
+    "/reviewdraft - show the next pending draft (non-modal)\n"
+    "    tap the ⏭ Next button (or send /reviewdraft again) to advance; each tap opens a Confirm/Cancel gate\n"
     "/reviewdraft fast - same, but commits on the first tap (no gate); undo via /listapproved or /listqueue\n"
     "    each draft has ✅ Approve / ❌ Reject / ⏸ Later buttons\n"
     "    on Approve confirm, the bot asks for your one-line joke, then notes\n"
@@ -1215,138 +1231,37 @@ def run_review_session(
     image_dir: str | None = None,
     fast: bool = False,
 ) -> int:
-    """The one-draft-at-a-time review flow, triggered by /reviewdraft.
+    """Show the NEXT pending draft (one at a time) and return immediately.
 
-    Sends the 📊 progress block, then one pending draft with Approve/Reject
-    buttons, waits for the tap (and optional note), then the next. When none are
-    left it idles, polling for late notes/taps and newly-generated drafts.
+    This is deliberately NON-modal: it sends a single pending draft with its
+    Approve/Reject/Later + Next buttons and returns to the caller (the idle
+    ``run_review_bot`` command loop). The user decides via the buttons, and
+    advances with the ⏭ Next button (or by sending /reviewdraft again) — both
+    re-enter this function to pull the next pending draft.
+
+    Why one-shot: the old version parked in a ``while`` loop that swallowed the
+    user until every draft was decided or a /command bailed them out. That made
+    the bot feel dead mid-review. Now the bot is responsive the whole time;
+    joke/notes capture is handled by the normal idle ``handle_text`` path via
+    the ``awaiting`` map, so a half-finished capture simply waits for the reply
+    instead of blocking the loop.
+
+    Returns 0 — decisions are counted by the caller's idle ``_handle`` when the
+    confirm/cancel gate actually commits, not here.
     """
-    decided = 0
-    # Set when a /command (anything other than a reply to the active draft)
-    # arrives while we're parked waiting on a draft. Lets the user interrupt a
-    # one-by-one session (e.g. they opened it by mistake, or a tap was never
-    # confirmed) instead of the bot ignoring every subsequent command.
-    command_seen = {"flag": False}
-
-    def _handle(upd: dict) -> str | None:
-        offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
-        if "callback_query" in upd:
-            data = (upd.get("callback_query") or {}).get("data") or ""
-            # One-at-a-time: a decision for a draft we haven't shown yet can't be a
-            # real tap. Ignore it so it neither approves prematurely nor gets
-            # swallowed before that draft is presented.
-            if data.startswith(("approve:", "reject:", "later:")):
-                _, _, did = data.partition(":")
-                if did not in sent:
-                    return None
-            res = handle_callback(conn, client, chat_id, upd, fast=fast)
-            # A committed decision (the confirm: step) carries "decision" but
-            # not "confirming"; the initial tap carries "confirming": True and
-            # must NOT count as a decision yet.
-            if res and "decision" in res and "confirming" not in res:
-                nonlocal decided
-                decided += 1
-                # A reject (no note_message_id) just records the decision and
-                # finishes; only an approve registers a joke/notes capture prompt.
-                if "note_message_id" in res:
-                    awaiting[res["draft_id"]] = {
-                        "note_message_id": res["note_message_id"],
-                        "stage": res.get("stage", "editor_line"),
-                        "decision": res.get("decision", "approve"),
-                    }
-                    return res["draft_id"]
-                return res["draft_id"]
-            elif res and "editcopy_message_id" in res:
-                awaiting[res["draft_id"]] = {"editcopy_message_id": res["editcopy_message_id"]}
-        elif "message" in upd:
-            text = (upd["message"].get("text") or "").strip()
-            if text.startswith("/"):
-                # A command (other than a /skip or joke reply) interrupts the
-                # parked session so the bot stays responsive.
-                command_seen["flag"] = True
-                handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
-            else:
-                handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
-        return None
-
     send_reviewed_summary(conn, client, chat_id)
-    sent: set[str] = set()
-    caught_up = False
-    iters = 0
-    max_draft_iters = 2000  # safety cap so a parked draft can't wedge the loop
-    while True:
-        iters += 1
-        if iters > max_iterations:
-            logger.warning("run_review_session hit max_iterations; returning")
-            return decided
-        pending = review.pending_drafts(conn)
-        draft = next((d for d in pending if d["id"] not in sent), None)
-        if draft is None:
-            if not caught_up:
-                client.send_message(chat_id, "✅ All caught up — no drafts pending.")
-                caught_up = True
-            try:
-                for upd in client.get_updates(offset=offset_ref[0], timeout=poll_timeout):
-                    _handle(upd)
-            except TelegramError as exc:
-                logger.error("[telegram] %s; retrying in 5s", exc)
-                time.sleep(5)
-            continue
-
-        _send_one(conn, client, chat_id, draft)
-        sent.add(draft["id"])
-        caught_up = False
-        # Wait for a decision on THIS draft (approve/reject/later). On approve the
-        # draft leaves `pending` immediately but leaves an `awaiting` entry for the
-        # joke; the drain loop below handles that before we move on.
-        draft_iters = 0
-        while draft["id"] in _pending_ids(conn):
-            draft_iters += 1
-            if draft_iters > max_draft_iters or command_seen["flag"]:
-                logger.warning(
-                    "parked on draft %s too long (iters=%d, command_seen=%s); returning to command loop",
-                    draft["id"], draft_iters, command_seen["flag"],
-                )
-                client.send_message(
-                    chat_id,
-                    f"↩️ Stepped out of reviewing `{draft['id']}`. Send /reviewdraft to resume.",
-                )
-                return decided
-            try:
-                upds = client.get_updates(offset=offset_ref[0], timeout=poll_timeout)
-            except TelegramError as exc:
-                logger.error("[telegram] %s; retrying in 5s", exc)
-                time.sleep(5)
-                continue
-            for upd in upds:
-                rid = _handle(upd)
-                if rid == draft["id"]:
-                    break
-        # Decision recorded. If a joke/notes capture is now open for this draft,
-        # drain it HERE — do not present the next draft until the human has had
-        # their say (the editor_line is the whole point of the product).
-        draft_iters = 0
-        while draft["id"] in awaiting:
-            draft_iters += 1
-            if draft_iters > max_draft_iters or command_seen["flag"]:
-                logger.warning(
-                    "awaiting capture for draft %s too long (iters=%d); returning to command loop",
-                    draft["id"], draft_iters,
-                )
-                client.send_message(
-                    chat_id,
-                    f"↩️ Stepped out of reviewing `{draft['id']}`. Send /reviewdraft to resume.",
-                )
-                return decided
-            try:
-                upds = client.get_updates(offset=offset_ref[0], timeout=poll_timeout)
-            except TelegramError as exc:
-                logger.error("[telegram] %s; retrying in 5s", exc)
-                time.sleep(5)
-                continue
-            for upd in upds:
-                _handle(upd)
-    return decided
+    pending = review.pending_drafts(conn)
+    draft = next(iter(pending), None)
+    if draft is None:
+        client.send_message(
+            chat_id,
+            "✅ All caught up — no drafts pending. Send /reviewdraft any time "
+            "to check again (new drafts from /draft or the daily timer will "
+            "appear here).",
+        )
+        return 0
+    _send_one(conn, client, chat_id, draft)
+    return 0
 
 
 def run_review_bot(
@@ -1363,7 +1278,7 @@ def run_review_bot(
 
     Idles and reacts to ``/commands`` instead of pushing drafts on startup:
 
-      /reviewdraft  -> start the one-by-one review flow (run_review_session)
+      /reviewdraft  -> show the next pending draft (non-modal; tap ⏭ Next or send /reviewdraft again to advance)
       /listapproved -> list approved drafts; tap one to open its content
       /status       -> reviewed/pending breakdown
       /help, /start -> this message
@@ -1377,6 +1292,22 @@ def run_review_bot(
 
     def _handle(upd: dict) -> None:
         offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
+        # ⏭ Next button: re-enter the (non-modal) review session to pull the
+        # next pending draft, without the user typing /reviewdraft again.
+        if "callback_query" in upd:
+            data = (upd.get("callback_query") or {}).get("data") or ""
+            if data.startswith("next:"):
+                run_review_session(
+                    conn,
+                    client,
+                    chat_id,
+                    awaiting,
+                    offset_ref,
+                    poll_timeout=poll_timeout,
+                    max_iterations=max_iterations,
+                    image_dir=image_dir,
+                )
+                return
         if "callback_query" in upd:
             res = handle_callback(conn, client, chat_id, upd)
             # A committed decision (the confirm: step) carries "decision" but
@@ -1405,7 +1336,15 @@ def run_review_bot(
             return
         text = (msg.get("text") or "").strip()
         if text.startswith("/"):
-            _dispatch(text)
+            # /skip and /cancel are replies to an in-flight joke/notes/edit-copy
+            # prompt (tracked in `awaiting`), NOT bot commands. Route them to
+            # handle_text so the prompt resolves instead of being swallowed by
+            # _dispatch as an "Unknown command" (which would leak the awaiting
+            # entry and wedge later prompts).
+            if text in ("/skip", "/cancel") and awaiting:
+                handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
+            else:
+                _dispatch(text)
             return
         handle_text(conn, client, chat_id, awaiting, upd, image_dir=image_dir)
 
