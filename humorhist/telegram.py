@@ -350,7 +350,14 @@ def send_pending_drafts(conn: sqlite3.Connection, client: TelegramTransport, cha
     return sent
 
 
-def handle_callback(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, update: dict) -> dict | None:
+def handle_callback(
+    conn: sqlite3.Connection,
+    client: TelegramTransport,
+    chat_id: str,
+    update: dict,
+    *,
+    fast: bool = False,
+) -> dict | None:
     """Process an inline-button tap.
 
     - ``approve:<id>`` / ``reject:<id>``: record the decision, then prompt for
@@ -372,10 +379,19 @@ def handle_callback(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         decision, _, draft_id = data.partition(":")
         if decision not in ("approve", "reject"):
             return None
+        if fast:
+            # /reviewdraft fast: commit on first tap, no confirm gate. The bot
+            # stays responsive via the per-draft undo (reopen/reject-from-list),
+            # so a fat-finger is recoverable without a two-tap gate.
+            client.answer_callback_query(cq["id"], text=f"fast {decision}")
+            return _commit_decision(conn, client, chat_id, cq, draft_id, decision)
         # GAP 3: a tap is a *proposal*, not a commit. Show a confirm/cancel
         # gate so a fat-finger Approve can't enqueue + fire copy-gen before the
         # editor can reconsider. Nothing is written to the DB yet.
-        client.answer_callback_query(cq["id"], text=f"confirm {decision}?")
+        # NOTE: keep the callback-answer text empty-ish — a non-empty toast
+        # ("confirm approve?") reads like the decision already happened on some
+        # clients, which is misleading. The real prompt carries the buttons.
+        client.answer_callback_query(cq["id"], text="")
         verb = "approve" if decision == "approve" else "reject"
         client.send_message(
             chat_id,
@@ -389,39 +405,7 @@ def handle_callback(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         decision, _, draft_id = rest.partition(":")
         if decision not in ("approve", "reject"):
             return None
-        try:
-            review.apply_review(conn, draft_id, decision=decision)
-        except ValueError:
-            client.answer_callback_query(cq["id"], text="already handled")
-            return None
-        client.answer_callback_query(cq["id"], text=f"{decision}d")
-        if decision == "reject":
-            # A reject needs no human-voice capture — the joke is the point of
-            # an *approve*. Just confirm and finish (no editor_line/notes prompt,
-            # no extra round-trips). The draft is already rejected + dequeued.
-            client.send_message(
-                chat_id,
-                f"🚫 Draft `{draft_id}` rejected. It's out of the queue; "
-                f"re-list it any time with /listrejected (or /reviewdraft if "
-                f"you change your mind later).",
-            )
-            return {"draft_id": draft_id, "decision": "reject"}
-        # The joke is the whole point of the product: capture the human-written
-        # editor_line first. A reply to this prompt becomes editor_line (which
-        # also steers B+ post-copy generation); /skip leaves it blank.
-        note = client.send_message(
-            chat_id,
-            f"Draft `{draft_id}` approved. Reply here with your one-line "
-            f"joke (the editor_line) — or send /skip to leave it blank:",
-        )
-        # Stash the decision so a follow-up reply knows whether to also capture
-        # a (secondary) notes step after the editor_line.
-        return {
-            "draft_id": draft_id,
-            "decision": decision,
-            "note_message_id": note["message_id"],
-            "stage": "editor_line",
-        }
+        return _commit_decision(conn, client, chat_id, cq, draft_id, decision)
     if data.startswith("cancel:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="cancelled")
@@ -566,6 +550,55 @@ def handle_callback(conn: sqlite3.Connection, client: TelegramTransport, chat_id
     return None
 
 
+def _commit_decision(
+    conn: sqlite3.Connection,
+    client: TelegramTransport,
+    chat_id: str,
+    cq: dict,
+    draft_id: str,
+    decision: str,
+) -> dict | None:
+    """Commit an approve/reject and run the decision-specific follow-up.
+
+    Shared by the confirm-gate path (``confirm:<decision>:<id>``) and the
+    ``/reviewdraft fast`` path (first tap commits directly). Returns the result
+    dict the caller uses to track note/joke capture state.
+    """
+    try:
+        review.apply_review(conn, draft_id, decision=decision)
+    except ValueError:
+        client.answer_callback_query(cq["id"], text="already handled")
+        return None
+    client.answer_callback_query(cq["id"], text=f"{decision}d")
+    if decision == "reject":
+        # A reject needs no human-voice capture — the joke is the point of
+        # an *approve*. Just confirm and finish (no editor_line/notes prompt,
+        # no extra round-trips). The draft is already rejected + dequeued.
+        client.send_message(
+            chat_id,
+            f"🚫 Draft `{draft_id}` rejected. It's out of the queue; "
+            f"re-list it any time with /listrejected (or /reviewdraft if "
+            f"you change your mind later).",
+        )
+        return {"draft_id": draft_id, "decision": "reject"}
+    # The joke is the whole point of the product: capture the human-written
+    # editor_line first. A reply to this prompt becomes editor_line (which
+    # also steers B+ post-copy generation); /skip leaves it blank.
+    note = client.send_message(
+        chat_id,
+        f"Draft `{draft_id}` approved. Reply here with your one-line "
+        f"joke (the editor_line) — or send /skip to leave it blank:",
+    )
+    # Stash the decision so a follow-up reply knows whether to also capture
+    # a (secondary) notes step after the editor_line.
+    return {
+        "draft_id": draft_id,
+        "decision": decision,
+        "note_message_id": note["message_id"],
+        "stage": "editor_line",
+    }
+
+
 def handle_text(
     conn: sqlite3.Connection,
     client: TelegramTransport,
@@ -702,15 +735,17 @@ def handle_text(
 
 HELP_TEXT = (
     "HumorHist review bot — the whole pipeline runs from here.\n\n"
+    "QUICK START: /reviewdraft to decide on pending drafts · /listqueue to manage "
+    "approved ones · /status for progress · /help for everything.\n\n"
     "DISCOVERY & DRAFTING\n"
     "/harvest - top up the candidate pool from seed + Wikipedia lists\n"
     "/screen [limit] - LLM-score unscored pool candidates (funny_score)\n"
     "/draft [count] [min_score] - fact-check + generate angles for top candidates\n"
     "/suggest <topic> - add an editor-suggested event to the pool\n\n"
     "REVIEW\n"
-    "/reviewdraft - review pending drafts one by one\n"
+    "/reviewdraft - review pending drafts one by one (each tap opens a Confirm/Cancel gate)\n"
+    "/reviewdraft fast - same, but commits on the first tap (no gate); undo via /listapproved or /listqueue\n"
     "    each draft has ✅ Approve / ❌ Reject / ⏸ Later buttons\n"
-    "    a tap opens a Confirm/Cancel gate (so a fat-finger can't commit)\n"
     "    on Approve confirm, the bot asks for your one-line joke, then notes\n"
     "    /later <id> defers a pending draft 30 days (#id shown in /listapproved)\n"
     "    /listlater - list deferred drafts; tap to bring one forward now\n"
@@ -720,12 +755,12 @@ HELP_TEXT = (
     "    each row also has a ❌ Reject button (confirm-gated) to un-approve it\n"
     "/listrejected - list rejected drafts; tap one to reopen for re-review\n"
     "/listqueue - list queued drafts with their #id, copy + Remove/Reject/Reopen\n"
-    "    each row: ✏️ Edit copy, ↩️ Remove (keep approved),\n"
+    "    each row: ✏️ Edit copy, 🗑 Remove (keep approved),\n"
     "             ❌ Reject (with confirm), ↩️ Reopen (back to pending)\n"
     "    /queue remove <id> pulls a draft out of the queue (kept approved)\n"
     "/view <id> - re-read any draft's full content (pending/approved/rejected)\n"
     "    (use the #id shown by /listapproved or /listqueue)\n"
-    "/viewcopy <id> - open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)\n\n"
+    "/viewcopy <id> - open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)\n"
     "BUFFER & STATUS\n"
     "/buffer - buffer health report + on-demand top-up\n"
     "/buffer enqueue - also sweep approved drafts into the queue\n"
@@ -747,7 +782,11 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     """
     rows = review.approved_drafts(conn)
     if not rows:
-        client.send_message(chat_id, "No approved drafts yet.")
+        client.send_message(
+            chat_id,
+            "No approved drafts yet. Run /reviewdraft to review pending ones, "
+            "or /status for progress.",
+        )
         return 0
     lines = [
         "✅ Approved drafts (tap to open; #id is the draft number):",
@@ -776,7 +815,11 @@ def send_rejected_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     """
     rows = review.rejected_drafts(conn)
     if not rows:
-        client.send_message(chat_id, "No rejected drafts.")
+        client.send_message(
+            chat_id,
+            "No rejected drafts. Reviewed drafts land here only after you reject "
+            "them from /reviewdraft or /listapproved.",
+        )
         return 0
     lines = [
         "❌ Rejected drafts (tap to send one back to pending for re-review; #id is the draft number):",
@@ -801,7 +844,11 @@ def send_deferred_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     """
     rows = review.deferred_drafts(conn)
     if not rows:
-        client.send_message(chat_id, "No deferred drafts. (/later defers one 30 days.)")
+        client.send_message(
+            chat_id,
+            "No deferred drafts. (/later defers one 30 days from /reviewdraft "
+            "or /listapproved.)",
+        )
         return 0
     lines = [
         "⏸ Deferred drafts (tap to clear the 30-day wait and bring one back to review now; #id is the draft number):",
@@ -904,7 +951,11 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
     # only show rows that are still queued (unpublished)
     rows = [r for r in rows if not r["published"]]
     if not rows:
-        client.send_message(chat_id, "Queue is empty (nothing approved + queued).")
+        client.send_message(
+            chat_id,
+            "Queue is empty (nothing approved + queued). Approve drafts with "
+            "/reviewdraft, then they appear here ready to publish.",
+        )
         return 0
     lines = [f"📋 Queued drafts ({len(rows)}) — edit copy before publishing (#id = draft number):"]
     lines.append("  ✏️ Edit copy   🗑 Remove from queue   ❌ Reject draft (confirm)   ↩️ Reopen to pending")
@@ -1162,6 +1213,7 @@ def run_review_session(
     poll_timeout: int = 30,
     max_iterations: int = 1_000_000,
     image_dir: str | None = None,
+    fast: bool = False,
 ) -> int:
     """The one-draft-at-a-time review flow, triggered by /reviewdraft.
 
@@ -1187,7 +1239,7 @@ def run_review_session(
                 _, _, did = data.partition(":")
                 if did not in sent:
                     return None
-            res = handle_callback(conn, client, chat_id, upd)
+            res = handle_callback(conn, client, chat_id, upd, fast=fast)
             # A committed decision (the confirm: step) carries "decision" but
             # not "confirming"; the initial tap carries "confirming": True and
             # must NOT count as a decision yet.
@@ -1361,6 +1413,11 @@ def run_review_bot(
         nonlocal decided
         cmd = text.split()[0].lower()
         if cmd == "/reviewdraft":
+            # /reviewdraft        -> normal flow (each tap opens a Confirm/Cancel gate)
+            # /reviewdraft fast   -> commits on the first tap (no confirm gate);
+            #                        recovery is the per-draft undo (reject/reopen
+            #                        from /listapproved or /listqueue)
+            fast = "fast" in text.split()
             decided += run_review_session(
                 conn,
                 client,
@@ -1369,6 +1426,7 @@ def run_review_bot(
                 offset_ref,
                 poll_timeout=poll_timeout,
                 max_iterations=max_iterations,
+                fast=fast,
             )
         elif cmd == "/listapproved":
             send_approved_list(conn, client, chat_id)
@@ -1595,8 +1653,16 @@ def send_reviewed_summary(conn: db.Connection, client: TelegramTransport, chat_i
             f"⚠️ {len(stuck)} approved draft(s) are missing their one-line joke "
             f"(committed but the joke was never captured):"
         ]
+        keyboard: list[list[dict]] = []
         for s in stuck:
             lines.append(f"  • #{s['draft_id']} {s['title'] or '(unknown)'}")
-        lines.append("Fix one with /setjoke <id> (then reply with the joke).")
-        client.send_message(chat_id, "\n".join(lines))
+            keyboard.append(
+                [{"text": f"📝 Add joke: #{s['draft_id']}", "callback_data": f"setjoke:{s['draft_id']}"}]
+            )
+        lines.append("Tap a draft above to add its joke, or run /setjoke <id>.")
+        client.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_markup={"inline_keyboard": keyboard},
+        )
     return text

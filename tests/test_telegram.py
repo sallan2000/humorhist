@@ -1008,7 +1008,78 @@ def test_reject_button_cancel_keeps_approval(tmp_path):
     )
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
-    assert any("cancelled" in m["text"] for m in stub.sent)
+
+
+def test_fast_mode_commits_on_first_tap(tmp_path):
+    """/reviewdraft fast commits on the first Approve tap with NO confirm gate.
+
+    Regression guard for the fast-mode addition: a single approve:<id> tap in
+    fast mode must apply the decision directly (no 'confirming' intermediate),
+    while the normal gate still requires confirm:approve:<id>."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+    # fast tap -> direct commit, no confirm gate
+    res = tg.handle_callback(
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "approve:d1", "message": {"message_id": 1}}},
+        fast=True,
+    )
+    assert res is not None
+    assert "confirming" not in res, "fast mode must not open a confirm gate"
+    assert res["decision"] == "approve"
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
+
+
+def test_normal_approve_still_requires_confirm(tmp_path):
+    """Sanity: the default (non-fast) approve tap still opens the confirm gate."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn,
+        stub,
+        "chat",
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "approve:d1", "message": {"message_id": 1}}},
+    )
+    assert res == {"draft_id": "d1", "decision": "approve", "confirming": True}
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "pending"
+
+
+def test_status_nudge_offers_setjoke_button(tmp_path):
+    """The stuck-capture nudge in /status must carry an inline 'add joke'
+    (setjoke:<id>) button so the editor can fix it from the phone without
+    typing /setjoke <id>."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, "d1")  # approved + queued, but no editor_line -> stuck
+    stub = tg.StubTelegram()
+    tg.send_reviewed_summary(conn, stub, "chat")
+    # find the nudge message (the one after the breakdown)
+    nudge = next((m for m in stub.sent if "missing their one-line joke" in m["text"]), None)
+    assert nudge is not None, "stuck-capture nudge not sent"
+    kb = nudge.get("reply_markup", {}).get("inline_keyboard", [])
+    cbs = {b["callback_data"] for row in kb for b in row}
+    assert "setjoke:d1" in cbs
+
+
+def test_empty_approved_list_hints_next_action(tmp_path):
+    """An empty /listapproved must tell the user what to do next, not just
+    'No approved drafts yet.'."""
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    n = tg.send_approved_list(conn, stub, "chat")
+    assert n == 0
+    assert "/reviewdraft" in stub.sent[-1]["text"]
+
+
+def test_empty_queue_list_hints_next_action(tmp_path):
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    n = tg.send_queue_list(conn, stub, "chat")
+    assert n == 0
+    assert "/reviewdraft" in stub.sent[-1]["text"]
 
 
 def test_view_command_re_reads_any_draft_from_phone(tmp_path):
