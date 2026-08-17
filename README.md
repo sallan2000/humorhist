@@ -480,16 +480,17 @@ surfaced as a nudge on `/status` and fixable with `/setjoke <id>` (GAP 4b).
 And an approved draft can now be un-approved or sent back to pending entirely
 from Telegram: `/listapproved` carries a ❌ Reject button and `/listqueue` rows
 carry ❌ Reject (confirm-gated) + ↩️ Reopen buttons. The CLI equivalents
-(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 299 passing.
+(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 345 passing.
 
-Not yet built:
-- Phase 4 publisher: turning a `queue` row into an actual posted item and
-  writing `posts` (auto-post to Mastodon/X vs. just holding copy for you to
-  paste — the `queue`/`posts` schema is ready for either). The copy-generation
-  half is complete; only the destination is deferred.
+Manual posting (by design — no auto-post):
+- `humorhist publish` exports every queued, copy-bearing draft: the post text
+  (≤280 chars via `humorhist copy`), the `source_link` "learn more" URL, and the
+  `image_path` when an image exists. You paste these into Bluesky/Mastodon by hand.
+- An auto-publisher was prototyped then deliberately removed — you keep control of
+  the posting step. No `posts` table, no platform credentials, no timer.
 
-Until the publisher exists, "publishing" means: read the approved draft with
-`show`, write the post yourself, and it's already in `queue`.
+Until you post manually, "publishing" means: read the approved draft with
+`humorhist publish`, copy the text + image into your client.
 
 -------------------------------------------------------------------------------
 ## Scheduling (weekly discovery)

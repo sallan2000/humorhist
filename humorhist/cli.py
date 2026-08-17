@@ -711,6 +711,38 @@ def cmd_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_publish(args: argparse.Namespace) -> int:
+    """Export queued, approved posts for MANUAL posting (no auto-post).
+
+    This is a read-only prep view, not a publisher. It lists every queued,
+    copy-bearing row and prints the exact text + image path you'd paste into
+    Bluesky / Mastodon by hand. Nothing is sent to any platform and nothing in
+    the DB is changed — keeping you in control of the posting step.
+    """
+    import humorhist.review as review
+
+    conn = _open_db(args.db)
+    rows = review.queued_drafts(conn)
+    rows = [r for r in rows if r.get("post_copy")]
+    if not rows:
+        print("Nothing queued with post copy yet. Run `humorhist queue --enqueue` and `humorhist copy regen` first.")
+        return 0
+
+    print(f"{len(rows)} post(s) ready to paste manually:\n")
+    for r in rows:
+        print(f"── {r['draft_id']} — {r['title']}")
+        print(r["post_copy"])
+        link = r.get("source_link")
+        if link:
+            print(f"\nlearn more: {link}")
+        img = r.get("image_path")
+        if img:
+            print(f"image: {img}")
+        print()
+    print("Post these by hand on your platforms. Nothing was sent automatically.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="humorhist", description=__doc__)
     p.add_argument("--db", default=DEFAULT_DB, help="path to the sqlite database")
@@ -793,6 +825,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--enqueue", action="store_true", help="move approved drafts into queue")
     q.add_argument("--scheduled-for", default=None, help="ISO timestamp to schedule under")
     q.set_defaults(func=cmd_queue)
+
+    pb = sub.add_parser(
+        "publish",
+        help="Export queued posts for MANUAL posting (prints copy + image; no auto-post)",
+    )
+    pb.set_defaults(func=cmd_publish)
 
     cp = sub.add_parser("copy", help="B+ : view/edit/regenerate a draft's post copy")
     cp_sub = cp.add_subparsers(dest="copy_command", required=True)
