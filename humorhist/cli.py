@@ -711,60 +711,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_publish(args: argparse.Namespace) -> int:
-    """Phase 4: publish queued, approved posts to a social transport.
-
-    Dry-run by default (renders what would go out, touches nothing). A real run
-    requires ``--go`` — never let the very first publish be unattended.
-    """
-    import humorhist.publish as publish
-
-    conn = _open_db(args.db)
-
-    if args.dry_run or not args.go:
-        results = publish.publish_due(
-            conn,
-            transport=args.transport,
-            dry_run=True,
-            limit=args.limit,
-            daily_max=args.daily_max,
-            data_dir=str(Path(args.db).resolve().parent),
-        )
-        if not results:
-            print("Nothing to publish (queue empty, or daily quota already used).")
-            return 0
-        print(f"Dry run — {len(results)} post(s) would be sent to {args.transport}:")
-        for r in results:
-            print(f"  [{r['draft_id']}] {r['text']!r}{'  (with image)' if r['has_image'] else ''}")
-        if not args.dry_run:
-            print("\nThis was a preview. Re-run with --go to actually publish.")
-        return 0
-
-    try:
-        results = publish.publish_due(
-            conn,
-            transport=args.transport,
-            dry_run=False,
-            limit=args.limit,
-            daily_max=args.daily_max,
-            data_dir=str(Path(args.db).resolve().parent),
-        )
-    except publish.PublishUnavailable as exc:
-        print(f"error: {exc}")
-        return 2
-
-    published = [r for r in results if r["status"] == "published"]
-    failed = [r for r in results if r["status"] in ("failed", "skipped")]
-    print(f"Published {len(published)} post(s) to {args.transport}.")
-    for r in published:
-        print(f"  ✓ {r['draft_id']} -> {r.get('url', '')}")
-    if failed:
-        print(f"Skipped/failed {len(failed)}:")
-        for r in failed:
-            print(f"  ✗ {r['draft_id']}: {r.get('reason', '')}")
-    return 0 if not failed else 1
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="humorhist", description=__doc__)
     p.add_argument("--db", default=DEFAULT_DB, help="path to the sqlite database")
@@ -844,17 +790,9 @@ def build_parser() -> argparse.ArgumentParser:
     ts.set_defaults(func=cmd_telegram_status)
 
     q = sub.add_parser("queue", help="Phase 4: list queued drafts (--enqueue to fill)")
-    q.add_argument("--enqueue", action="store_true", help="move approved drafts into the publish queue")
-    q.add_argument("--scheduled-for", dest="scheduled_for", default=None, help="ISO datetime for enqueued rows")
+    q.add_argument("--enqueue", action="store_true", help="move approved drafts into queue")
+    q.add_argument("--scheduled-for", default=None, help="ISO timestamp to schedule under")
     q.set_defaults(func=cmd_queue)
-
-    pb = sub.add_parser("publish", help="Phase 4: publish queued posts to a social transport")
-    pb.add_argument("--transport", default="mastodon", choices=["mastodon"], help="target network (default mastodon)")
-    pb.add_argument("--go", action="store_true", help="actually publish (omit for a dry-run preview)")
-    pb.add_argument("--dry-run", action="store_true", help="render planned posts without sending (default behaviour)")
-    pb.add_argument("--limit", type=int, default=None, help="max posts to consider this run")
-    pb.add_argument("--daily-max", type=int, default=None, help="override HUMORHIST_DAILY_MAX quota")
-    pb.set_defaults(func=cmd_publish)
 
     cp = sub.add_parser("copy", help="B+ : view/edit/regenerate a draft's post copy")
     cp_sub = cp.add_subparsers(dest="copy_command", required=True)
