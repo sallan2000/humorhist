@@ -780,6 +780,58 @@ def test_send_draft_content_shows_post_copy_and_copy_button(tmp_path):
     assert "notes:d1" in cbs  # existing add-notes button preserved
 
 
+def test_editmenu_callback_opens_regenerate_or_type_menu(tmp_path):
+    # GAP fix: tapping ✏️ Edit must offer Regenerate even with zero editor notes.
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, draft_id="d1", with_copy=True)
+    stub = tg.StubTelegram()
+    upd = {
+        "update_id": 1,
+        "callback_query": {"id": "cb1", "data": "editmenu:d1", "message": {"message_id": 10}},
+    }
+    res = tg.handle_callback(conn, stub, "chat", upd)
+    assert res is None  # menu is a self-contained message, no awaiting state
+    menu_msgs = [m for m in stub.sent if "reply_markup" in m]
+    assert menu_msgs, "edit menu should have been sent"
+    kb = menu_msgs[-1]["reply_markup"]["inline_keyboard"][0]
+    cbs = {b["callback_data"] for b in kb}
+    assert "regencopy:d1" in cbs
+    assert "editcopy:d1" in cbs
+
+
+def test_regencopy_works_with_no_editor_notes(tmp_path, monkeypatch):
+    # Regenerate must produce fresh copy even when no note/editor_line exists yet.
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, draft_id="d1", with_copy=True)
+    # assert pre-condition: no editor notes / editor_line on the draft
+    row = conn.execute("SELECT editor_notes, editor_line FROM drafts WHERE id='d1'").fetchone()
+    assert (row["editor_notes"] or row["editor_line"]) is None
+
+    captured = {}
+
+    def fake_fill(conn2, llm, draft_id=None, force=False):
+        did = draft_id or "d1"
+        captured["draft_id"] = did
+        cw.set_post_copy(conn2, did, "Regenerated copy, no notes required.")
+        return 1
+
+    import humorhist.copywriter as cw
+
+    monkeypatch.setattr(cw, "fill_post_copy", fake_fill)
+    monkeypatch.setattr(tg, "_get_llm", lambda chat_id, client: object())
+
+    stub = tg.StubTelegram()
+    upd = {
+        "update_id": 1,
+        "callback_query": {"id": "cb1", "data": "regencopy:d1", "message": {"message_id": 10}},
+    }
+    res = tg.handle_callback(conn, stub, "chat", upd)
+    assert res is None
+    assert captured["draft_id"] == "d1"
+    new_copy = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"]
+    assert new_copy == "Regenerated copy, no notes required."
+
+
 def test_send_draft_content_copy_absent_shows_zero_count(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn, draft_id="d1", with_copy=False)
@@ -1398,9 +1450,30 @@ def test_send_copy_content_carries_edit_regen_buttons(tmp_path):
     tg.send_copy_content(conn, stub, "chat", "d1")
     kb = stub.sent[-1]["reply_markup"]["inline_keyboard"][0]
     cbs = {b["callback_data"] for b in kb}
-    assert "editcopy:d1" in cbs
+    # The copy screen's Edit button now opens a CHOICE menu (editmenu), which in
+    # turn offers both Regenerate and Type-myself — so regenerate is always one
+    # tap away, even with no editor notes yet.
+    assert "editmenu:d1" in cbs
     assert "regencopy:d1" in cbs
     assert "France invaded" in stub.sent[-1]["text"]
+
+
+def test_editmenu_from_copy_screen_offers_both_options(tmp_path):
+    # End-to-end: copy screen -> tap Edit (editmenu) -> menu carries regen + type.
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    stub = tg.StubTelegram()
+    tg.send_copy_content(conn, stub, "chat", "d1")
+    # tap the Edit button
+    edit_upd = {
+        "update_id": 99,
+        "callback_query": {"id": "cb9", "data": "editmenu:d1", "message": {"message_id": 10}},
+    }
+    tg.handle_callback(conn, stub, "chat", edit_upd)
+    menu = [m for m in stub.sent if "reply_markup" in m][-1]
+    cbs = {b["callback_data"] for b in menu["reply_markup"]["inline_keyboard"][0]}
+    assert "regencopy:d1" in cbs
+    assert "editcopy:d1" in cbs
 
 
 def test_regencopy_without_llm_sends_clean_unavailable(tmp_path, monkeypatch):

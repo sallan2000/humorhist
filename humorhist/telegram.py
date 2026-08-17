@@ -533,6 +533,29 @@ def handle_callback(
             "decision": "approve",
             "setjoke": True,
         }
+    if data.startswith("editmenu:"):
+        # GAP fix: the ✏️ Edit button now opens a CHOICE menu (Regenerate vs type
+        # manually) instead of dropping straight into a bare reply box. Regenerate
+        # always works — notes are optional, so it's offered even when nothing has
+        # been added as an editor note yet.
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="edit options")
+        menu = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔄 Regenerate copy", "callback_data": f"regencopy:{draft_id}"},
+                    {"text": "✏️ Type copy myself", "callback_data": f"editcopy:{draft_id}"},
+                ]
+            ]
+        }
+        client.send_message(
+            chat_id,
+            f"How do you want to change the post copy for `{draft_id}`?\n"
+            f"• 🔄 Regenerate — ask the LLM for fresh copy (works with or without notes)\n"
+            f"• ✏️ Type myself — reply with your own copy",
+            reply_markup=menu,
+        )
+        return None
     if data.startswith("editcopy:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="editing copy")
@@ -1012,11 +1035,11 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
 def send_copy_content(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str) -> list[dict]:
     """Send a queued draft's post copy with inline Edit + Regenerate buttons.
 
-    Tapping 'Edit' (callback ``editcopy:<id>``) prompts the reviewer to reply
-    with new copy (handled by ``handle_text`` via the awaited map). Tapping
-    'Regenerate' (callback ``regencopy:<id>``) asks the LLM for fresh copy and
-    re-sends. The copy is read from ``queue.post_copy``; if absent, a hint to
-    regenerate is shown.
+    Tapping 'Edit' (callback ``editmenu:<id>``) opens a choice menu — 'Regenerate'
+    (callback ``regencopy:<id>``, works with or without editor notes) and 'Type
+    myself' (callback ``editcopy:<id>``, a reply that replaces the copy). Tapping
+    'Regenerate' asks the LLM for fresh copy and re-sends. The copy is read from
+    ``queue.post_copy``; if absent, a hint to regenerate is shown.
     """
     from humorhist.copywriter import char_limit
 
@@ -1035,7 +1058,7 @@ def send_copy_content(conn: sqlite3.Connection, client: TelegramTransport, chat_
     markup = {
         "inline_keyboard": [
             [
-                {"text": "✏️ Edit", "callback_data": f"editcopy:{draft_id}"},
+                {"text": "✏️ Edit", "callback_data": f"editmenu:{draft_id}"},
                 {"text": "🔄 Regenerate", "callback_data": f"regencopy:{draft_id}"},
             ]
         ]
