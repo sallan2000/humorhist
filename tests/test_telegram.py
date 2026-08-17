@@ -1357,8 +1357,9 @@ def test_reviewnow_callback_when_not_deferred_is_safe(tmp_path):
     assert any("Cannot bring forward" in m["text"] for m in stub.sent)
 
 
-def test_setjoke_callback_opens_editor_line_prompt(tmp_path):
-    """GAP 4b: setjoke:<id> re-opens the joke prompt on an approved+queued draft."""
+def test_setjoke_callback_opens_generate_or_type_menu(tmp_path):
+    """GAP 4b (extended): setjoke:<id> now offers LLM generate + type-myself,
+    instead of a bare reply box with no LLM option."""
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     review.apply_review(conn, "d1", decision="approve")  # approved + queued, no joke
@@ -1369,21 +1370,37 @@ def test_setjoke_callback_opens_editor_line_prompt(tmp_path):
         "chat",
         {"update_id": 1, "callback_query": {"id": "cb1", "data": "setjoke:d1", "message": {"message_id": 1}}},
     )
-    assert res["stage"] == "editor_line"
-    assert res.get("setjoke") is True
-    # reply with the joke -> set via set_editor_line (no status/queue change)
-    note_id = res["note_message_id"]
-    tg.handle_text(
+    assert res is None  # menu is self-contained; no awaiting state
+    menu = [m for m in stub.sent if "reply_markup" in m][-1]
+    cbs = {b["callback_data"] for b in menu["reply_markup"]["inline_keyboard"][0]}
+    assert "regencopy:d1" in cbs  # LLM generate, works with no joke/note
+    assert "editcopy:d1" in cbs   # type the joke manually
+
+
+def test_setjoke_menu_generate_works_with_no_joke(tmp_path, monkeypatch):
+    """From the 'Add joke' menu, tapping Generate copy (LLM) regenerates note-free."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, draft_id="d1", with_copy=False)
+    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] is None
+
+    def fake_fill(conn2, llm, draft_id=None, force=False):
+        cw.set_post_copy(conn2, draft_id or "d1", "LLM draft from angles, no joke needed.")
+        return 1
+
+    import humorhist.copywriter as cw
+
+    monkeypatch.setattr(cw, "fill_post_copy", fake_fill)
+    monkeypatch.setattr(tg, "_get_llm", lambda chat_id, client: object())
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
         conn,
         stub,
         "chat",
-        {"d1": {"note_message_id": note_id, "stage": "editor_line", "decision": "approve", "setjoke": True}},
-        _text_update(2, "the bear was a tax dodge", note_id),
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1", "message": {"message_id": 1}}},
     )
-    row = conn.execute("SELECT editor_line, status FROM drafts WHERE id='d1'").fetchone()
-    assert row["editor_line"] == "the bear was a tax dodge"
-    assert row["status"] == "approved"  # unchanged
-    assert review.stuck_captures(conn) == []  # no longer stuck
+    assert res is None
+    new_copy = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"]
+    assert new_copy == "LLM draft from angles, no joke needed."
 
 
 def test_reopen_callback_sends_draft_back_to_pending(tmp_path):

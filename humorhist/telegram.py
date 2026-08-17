@@ -516,23 +516,28 @@ def handle_callback(
         )
         return None
     if data.startswith("setjoke:"):
-        # GAP 4b: fix a "stuck capture" — an approved+queued draft whose joke
-        # (editor_line) was never filled. Re-open the editor_line prompt.
+        # GAP 4b fix (extended): an approved+queued draft whose joke (editor_line)
+        # was never filled. Previously this dropped straight into a bare reply box
+        # with no LLM option. Now it opens the same choice menu as the copy editor
+        # so Generate/Regenerate is always one tap away (works with no note yet).
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="add joke")
-        prompt = client.send_message(
-            chat_id,
-            f"Reply with the one-line joke (editor_line) for approved draft "
-            f"`{draft_id}` — this is the human voice for the post copy "
-            f"(or /skip to leave it blank):",
-        )
-        return {
-            "draft_id": draft_id,
-            "note_message_id": prompt["message_id"],
-            "stage": "editor_line",
-            "decision": "approve",
-            "setjoke": True,
+        menu = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔄 Generate copy (LLM)", "callback_data": f"regencopy:{draft_id}"},
+                    {"text": "✏️ Write joke myself", "callback_data": f"editcopy:{draft_id}"},
+                ]
+            ]
         }
+        client.send_message(
+            chat_id,
+            f"How do you want to fill the post copy for `{draft_id}`?\n"
+            f"• 🔄 Generate copy — ask the LLM for fresh copy (works with or without a joke/note)\n"
+            f"• ✏️ Write joke myself — reply with your one-line joke, then copy is generated from it",
+            reply_markup=menu,
+        )
+        return None
     if data.startswith("editmenu:"):
         # GAP fix: the ✏️ Edit button now opens a CHOICE menu (Regenerate vs type
         # manually) instead of dropping straight into a bare reply box. Regenerate
