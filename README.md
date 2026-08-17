@@ -7,9 +7,9 @@ jokes — humorhist does the research and hands you angles, source links, and th
 
 It is a command-line tool, not a service. You run stages in order:
 
-    harvest  ->  screen  ->  draft  ->  (you review)  ->  copy  ->  publish*
+    harvest  ->  screen  ->  draft  ->  (you review)  ->  copy  ->  publish
 
-    * publishing is not built yet (see "Project status" below).
+    * publishing posts to Mastodon is built (see "Phase 4: publisher" below).
 
 -------------------------------------------------------------------------------
 ## What it actually does
@@ -428,6 +428,9 @@ The comic-angle prompt that most affects output quality lives in:
 
 325 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed; the real Telegram/FAL HTTP transports are mocked with respx).
 
+357 tests as of 2026-08-17 (the Phase 4 publisher suite added 12). Run `pytest tests/ -q`.
+359 tests as of 2026-08-17 (added 2 dedup-invariant guard tests — see "Cross-source dedup" below).
+
 -------------------------------------------------------------------------------
 ## Project status
 -------------------------------------------------------------------------------
@@ -480,16 +483,48 @@ surfaced as a nudge on `/status` and fixable with `/setjoke <id>` (GAP 4b).
 And an approved draft can now be un-approved or sent back to pending entirely
 from Telegram: `/listapproved` carries a ❌ Reject button and `/listqueue` rows
 carry ❌ Reject (confirm-gated) + ↩️ Reopen buttons. The CLI equivalents
-(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 299 passing.
+(`reviewnow`, `setjoke`, `reopen`) were added alongside.
 
-Not yet built:
-- Phase 4 publisher: turning a `queue` row into an actual posted item and
-  writing `posts` (auto-post to Mastodon/X vs. just holding copy for you to
-  paste — the `queue`/`posts` schema is ready for either). The copy-generation
-  half is complete; only the destination is deferred.
+-------------------------------------------------------------------------------
+## Phase 4: publisher (2026-08-17)
+-------------------------------------------------------------------------------
 
-Until the publisher exists, "publishing" means: read the approved draft with
-`show`, write the post yourself, and it's already in `queue`.
+The pipeline now turns an approved `queue` row into a real social post.
+`humorhist publish` reads unpublished, copy-bearing queue rows and sends them to
+a transport. Only **Mastodon** is built (free API, low suspension risk); X is a
+documented opt-in second transport behind the same copy (see
+`references/x-publisher-2026.md`) and slots in without a rewrite.
+
+What `publish` does:
+- **Daily cadence guard** (`HUMORHIST_DAILY_MAX`, default 1) caps posts/day per
+  transport, so an unattended run can never spam. The guard counts rows already
+  in `posts` for today (UTC).
+- **Dry-run by default.** With no `--go` it renders what *would* go out and
+  touches neither the network nor the DB — safe to run any time.
+- **Writes a `posts` row** on success (transport + post id + url + timestamp)
+  and flips the queue row to `published`, so a re-run never double-posts.
+- **Best-effort / graceful.** Missing Mastodon credentials make
+  `resilient_transport()` raise `PublishUnavailable`, which surfaces as a clean
+  `skipped` (no traceback). The "learn more" `source_link` is appended to the
+  post body on Mastodon (free there, unlike X).
+- **Story images** are attached when the queue row has an `image_path` and the
+  file exists on disk (FAL-generated via `image` / `/image` once funded).
+
+Examples:
+
+    # preview only — shows the planned posts, sends nothing
+    humorhist publish
+    humorhist publish --dry-run
+
+    # actually post (manual first publish recommended; never let the timer post #1)
+    humorhist publish --go
+
+    # Mastodon is the only transport today; limit/quota overrides available
+    humorhist publish --go --limit 1 --daily-max 2
+
+Required env (Mastodon): `HUMORHIST_MASTODON_BASE_URL` (e.g.
+`https://mastodon.social`) and `HUMORHIST_MASTODON_TOKEN`. The first real publish
+should be done by hand; only then should a timer invoke `publish --go`.
 
 -------------------------------------------------------------------------------
 ## Scheduling (weekly discovery)

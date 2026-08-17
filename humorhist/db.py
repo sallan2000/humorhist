@@ -75,6 +75,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_normalized_title_column(conn)
     _backfill_normalized_title(conn)
     _dedupe_pool(conn)
+    # Phase 4 publisher: the `posts` table captures each successful publish and
+    # a couple of columns let the cadence guard count today's output cheaply.
+    _ensure_posts_published_columns(conn)
     conn.commit()
 
 
@@ -271,6 +274,85 @@ def _ensure_queue_link_column(conn: sqlite3.Connection) -> None:
     existing = {r[1] for r in conn.execute("PRAGMA table_info(queue)")}
     if "source_link" not in existing:
         conn.execute("ALTER TABLE queue ADD COLUMN source_link TEXT")
+
+
+def _ensure_posts_published_columns(conn: sqlite3.Connection) -> None:
+    """Add Phase 4 publisher columns to posts if absent (no-op if present).
+
+    The original schema only had draft_id/slug/url/tweet_id/published_at. The
+    publisher needs a transport tag (so Mastodon/X rows coexist in one table)
+    and a per-day published_at for the cadence guard to count cheaply.
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(posts)")}
+    if "transport" not in existing:
+        conn.execute("ALTER TABLE posts ADD COLUMN transport TEXT DEFAULT 'mastodon'")
+    if "post_id" not in existing:
+        # Generic per-network post id (the base schema called this tweet_id for X).
+        conn.execute("ALTER TABLE posts ADD COLUMN post_id TEXT")
+    if "published_at" not in existing:
+        # published_at already exists in the base schema; keep this guard for
+        # any future column additions so migrate() stays safe to re-run.
+        pass
+
+
+def queued_unpublished(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return queued (approved) rows that have not yet been published.
+
+    Ordered by oldest first so drip publishing is deterministic and replays
+    the same order across runs.
+    """
+    return conn.execute(
+        """
+        SELECT q.draft_id, q.post_copy, q.image_path, q.source_link, q.scheduled_for
+        FROM queue q
+        WHERE q.published = 0
+          AND q.post_copy IS NOT NULL
+          AND q.post_copy != ''
+        ORDER BY COALESCE(q.scheduled_for, '9999'), q.id ASC
+        """
+    ).fetchall()
+
+
+def posts_today(conn: sqlite3.Connection, *, transport: str | None = None) -> int:
+    """Count posts published today (UTC date) — the cadence-guard input.
+
+    When ``transport`` is given, only that transport is counted (so an X limit
+    stays independent of the Mastodon limit).
+    """
+    today = datetime.now(UTC).date().isoformat()
+    if transport is None:
+        row = conn.execute(
+            "SELECT count(*) AS n FROM posts WHERE substr(published_at, 1, 10) = ?", (today,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT count(*) AS n FROM posts WHERE substr(published_at, 1, 10) = ? AND transport = ?",
+            (today, transport),
+        ).fetchone()
+    return int(row["n"])
+
+
+def add_post(
+    conn: sqlite3.Connection,
+    *,
+    draft_id: str,
+    transport: str,
+    url: str | None = None,
+    post_id: str | None = None,
+) -> None:
+    """Record a successful publish in the posts table (idempotent)."""
+    conn.execute(
+        """INSERT OR REPLACE INTO posts (draft_id, transport, url, post_id, published_at)
+        VALUES (?, ?, ?, ?, ?)""",
+        (draft_id, transport, url, post_id, datetime.now(UTC).isoformat()),
+    )
+    conn.commit()
+
+
+def mark_queue_published(conn: sqlite3.Connection, draft_id: str) -> None:
+    """Flip the queue row to published=1 so it is excluded from future runs."""
+    conn.execute("UPDATE queue SET published = 1 WHERE draft_id = ?", (draft_id,))
+    conn.commit()
 
 
 def set_source_link(conn: sqlite3.Connection, draft_id: str, link: str | None) -> None:
