@@ -214,9 +214,33 @@ def test_parse_full_sample_counts_and_sources():
     assert len(items) == 12
     for it in items:
         assert it["source_name"] == "wikipedia:List_of_unusual_deaths"
-        assert it["source_url"] == "https://en.wikipedia.org/wiki/List_of_unusual_deaths"
         assert 0 < len(it["title"]) <= 120
         assert 0 < len(it["summary"]) <= 500
+
+
+def test_parse_links_to_specific_article_not_list_page():
+    # A linked event should point at the article behind the link, not the list.
+    wt = "* [[War of Jenkins' Ear]] was a conflict between Britain and Spain over a severed ear."
+    items = parse_list_items(wt, "List_of_wars_of_succession")
+    assert len(items) == 1
+    assert items[0]["source_url"] == "https://en.wikipedia.org/wiki/War_of_Jenkins'_Ear"
+
+
+def test_parse_falls_back_to_list_page_when_no_link():
+    # A prose-only item (no wiki link) keeps the parent list page as source.
+    wt = "* The Dancing Plague saw people dance uncontrollably for no clear reason at all here."
+    items = parse_list_items(wt, "List_of_unusual_deaths")
+    assert len(items) == 1
+    assert items[0]["source_url"] == "https://en.wikipedia.org/wiki/List_of_unusual_deaths"
+
+
+def test_parse_link_namespace_does_not_become_article_url():
+    # A line whose only link is a File:/Category: link has no article target,
+    # so it must fall back to the list page rather than a 404 namespace URL.
+    wt = "* [[File:Map.png]] shows the battle of a real war with no article link in this line."
+    items = parse_list_items(wt, "List_of_wars_of_succession")
+    assert len(items) == 1
+    assert items[0]["source_url"] == "https://en.wikipedia.org/wiki/List_of_wars_of_succession"
 
 
 # --------------------------------------------------------------------------- #

@@ -248,13 +248,17 @@ def _populate_publish_artifacts(conn: sqlite3.Connection, draft_id: str, *, imag
 
 
 def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
-    """Return queued (unpublished) drafts, oldest first, joined to pool title."""
+    """Return queued (unpublished) drafts, oldest first, joined to pool title.
+
+    Includes ``source_link`` and ``image_path`` so the read-only ``publish``
+    export can show the "learn more" link and story image when present.
+    """
     return [
         dict(r)
         for r in conn.execute(
             """
             SELECT q.id AS queue_id, q.draft_id, q.scheduled_for, q.published,
-                   q.post_copy, p.title AS title
+                   q.post_copy, q.source_link, q.image_path, p.title AS title
             FROM queue q
             LEFT JOIN drafts d ON d.id = q.draft_id
             LEFT JOIN pool p ON p.id = d.pool_id

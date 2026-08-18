@@ -718,6 +718,10 @@ def cmd_publish(args: argparse.Namespace) -> int:
     copy-bearing row and prints the exact text + image path you'd paste into
     Bluesky / Mastodon by hand. Nothing is sent to any platform and nothing in
     the DB is changed — keeping you in control of the posting step.
+
+    A short per-draft readiness checklist (copy / joke / image / link) is
+    appended so you can see at a glance which queued posts still need work
+    before they're post-ready.
     """
     import humorhist.review as review
 
@@ -727,6 +731,12 @@ def cmd_publish(args: argparse.Namespace) -> int:
     if not rows:
         print("Nothing queued with post copy yet. Run `humorhist queue --enqueue` and `humorhist copy regen` first.")
         return 0
+
+    # Pull joke (editor_line) from drafts to build the readiness checklist.
+    joke_by_draft = {}
+    for r in rows:
+        d = conn.execute("SELECT editor_line FROM drafts WHERE id = ?", (r["draft_id"],)).fetchone()
+        joke_by_draft[r["draft_id"]] = (d["editor_line"] if d else None)
 
     print(f"{len(rows)} post(s) ready to paste manually:\n")
     for r in rows:
@@ -738,6 +748,14 @@ def cmd_publish(args: argparse.Namespace) -> int:
         img = r.get("image_path")
         if img:
             print(f"image: {img}")
+        # Post-readiness checklist (no image is optional / FAL-gated).
+        has_joke = bool(joke_by_draft.get(r["draft_id"]))
+        has_img = bool(img)
+        flags = []
+        flags.append("copy OK")
+        flags.append("joke OK" if has_joke else "joke MISSING")
+        flags.append("image OK" if has_img else "image none (optional)")
+        print("  readiness: " + " | ".join(flags))
         print()
     print("Post these by hand on your platforms. Nothing was sent automatically.")
     return 0

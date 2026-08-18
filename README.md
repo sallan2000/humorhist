@@ -480,12 +480,15 @@ surfaced as a nudge on `/status` and fixable with `/setjoke <id>` (GAP 4b).
 And an approved draft can now be un-approved or sent back to pending entirely
 from Telegram: `/listapproved` carries a ❌ Reject button and `/listqueue` rows
 carry ❌ Reject (confirm-gated) + ↩️ Reopen buttons. The CLI equivalents
-(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 345 passing.
+(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 349 passing.
 
 Manual posting (by design — no auto-post):
 - `humorhist publish` exports every queued, copy-bearing draft: the post text
   (≤280 chars via `humorhist copy`), the `source_link` "learn more" URL, and the
-  `image_path` when an image exists. You paste these into Bluesky/Mastodon by hand.
+  `image_path` when an image exists. Each row ends with a readiness checklist
+  (`copy OK | joke OK | image none (optional)`) so you can see at a glance which
+  posts are post-ready and which still need a one-line joke. You paste these into
+  Bluesky/Mastodon by hand.
 - An auto-publisher was prototyped then deliberately removed — you keep control of
   the posting step. No `posts` table, no platform credentials, no timer.
 

@@ -226,6 +226,31 @@ def _extract_first_link(text: str) -> str | None:
     return inner.split("|", 1)[1].strip() if "|" in inner else target
 
 
+def _first_link_target(text: str) -> str | None:
+    """Return the URL-safe article slug of the first wiki link in ``text``.
+
+    Wikipedia link targets may carry a namespace prefix (``File:``,
+    ``Category:``, ...) or an anchor (``Article#section``); this strips the
+    namespace, keeps the article title, and converts spaces/entities to the
+    underscore form used in article URLs. Returns ``None`` when there is no
+    (non-namespace) link, so callers can fall back to the parent list page.
+    """
+    m = re.search(r"\[\[([^\[\]]+)\]\]", text)
+    if not m:
+        return None
+    inner = m.group(1)
+    target = inner.split("|", 1)[0].strip()
+    # Drop namespace prefixes (File:, Category:, ...) — they are not articles.
+    if target.split(":", 1)[0].strip().lower() in _LINK_NAMESPACES:
+        return None
+    # Strip any section anchor; article slugs never include '#'.
+    target = target.split("#", 1)[0].strip()
+    if not target:
+        return None
+    slug = target.replace(" ", "_")
+    return slug
+
+
 def _extract_year(text: str) -> int | None:
     """Extract a year from the first 60 chars of cleaned text.
 
@@ -331,12 +356,22 @@ def parse_list_items(wikitext: str, source_page: str) -> list[dict]:
             year = section_year
         summary = cleaned[:500]
 
+        # Prefer the *specific article* behind the event as the "learn more"
+        # link. When the list line links a Wikipedia article, the first link's
+        # target is the real subject (Wikipedia resolves redirects), which is far
+        # more useful than the parent list page for a reader. Link-less entries
+        # fall back to the list page, preserving prior behaviour.
+        slug = _first_link_target(content)
+        source_url = (
+            f"https://en.wikipedia.org/wiki/{slug}" if slug else f"https://en.wikipedia.org/wiki/{source_page}"
+        )
+
         items.append(
             {
                 "title": title,
                 "year": year,
                 "summary": summary,
-                "source_url": f"https://en.wikipedia.org/wiki/{source_page}",
+                "source_url": source_url,
                 "source_name": f"wikipedia:{source_page}",
             }
         )

@@ -427,6 +427,36 @@ def test_copy_parser_registered():
     assert callable(args.func)
 
 
+def test_publish_prints_readiness_checklist(dbpath, capsys):
+    from humorhist.cli import cmd_publish
+
+    # _seed_approved_with_queue gives an approved+queued row WITH copy.
+    _seed_approved_with_queue(dbpath)
+    # Give it a one-line joke + an image path so the checklist reads all-green.
+    conn = db.connect(dbpath)
+    conn.execute("UPDATE drafts SET editor_line = 'A salty one-liner.' WHERE id = 'd1'")
+    conn.execute("UPDATE queue SET image_path = '/tmp/x.png' WHERE draft_id = 'd1'")
+    conn.commit()
+    conn.close()
+
+    rc = cmd_publish(argparse.Namespace(db=dbpath))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1 post(s) ready to paste manually" in out
+    assert "readiness: copy OK | joke OK | image OK" in out
+
+
+def test_publish_flags_missing_joke(dbpath, capsys):
+    from humorhist.cli import cmd_publish
+
+    # No editor_line -> checklist should flag the joke as MISSING.
+    _seed_approved_with_queue(dbpath)
+    rc = cmd_publish(argparse.Namespace(db=dbpath))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "readiness: copy OK | joke MISSING | image none (optional)" in out
+
+
 # --- reopen / reviewnow / setjoke / suggest (GAP 3/4 CLI surface) ------------
 
 
