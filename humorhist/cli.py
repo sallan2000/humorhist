@@ -125,7 +125,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     if stuck:
         print(f"\n⚠️ Stuck captures ({len(stuck)}): approved + queued but the one-line joke was never filled:")
         for s in stuck:
-            print(f"  • {s['draft_id']} {s['title']}")
+            short = s.get("short_code") or s["draft_id"]
+            print(f"  • {short} {s['title']}")
         print('  Fix with: humorhist setjoke <id> "<joke>"')
     else:
         print("\n✅ No stuck captures (every approved+queued draft has its one-line joke).")
@@ -706,8 +707,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
     print(f"{len(rows)} draft(s) in queue:")
     for r in rows:
         sched = r["scheduled_for"] or "(unscheduled)"
+        short = r.get("short_code") or r["draft_id"]
         flag = " [published]" if r["published"] else ""
-        print(f"  {r['draft_id']} — {r['title']} — scheduled {sched}{flag}")
+        print(f"  {short} — {r['title']} — scheduled {sched}{flag}")
     return 0
 
 
@@ -740,7 +742,8 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
     print(f"{len(rows)} post(s) ready to paste manually:\n")
     for r in rows:
-        print(f"── {r['draft_id']} — {r['title']}")
+        short = r.get("short_code") or r["draft_id"]
+        print(f"── {short} — {r['title']}")
         print(r["post_copy"])
         link = r.get("source_link")
         if link:

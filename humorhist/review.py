@@ -258,7 +258,8 @@ def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
         for r in conn.execute(
             """
             SELECT q.id AS queue_id, q.draft_id, q.scheduled_for, q.published,
-                   q.post_copy, q.source_link, q.image_path, p.title AS title
+                   q.post_copy, q.source_link, q.image_path, p.title AS title,
+                   d.short_code AS short_code
             FROM queue q
             LEFT JOIN drafts d ON d.id = q.draft_id
             LEFT JOIN pool p ON p.id = d.pool_id
@@ -281,7 +282,8 @@ def deferred_drafts(conn: sqlite3.Connection) -> list[dict]:
         dict(r)
         for r in conn.execute(
             """
-            SELECT d.id AS draft_id, p.title AS title, d.defer_until
+            SELECT d.id AS draft_id, p.title AS title, d.defer_until,
+                   d.short_code AS short_code
             FROM drafts d
             LEFT JOIN pool p ON p.id = d.pool_id
             WHERE d.status = 'pending'
@@ -324,7 +326,7 @@ def approved_drafts(conn: sqlite3.Connection) -> list[dict]:
         for r in conn.execute(
             """
             SELECT d.id AS draft_id, d.editor_line, d.editor_notes, d.reviewed_at,
-                   p.title AS title
+                   p.title AS title, d.short_code AS short_code
             FROM drafts d
             LEFT JOIN pool p ON p.id = d.pool_id
             WHERE d.status = 'approved'
@@ -345,7 +347,7 @@ def rejected_drafts(conn: sqlite3.Connection) -> list[dict]:
         for r in conn.execute(
             """
             SELECT d.id AS draft_id, d.editor_line, d.editor_notes, d.reviewed_at,
-                   p.title AS title
+                   p.title AS title, d.short_code AS short_code
             FROM drafts d
             LEFT JOIN pool p ON p.id = d.pool_id
             WHERE d.status = 'rejected'
@@ -408,7 +410,7 @@ def stuck_captures(conn: sqlite3.Connection) -> list[dict]:
         dict(r)
         for r in conn.execute(
             """
-            SELECT d.id AS draft_id, p.title AS title
+            SELECT d.id AS draft_id, p.title AS title, d.short_code AS short_code
             FROM drafts d
             LEFT JOIN pool p ON p.id = d.pool_id
             WHERE d.status = 'approved'

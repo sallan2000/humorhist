@@ -840,11 +840,12 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     for r in rows:
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
-        lines.append(f"  • #{did} {title}")
+        short = r.get("short_code") or did
+        lines.append(f"  • #{short} {title}")
         keyboard.append(
             [
-                {"text": f"👁 Open: {title[:18]} (#{did})", "callback_data": f"view:{did}"},
-                {"text": f"❌ Reject #{did}", "callback_data": f"reject:{did}"},
+                {"text": f"👁 Open: {title[:18]} (#{short})", "callback_data": f"view:{did}"},
+                {"text": f"❌ Reject #{short}", "callback_data": f"reject:{did}"},
             ]
         )
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
@@ -873,8 +874,9 @@ def send_rejected_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     for r in rows:
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
-        lines.append(f"  • #{did} {title}")
-        keyboard.append([{"text": f"↩️ Reopen: {title[:18]} (#{did})", "callback_data": f"reopen:{did}"}])
+        short = r.get("short_code") or did
+        lines.append(f"  • #{short} {title}")
+        keyboard.append([{"text": f"↩️ Reopen: {title[:18]} (#{short})", "callback_data": f"reopen:{did}"}])
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
@@ -902,8 +904,9 @@ def send_deferred_list(conn: sqlite3.Connection, client: TelegramTransport, chat
     for r in rows:
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
-        lines.append(f"  • #{did} {title}")
-        keyboard.append([{"text": f"⏩ Review now: {title[:16]} (#{did})", "callback_data": f"reviewnow:{did}"}])
+        short = r.get("short_code") or did
+        lines.append(f"  • #{short} {title}")
+        keyboard.append([{"text": f"⏩ Review now: {title[:16]} (#{short})", "callback_data": f"reviewnow:{did}"}])
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
     return len(rows)
 
@@ -1007,6 +1010,7 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
     for r in rows:
         title = r["title"] or "(unknown)"
         did = r["draft_id"]
+        short = r.get("short_code") or did
         copy = r.get("post_copy")
         if copy:
             snippet = copy if len(copy) <= 80 else copy[:77] + "..."
@@ -1014,7 +1018,7 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         else:
             snippet = "(no copy yet)"
             status = f"0/{limit}"
-        lines.append(f"  • #{did} {title}\n    {snippet}  [{status}]")
+        lines.append(f"  • #{short} {title}\n    {snippet}  [{status}]")
         link = db.get_source_link(conn, did)
         if link:
             lines.append(f"    🔗 {db.shorten_url(link, shorten=False)}")
@@ -1022,15 +1026,15 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         # shares the ↩️ glyph with 'Reopen').
         keyboard.append(
             [
-                {"text": f"✏️ Edit copy #{did}", "callback_data": f"copy:{did}"},
-                {"text": f"🗑 Remove #{did}", "callback_data": f"remove:{did}"},
+                {"text": f"✏️ Edit copy #{short}", "callback_data": f"copy:{did}"},
+                {"text": f"🗑 Remove #{short}", "callback_data": f"remove:{did}"},
             ]
         )
         # Row 2: reject (confirm-gated) + reopen to pending.
         keyboard.append(
             [
-                {"text": f"❌ Reject #{did}", "callback_data": f"reject:{did}"},
-                {"text": f"↩️ Reopen #{did}", "callback_data": f"reopen:{did}"},
+                {"text": f"❌ Reject #{short}", "callback_data": f"reject:{did}"},
+                {"text": f"↩️ Reopen #{short}", "callback_data": f"reopen:{did}"},
             ]
         )
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
@@ -1622,9 +1626,10 @@ def send_reviewed_summary(conn: db.Connection, client: TelegramTransport, chat_i
         ]
         keyboard: list[list[dict]] = []
         for s in stuck:
-            lines.append(f"  • #{s['draft_id']} {s['title'] or '(unknown)'}")
+            short = s.get("short_code") or s["draft_id"]
+            lines.append(f"  • #{short} {s['title'] or '(unknown)'}")
             keyboard.append(
-                [{"text": f"📝 Add joke: #{s['draft_id']}", "callback_data": f"setjoke:{s['draft_id']}"}]
+                [{"text": f"📝 Add joke: #{short}", "callback_data": f"setjoke:{s['draft_id']}"}]
             )
         lines.append("Tap a draft above to add its joke, or run /setjoke <id>.")
         client.send_message(

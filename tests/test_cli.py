@@ -299,7 +299,10 @@ def test_queue_enqueue_moves_approved(dbpath, monkeypatch, capsys):
     # now listed
     rc = main(["--db", dbpath, "queue"])
     out = capsys.readouterr().out
-    assert "d1" in out
+    # the listing renders the short_code, not the 16-char internal id
+    short = conn.execute("SELECT short_code FROM drafts WHERE id='d1'").fetchone()["short_code"]
+    assert short in out
+    assert "d1" not in out
     # idempotent: second enqueue adds nothing
     rc = main(["--db", dbpath, "queue", "--enqueue"])
     out = capsys.readouterr().out

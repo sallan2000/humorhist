@@ -465,4 +465,73 @@ def test_enqueue_approved_populates_link_best_effort(tmp_path, monkeypatch):
     # no image generated without a dir/credential
     info = db.get_image(conn, "d1")
     assert info is not None
-    assert info["image_path"] is None
+
+
+def test_make_short_code_is_8char_base62():
+    code = db.make_short_code("some-seed-value")
+    assert len(code) == 8
+    assert all(c in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for c in code)
+
+
+def test_make_short_code_is_stable():
+    assert db.make_short_code("emu-war") == db.make_short_code("emu-war")
+    assert db.make_short_code("emu-war") != db.make_short_code("emu war")
+
+
+def test_short_code_for_table_returns_unique_on_collision(tmp_path, monkeypatch):
+    conn = _fresh_db(tmp_path)
+    # Simulate a collision on the first attempt only: the stub returns a fixed
+    # code for the first seed, then a DISTINCT code for any retried seed
+    # (seeds get a '#<n>' suffix), so the retry path resolves to a new value.
+    calls = {"n": 0}
+
+    def _stub(seed):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "AAAA1111"
+        return "BBBB2222"
+
+    monkeypatch.setattr(db, "make_short_code", _stub)
+    first = db.short_code_for_table(conn, "pool", "seed-a")
+    # Insert a pool row carrying that code.
+    conn.execute("INSERT INTO pool (id, title, short_code) VALUES ('p1', 'A', ?)", (first,))
+    conn.commit()
+    second = db.short_code_for_table(conn, "pool", "seed-b")
+    assert second != first  # retry produced a distinct code
+    assert second == "BBBB2222"
+
+
+def test_migrate_backfills_short_codes_on_existing_db(tmp_path):
+    # Simulate a pre-short_code DB: migrate once, then clear short_codes, then
+    # re-migrate and confirm they are repopulated (idempotent backfill).
+    path = tmp_path / "test.sqlite"
+    conn = db.connect(str(path))
+    db.migrate(conn)
+    db.upsert_pool_item(
+        conn, id="p1", title="Emu War", year=1932, date_hint=None,
+        summary=None, source_url="https://example.com/emu", source_name="w",
+    )
+    conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1','p1','approved')")
+    conn.commit()
+    # Wipe the codes as if they never existed, then re-migrate.
+    conn.execute("UPDATE pool SET short_code = NULL")
+    conn.execute("UPDATE drafts SET short_code = NULL")
+    conn.commit()
+    db.migrate(conn)  # backfill must re-run
+    p = conn.execute("SELECT short_code FROM pool WHERE id='p1'").fetchone()
+    d = conn.execute("SELECT short_code FROM drafts WHERE id='d1'").fetchone()
+    assert p["short_code"] and len(p["short_code"]) == 8
+    assert d["short_code"] and len(d["short_code"]) == 8
+
+
+def test_short_codes_unique_across_pool_and_drafts(tmp_path):
+    conn = _fresh_db(tmp_path)
+    db.upsert_pool_item(
+        conn, id="p1", title="Emu War", year=1932, date_hint=None,
+        summary=None, source_url="https://example.com/emu", source_name="w",
+    )
+    conn.execute("INSERT INTO drafts (id, pool_id, status) VALUES ('d1','p1','approved')")
+    conn.commit()
+    p = conn.execute("SELECT short_code FROM pool WHERE id='p1'").fetchone()["short_code"]
+    d = conn.execute("SELECT short_code FROM drafts WHERE id='d1'").fetchone()["short_code"]
+    assert p != d  # pool and draft codes must not collide

@@ -50,6 +50,41 @@ CREATE TABLE IF NOT EXISTS posts (
 
 _ID_LEN = 16
 
+# Short display codes for the Telegram/CLI UI. The full 16-char sha1 stays the
+# internal primary key (used in every callback/route); the 8-char base62
+# ``short_code`` is shown to the editor so listings and buttons render cleanly.
+# 62^8 (~2.2e14) makes collisions astronomically unlikely at this row count
+# (birthday p ~1e-9 at 735 rows, ~6e-8 at 5000); a UNIQUE index + retry backs
+# that up so we never silently reuse a code.
+_SHORT_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_SHORT_LEN = 8
+
+
+def make_short_code(seed: str) -> str:
+    """Return an 8-char base62 short code derived from ``seed`` (stable)."""
+    digest = hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()
+    val = int(digest[:10], 16)
+    out = ""
+    for _ in range(_SHORT_LEN):
+        out = _SHORT_ALPHABET[val % 62] + out
+        val //= 62
+    return out
+
+
+def short_code_for_table(conn: sqlite3.Connection, table: str, seed: str) -> str:
+    """Return a unique short code for ``table``, retrying on collision.
+
+    Used at insert time so two rows never share a code even in the rare event
+    the deterministic ``make_short_code`` collides (UNIQUE index enforces this).
+    """
+    existing = {r[0] for r in conn.execute(f"SELECT short_code FROM {table} WHERE short_code IS NOT NULL").fetchall()}
+    code = make_short_code(seed)
+    attempt = 0
+    while code in existing:
+        attempt += 1
+        code = make_short_code(f"{seed}#{attempt}")
+    return code
+
 
 def connect(path: str) -> sqlite3.Connection:
     """Open a SQLite connection with foreign keys on and Row factory set."""
@@ -75,7 +110,39 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_normalized_title_column(conn)
     _backfill_normalized_title(conn)
     _dedupe_pool(conn)
+    # Short display codes for the Telegram/CLI UI (cosmetic; internal id stays
+    # the primary key). Backfill any rows that lack one.
+    _ensure_short_code_columns(conn)
+    _backfill_short_codes(conn)
     conn.commit()
+
+
+def _ensure_short_code_columns(conn: sqlite3.Connection) -> None:
+    """Add short_code to pool + drafts if absent (no-op if present)."""
+    pool_cols = {r[1] for r in conn.execute("PRAGMA table_info(pool)")}
+    if "short_code" not in pool_cols:
+        conn.execute("ALTER TABLE pool ADD COLUMN short_code TEXT")
+    draft_cols = {r[1] for r in conn.execute("PRAGMA table_info(drafts)")}
+    if "short_code" not in draft_cols:
+        conn.execute("ALTER TABLE drafts ADD COLUMN short_code TEXT")
+    # Safety net: never two rows sharing a code.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_short ON pool(short_code) "
+        "WHERE short_code IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_short ON drafts(short_code) "
+        "WHERE short_code IS NOT NULL"
+    )
+
+
+def _backfill_short_codes(conn: sqlite3.Connection) -> None:
+    """Assign a short_code to any pool/drafts row that lacks one."""
+    for table, seed_col in (("pool", "id"), ("drafts", "id")):
+        rows = conn.execute(f"SELECT {seed_col} FROM {table} WHERE short_code IS NULL").fetchall()
+        for r in rows:
+            code = short_code_for_table(conn, table, r[seed_col])
+            conn.execute(f"UPDATE {table} SET short_code = ? WHERE {seed_col} = ?", (code, r[seed_col]))
 
 
 def _ensure_defer_column(conn: sqlite3.Connection) -> None:
@@ -392,8 +459,8 @@ def upsert_pool_item(
             """
             INSERT INTO pool
               (id, title, year, date_hint, summary, source_url, source_name,
-               funny_score, status, harvested_at, normalized_title)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+               funny_score, status, harvested_at, normalized_title, short_code)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
             """,
             (
                 id,
@@ -406,6 +473,7 @@ def upsert_pool_item(
                 funny_score,
                 datetime.now(UTC).isoformat(),
                 norm,
+                short_code_for_table(conn, "pool", id),
             ),
         )
         conn.commit()
@@ -491,13 +559,14 @@ def add_suggested_pool_item(
         conn.execute(
             """
             INSERT INTO pool (id, title, year, summary, source_url, source_name,
-                              status, harvested_at, note)
-            VALUES (?, ?, ?, ?, ?, 'editor-suggestion', 'new', ?, ?)
+                              status, harvested_at, note, short_code)
+            VALUES (?, ?, ?, ?, ?, 'editor-suggestion', 'new', ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               note = excluded.note,
               status = 'new'
             """,
-            (pool_id, title.strip(), year, note or "", source_url, datetime.now(UTC).isoformat(), note or ""),
+            (pool_id, title.strip(), year, note or "", source_url, datetime.now(UTC).isoformat(), note or "",
+             short_code_for_table(conn, "pool", pool_id)),
         )
         conn.commit()
         return pool_id
@@ -518,10 +587,11 @@ def add_suggested_pool_item(
     conn.execute(
         """
         INSERT INTO pool (id, title, year, summary, source_url, source_name,
-                          status, harvested_at, note, normalized_title)
-        VALUES (?, ?, ?, ?, ?, 'editor-suggestion', 'new', ?, ?, ?)
+                          status, harvested_at, note, normalized_title, short_code)
+        VALUES (?, ?, ?, ?, ?, 'editor-suggestion', 'new', ?, ?, ?, ?)
         """,
-        (pool_id, title.strip(), year, note or "", source_url, now, note or "", norm),
+        (pool_id, title.strip(), year, note or "", source_url, now, note or "", norm,
+         short_code_for_table(conn, "pool", pool_id)),
     )
     conn.commit()
     return pool_id

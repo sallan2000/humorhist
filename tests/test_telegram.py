@@ -192,6 +192,7 @@ def test_handle_callback_approve_cancel_is_noop(tmp_path):
             "editor_notes": None,
             "reviewed_at": None,
             "defer_until": None,
+            "short_code": None,
         }
     ]
 
@@ -694,6 +695,24 @@ def test_listapproved_lists_greenlit_drafts_with_buttons(tmp_path):
     # the approved draft has an inline 'view' button (opens content + add notes)
     btns = msg["reply_markup"]["inline_keyboard"]
     assert btns[0][0]["callback_data"] == "view:d1"
+
+
+def test_listapproved_renders_short_code_not_full_id(tmp_path):
+    conn = _fresh_db(tmp_path)
+    conn.execute("INSERT OR IGNORE INTO pool (id, title) VALUES ('p1','Emu War')")
+    conn.execute(
+        "INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at, short_code) "
+        "VALUES ('d1','p1','{}','{}','approved','2026-01-01T00:00:00+00:00','K7m2Qp9x')"
+    )
+    conn.commit()
+    stub = tg.StubTelegram()
+    n = tg.send_approved_list(conn, stub, "chat")
+    assert n == 1
+    text = stub.sent[0]["text"]
+    assert "K7m2Qp9x" in text          # short code shown to the editor
+    assert "d1" not in text            # full 16-char id is NOT dumped in the listing
+    # but the button still routes on the real id
+    assert stub.sent[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "view:d1"
 
 
 def test_listapproved_add_notes_via_button(tmp_path):

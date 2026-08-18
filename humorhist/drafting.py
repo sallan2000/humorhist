@@ -104,8 +104,8 @@ def draft_one(
     conn.execute(
         """
         INSERT INTO drafts
-          (id, pool_id, brief_json, angles_json, status, created_at)
-        VALUES (?, ?, ?, ?, 'pending', ?)
+          (id, pool_id, brief_json, angles_json, status, created_at, short_code)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?)
         """,
         (
             draft_id,
@@ -113,6 +113,7 @@ def draft_one(
             json.dumps(brief, ensure_ascii=False),
             json.dumps(angles, ensure_ascii=False),
             now,
+            db.short_code_for_table(conn, "drafts", draft_id),
         ),
     )
     db.set_status(conn, "pool", item["id"], "drafted")
