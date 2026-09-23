@@ -11,22 +11,20 @@ Each phase is idempotent and failure-isolated:
                overwrites an existing (possibly reviewed/approved) draft.
   - nudge    : best-effort Telegram ping if fresh pending drafts appeared.
 
-The LLM token is re-read per network call so a long run survives the hourly
-Nous token expiry (it only refreshes while Hermes runs).
+The LLM client is built via resilient_client() (HUMORHIST_LLM_API_KEY, falling
+back to the live Nous OAuth token) — the same credential path the buffer timer
+and Telegram bot use. Pass a 300s timeout since the hy3 model is slow.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-AUTH = Path.home() / ".hermes" / "auth.json"
 LOG = REPO / "data" / "weekly_pipeline.log"
 
 sys.path.insert(0, str(REPO))
@@ -41,7 +39,7 @@ os.environ.setdefault("HUMORHIST_LLM_MODEL", "tencent/hy3:free")
 
 
 def log(msg: str) -> None:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {msg}"
     print(line, flush=True)
     LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -49,14 +47,15 @@ def log(msg: str) -> None:
         fh.write(line + "\n")
 
 
-def current_token() -> str:
-    return json.loads(AUTH.read_text())["providers"]["nous"]["access_token"]
-
-
 def _llm():
-    from humorhist.llm import NousClient
+    from humorhist.llm import resilient_client
 
-    return NousClient(api_key=current_token(), max_retries=2, timeout=300.0)
+    # Use the same unattended credential path as the buffer timer / Telegram bot
+    # (HUMORHIST_LLM_API_KEY, falling back to the Nous OAuth token). The old
+    # current_token() path read the OAuth token directly and 404'd on the hy3
+    # endpoint, so the weekly harvest never produced drafts despite the key being
+    # set in .env. Pass a 300s timeout since hy3 is slow.
+    return resilient_client(timeout=300.0)
 
 
 def main() -> int:

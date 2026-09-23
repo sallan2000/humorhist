@@ -824,6 +824,7 @@ HELP_TEXT = (
     "    /listlater - list deferred drafts; tap to bring one forward now\n"
     "    /reviewnow [<id>] - bring a deferred draft (or ALL) back for review\n"
     "/setjoke <id> - set the one-line joke on an approved draft (fixes a blank capture)\n"
+    "/jokes - list approved drafts missing their one-line joke (tap to fill one)\n"
     "/notes <id> - steer angles (pending draft) or add notes (approved); reply to the prompt\n"
     "/listapproved - list approved drafts with their #id; tap one to open it\n"
     "    each row also has a ❌ Reject button (confirm-gated) to un-approve it\n"
@@ -876,7 +877,7 @@ def send_approved_list(conn: sqlite3.Connection, client: TelegramTransport, chat
         keyboard.append(
             [
                 {"text": f"👁 Open: {title[:18]} (#{short})", "callback_data": f"view:{did}"},
-                {"text": f"❌ Reject #{short}", "callback_data": f"reject:{did}"},
+                {"text": f"❌ Reject: {title[:16]} (#{short})", "callback_data": f"reject:{did}"},
             ]
         )
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
@@ -1057,15 +1058,15 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         # shares the ↩️ glyph with 'Reopen').
         keyboard.append(
             [
-                {"text": f"✏️ Edit copy #{short}", "callback_data": f"copy:{did}"},
-                {"text": f"🗑 Remove #{short}", "callback_data": f"remove:{did}"},
+                {"text": f"✏️ Edit: {title[:16]} (#{short})", "callback_data": f"copy:{did}"},
+                {"text": f"🗑 Remove: {title[:16]} (#{short})", "callback_data": f"remove:{did}"},
             ]
         )
         # Row 2: reject (confirm-gated) + reopen to pending.
         keyboard.append(
             [
-                {"text": f"❌ Reject #{short}", "callback_data": f"reject:{did}"},
-                {"text": f"↩️ Reopen #{short}", "callback_data": f"reopen:{did}"},
+                {"text": f"❌ Reject: {title[:16]} (#{short})", "callback_data": f"reject:{did}"},
+                {"text": f"↩️ Reopen: {title[:16]} (#{short})", "callback_data": f"reopen:{did}"},
             ]
         )
     client.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard})
@@ -1484,6 +1485,8 @@ def run_review_bot(
                 send_draft_content(conn, client, chat_id, target[1])
         elif cmd == "/status":
             send_reviewed_summary(conn, client, chat_id)
+        elif cmd == "/jokes":
+            send_stuck_jokes_list(conn, client, chat_id)
         elif cmd == "/later":
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
@@ -1700,23 +1703,51 @@ def send_reviewed_summary(conn: db.Connection, client: TelegramTransport, chat_i
     """
     text = format_reviewed_summary(review.reviewed_summary(conn))
     client.send_message(chat_id, text)
+    if review.stuck_captures(conn):
+        send_stuck_jokes_list(conn, client, chat_id)
+    return text
+
+
+def send_stuck_jokes_list(
+    conn: sqlite3.Connection, client: TelegramTransport, chat_id: str
+) -> int:
+    """DM approved+queued drafts that still lack a one-line joke (editor_line).
+
+    Each row shows the topic title alongside the #short_code and carries an inline
+    📝 Add joke button (setjoke:<id>) that prompts for the joke directly. Used by:
+    - ``/jokes`` (dedicated command for filling missing jokes)
+    - ``/status`` nudge (via ``send_reviewed_summary``)
+
+    Returns the count listed (0 if none are stuck).
+    """
     stuck = review.stuck_captures(conn)
-    if stuck:
-        lines = [
-            f"⚠️ {len(stuck)} approved draft(s) are missing their one-line joke "
-            f"(committed but the joke was never captured):"
-        ]
-        keyboard: list[list[dict]] = []
-        for s in stuck:
-            short = s.get("short_code") or s["draft_id"]
-            lines.append(f"  • #{short} {s['title'] or '(unknown)'}")
-            keyboard.append(
-                [{"text": f"📝 Add joke: #{short}", "callback_data": f"setjoke:{s['draft_id']}"}]
-            )
-        lines.append("Tap a draft above to add its joke, or run /setjoke <id>.")
+    if not stuck:
         client.send_message(
             chat_id,
-            "\n".join(lines),
-            reply_markup={"inline_keyboard": keyboard},
+            "No stuck jokes — every approved draft has its one-line joke. 🎭",
         )
-    return text
+        return 0
+    lines = [
+        f"⚠️ {len(stuck)} approved draft(s) are missing their one-line joke "
+        f"(committed but the joke was never captured):",
+        "  Tap a draft's 📝 Add joke button to fill it (or /setjoke <id>).",
+    ]
+    keyboard: list[list[dict]] = []
+    for s in stuck:
+        title = s["title"] or "(unknown)"
+        short = s.get("short_code") or s["draft_id"]
+        lines.append(f"  • #{short} {title}")
+        keyboard.append(
+            [
+                {
+                    "text": f"📝 Add joke: {title[:16]} (#{short})",
+                    "callback_data": f"setjoke:{s['draft_id']}",
+                }
+            ]
+        )
+    client.send_message(
+        chat_id,
+        "\n".join(lines),
+        reply_markup={"inline_keyboard": keyboard},
+    )
+    return len(stuck)

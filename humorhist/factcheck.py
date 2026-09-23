@@ -255,7 +255,7 @@ def factcheck(client: LLMClient, item: dict, extract: str) -> dict:
 
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            raw = client.complete_json(FACTCHECK_SYSTEM_PROMPT, prompt)
+            raw = client.complete_json(FACTCHECK_SYSTEM_PROMPT, prompt, reasoning_off=True)
         except LLMError as exc:
             last_error = str(exc)
         else:

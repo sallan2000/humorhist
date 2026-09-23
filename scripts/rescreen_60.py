@@ -9,30 +9,35 @@ screen_pool only touches NULL rows. This script:
   3. re-scores exactly those rows via score_batch (the 681 never-screened
      NULL rows are left untouched),
   4. prints before/after for each.
+
+Uses resilient_client() (HUMORHIST_LLM_API_KEY, falling back to the live Nous
+OAuth token) -- the same credential path the weekly pipeline / buffer timer use.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-AUTH = Path.home() / ".hermes" / "auth.json"
 DB = REPO / "data" / "humorhist.sqlite"
 
 os.environ.setdefault("HUMORHIST_LLM_MODEL", "tencent/hy3:free")
 
 import humorhist.db as db
 from humorhist.harvest.screen import score_batch
-from humorhist.llm import NousClient
 
 BATCH = 20
 
 
 def main() -> int:
-    token = json.loads(AUTH.read_text())["providers"]["nous"]["access_token"]
-    client = NousClient(api_key=token, max_retries=2, timeout=300.0)
+    try:
+        from humorhist.llm import resilient_client
+
+        client = resilient_client(timeout=300.0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: cannot build LLM client: {exc}")
+        return 2
 
     conn = db.connect(str(DB))
     db.migrate(conn)

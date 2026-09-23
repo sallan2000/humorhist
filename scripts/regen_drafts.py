@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate existing drafts under the new prompts, then draft fresh candidates.
 
-Two phases, each re-reading the Nous OAuth token per item so the run survives
-the hourly token expiry (token only refreshes while Hermes runs):
+Both phases build their LLM client from the unattended credential path
+(HUMORHIST_LLM_API_KEY, falling back to the live Nous OAuth token) via
+resilient_client(), re-creating the client each item so a long run survives the
+hourly token expiry.
 
   1. REGEN: re-run draft_one on the pool items backing the existing drafts,
      replacing their brief/angles with output from the current (post
@@ -16,18 +18,16 @@ Runs as a durable systemd --user unit.
 from __future__ import annotations
 
 import argparse
-import json
+import logging
 import os
 import sys
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-AUTH = Path.home() / ".hermes" / "auth.json"
-LOG = REPO / "data" / "regen_drafts.log"
-
 sys.path.insert(0, str(REPO))
+
+LOG = REPO / "data" / "regen_drafts.log"
 
 # Load a local .env (gitignored) into os.environ so HUMORHIST_TELEGRAM_* work
 # without manual exports.
@@ -37,27 +37,16 @@ env.load_env()
 
 os.environ.setdefault("HUMORHIST_LLM_MODEL", "tencent/hy3:free")
 
+logger = logging.getLogger("regen_drafts")
+
 
 def log(msg: str) -> None:
-    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    stamp = datetime.now(UTC).strftime("%H:%M:%S")
     line = f"[{stamp}] {msg}"
     print(line, flush=True)
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a") as fh:
         fh.write(line + "\n")
-
-
-def current_token() -> str:
-    return json.loads(AUTH.read_text())["providers"]["nous"]["access_token"]
-
-
-def token_expiry_minutes() -> float:
-    try:
-        d = json.loads(AUTH.read_text())
-        exp = datetime.fromisoformat(d["providers"]["nous"]["expires_at"].replace("Z", "+00:00"))
-        return (exp - datetime.now(timezone.utc)).total_seconds() / 60
-    except Exception:
-        return -1.0
 
 
 def main() -> int:
@@ -69,7 +58,7 @@ def main() -> int:
 
     import humorhist.db as db
     from humorhist.drafting import draft_candidates, draft_one
-    from humorhist.llm import NousClient
+    from humorhist.llm import LLMUnavailable, resilient_client
 
     conn = db.connect(args.db)
     db.migrate(conn)
@@ -87,10 +76,14 @@ def main() -> int:
         if row is None:
             log(f"  skip {pid}: pool row missing")
             continue
-        mins = token_expiry_minutes()
         title = row["title"]
-        log(f"  regen {title[:50]!r} | token {mins:.0f}m left")
-        client = NousClient(api_key=current_token(), max_retries=2, timeout=300.0)
+        log(f"  regen {title[:50]!r}")
+        try:
+            client = resilient_client(timeout=300.0)
+        except LLMUnavailable as exc:
+            log(f"    SKIP {title[:40]}: no LLM credential ({exc})")
+            regen_fail += 1
+            continue
         try:
             did = draft_one(conn, client, row)
             regen_ok += 1
@@ -103,14 +96,16 @@ def main() -> int:
 
     # --- Phase 2: fresh candidates ----------------------------------------
     log(f"FRESH: drafting {args.fresh_count} new candidates (min_score={args.min_score})")
-    mins = token_expiry_minutes()
-    client = NousClient(api_key=current_token(), max_retries=2, timeout=300.0)
-    log(f"  token {mins:.0f}m left")
-    # draft_candidates samples from window*4; a fresh token mid-run would need a
-    # re-read, but this is a single call selecting <= count items.
-    result = draft_candidates(
-        conn, client, count=args.fresh_count, min_score=args.min_score
-    )
+    try:
+        client = resilient_client(timeout=300.0)
+    except LLMUnavailable as exc:
+        log(f"FRESH: no LLM credential -- skipping ({exc})")
+        result = {"drafted": 0, "failed": 0}
+    else:
+        log("  drafting...")
+        result = draft_candidates(
+            conn, client, count=args.fresh_count, min_score=args.min_score
+        )
     log(f"FRESH result: {result}")
 
     # --- Summary ----------------------------------------------------------

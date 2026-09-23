@@ -42,10 +42,6 @@ CREATE TABLE IF NOT EXISTS queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id TEXT REFERENCES drafts(id),
   scheduled_for TEXT, published INT DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS posts (
-  draft_id TEXT PRIMARY KEY, slug TEXT, url TEXT,
-  tweet_id TEXT, published_at TEXT
-);
 """
 
 _ID_LEN = 16
@@ -651,9 +647,9 @@ def draft_exists_for_pool(conn: sqlite3.Connection, pool_id: str) -> bool:
 
 
 def counts(conn: sqlite3.Connection) -> dict:
-    """Return a dict of row counts for pool, drafts, queue, posts."""
+    """Return a dict of row counts for pool, drafts, queue."""
     result: dict[str, int] = {}
-    for table in ("pool", "drafts", "queue", "posts"):
+    for table in ("pool", "drafts", "queue"):
         cur = conn.execute(f"SELECT COUNT(*) AS n FROM {table}")
         result[table] = int(cur.fetchone()["n"])
     return result

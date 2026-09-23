@@ -272,6 +272,7 @@ def generate_angles(
                 prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                reasoning_off=True,
             )
             return validate_angles(raw)
         except (AnglesError, LLMError) as exc:

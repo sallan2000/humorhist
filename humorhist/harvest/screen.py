@@ -114,7 +114,7 @@ def score_batch(client: LLMClient, items: list[dict]) -> dict[str, float]:
         return {}
 
     prompt = build_batch_prompt(items)
-    result = client.complete_json(SCREEN_SYSTEM_PROMPT, prompt)
+    result = client.complete_json(SCREEN_SYSTEM_PROMPT, prompt, reasoning_off=True)
 
     if not isinstance(result, list):
         raise LLMError(f"expected a JSON array of scores, got {type(result).__name__}")

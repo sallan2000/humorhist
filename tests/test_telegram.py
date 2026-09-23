@@ -1177,6 +1177,35 @@ def test_status_nudge_offers_setjoke_button(tmp_path):
     assert "setjoke:d1" in cbs
 
 
+def test_jokes_command_lists_stuck_drafts_with_title(tmp_path):
+    """/jokes lists only approved+queued drafts missing a one-line joke,
+    showing the topic title alongside the #short_code so the reviewer
+    can pick which to fill without guessing."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, "d1", with_copy=True)  # no editor_line -> stuck
+    stub = tg.StubTelegram()
+    n = tg.send_stuck_jokes_list(conn, stub, "chat")
+    assert n == 1
+    text = stub.sent[-1]["text"]
+    assert "Pastry War" in text          # title shown so they can pick
+    assert "#d1" in text                 # short code shown for /setjoke <id>
+    kb = stub.sent[-1]["reply_markup"]["inline_keyboard"]
+    cbs = {b["callback_data"] for row in kb for b in row}
+    assert "setjoke:d1" in cbs
+    # button text also carries the title, not just the short code
+    all_btn = [b["text"] for row in kb for b in row]
+    assert any("Pastry War" in t for t in all_btn), all_btn
+
+
+def test_jokes_command_empty_when_no_stuck_drafts(tmp_path):
+    """/jokes with no missing jokes sends a friendly 'all caught up' message."""
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram()
+    n = tg.send_stuck_jokes_list(conn, stub, "chat")
+    assert n == 0
+    assert "No stuck jokes" in stub.sent[-1]["text"]
+
+
 def test_empty_approved_list_hints_next_action(tmp_path):
     """An empty /listapproved must tell the user what to do next, not just
     'No approved drafts yet.'."""
@@ -1193,6 +1222,24 @@ def test_empty_queue_list_hints_next_action(tmp_path):
     n = tg.send_queue_list(conn, stub, "chat")
     assert n == 0
     assert "/reviewdraft" in stub.sent[-1]["text"]
+
+
+def test_jokes_command_dispatch(tmp_path):
+    """`/jokes` through the bot loop must list stuck drafts (title + setjoke button)."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, "d1", with_copy=True)  # stuck: no editor_line
+    stub = tg.StubTelegram(
+        updates=[
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/jokes"}},
+        ]
+    )
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    full = "\n".join(m["text"] for m in stub.sent)
+    assert "Pastry War" in full
+    assert "missing their one-line joke" in full
+    cb_msgs = [m for m in stub.sent if "reply_markup" in m]
+    cbs = {b["callback_data"] for mb in cb_msgs for row in mb["reply_markup"]["inline_keyboard"] for b in row}
+    assert "setjoke:d1" in cbs
 
 
 def test_view_command_re_reads_any_draft_from_phone(tmp_path):

@@ -194,6 +194,7 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /listlater    list deferred drafts; tap one to bring it forward now
     /reviewnow [<id>]  bring a deferred (/later) draft — or ALL — back for review
     /setjoke <id> set the one-line joke on an approved draft (fixes a blank capture)
+    /jokes      list approved drafts missing their one-line joke (tap 📝 to fill one)
     /notes <id>    pending: steer the angles with a note (regenerates on reply);
                    approved: add editor notes (same as the Add notes button)
     /later <id>    defer a pending draft 30 days
@@ -265,6 +266,11 @@ the weekly timer, etc.) — you don't have to remember to poll it.
            was never captured (a "stuck capture"), then you reply with it.
            (No status/queue change — just fills the blank human voice.)
 
+    /jokes
+        → lists only the drafts still missing their one-line joke, each with the
+           topic title + a 📝 Add joke button. Tap one to fill it, or /setjoke <id>.
+           (Short for hunting stuck captures without scanning /status.)
+
     /listapproved
         → list of greenlit drafts, each with a 👁 button to open its content
           and a ❌ Reject button (confirm-gated) to un-approve it on the spot.
@@ -287,7 +293,7 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /status
         → approved / rejected / pending breakdown + buffer level; if any
            approved+queued draft is missing its one-line joke, a ⚠️ stuck-capture
-           nudge lists them (fix with /setjoke <id>).
+           nudge lists them (or run /jokes for a dedicated list; fix with /setjoke <id>).
 
     /buffer
         → buffer health (pending/queued counts, level) + on-demand top-up if
@@ -431,7 +437,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-368 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed; the real Telegram/FAL HTTP transports are mocked with respx).
+371 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed; the real Telegram/FAL HTTP transports are mocked with respx).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -480,12 +486,14 @@ undoable from chat. Approve/Reject taps open a **Confirm/Cancel gate** (GAP 3)
 so a fat-finger can't commit before you reconsider. Deferred (`/later`) drafts
 get a bring-forward path — `/listlater` lists them with a Review-now button,
 `/reviewnow [<id>]` (and a `reviewnow:` callback) clears the defer (GAP 4a).
-Approved+queued drafts missing their one-line joke (a "stuck capture") are
-surfaced as a nudge on `/status` and fixable with `/setjoke <id>` (GAP 4b).
-And an approved draft can now be un-approved or sent back to pending entirely
-from Telegram: `/listapproved` carries a ❌ Reject button and `/listqueue` rows
-carry ❌ Reject (confirm-gated) + ↩️ Reopen buttons. The CLI equivalents
-(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 368 passing.
+Approved+queued drafts missing their one-line joke (a \"stuck capture\") are
+surfaced as a nudge on `/status` and via the dedicated `/jokes` command, fixable
+with `/setjoke <id>` or a tap on the 📝 Add joke button (GAP 4b). And an approved
+draft can now be un-approved or sent back to pending entirely from Telegram:
+`/listapproved` carries a ❌ Reject button and `/listqueue` rows carry ❌ Reject
+(confirm-gated) + ↩️ Reopen buttons. All listing buttons now include the topic
+title alongside the #short_code so picks are informed. The CLI equivalents
+(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 371 passing.
 
 Manual posting (by design — no auto-post):
 - `humorhist publish` exports every queued, copy-bearing draft: the post text
@@ -548,4 +556,4 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
         weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
         fill_approved_copy.py  one-shot: generate post copy for approved+queued drafts
-    tests/                  pytest suite (368 tests)
+    tests/                  pytest suite (371 tests)

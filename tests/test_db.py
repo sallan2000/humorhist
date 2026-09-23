@@ -67,7 +67,6 @@ def test_migrate_idempotent(tmp_path):
     assert counts["pool"] == 1
     assert counts["drafts"] == 0
     assert counts["queue"] == 0
-    assert counts["posts"] == 0
 
 
 def test_make_id_stable(tmp_path):
@@ -151,7 +150,7 @@ def test_counts(tmp_path):
         source_name=None,
     )
     counts = db.counts(conn)
-    assert counts == {"pool": 1, "drafts": 0, "queue": 0, "posts": 0}
+    assert counts == {"pool": 1, "drafts": 0, "queue": 0}
 
 
 def test_migrate_adds_defer_and_note_columns(tmp_path):

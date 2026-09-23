@@ -5,22 +5,21 @@ Runs on a systemd --user timer (see humorhist-buffer.timer). Each run:
 
   1. Computes buffer depth (unpublished queued drafts == days of buffer).
   2. If pending drafts are scarce (< 5), auto-drafts more candidates
-     (best-effort; needs the Nous LLM token from ~/.hermes/auth.json).
+     (best-effort; uses HUMORHIST_LLM_API_KEY or the live Nous OAuth token).
   3. If the buffer is low (< 7 days) or critical (< 3), DMs a Telegram alert.
      Healthy buffers stay silent — no nagging when there's a week+ of content.
 
-The LLM token is re-read per network call so a long run survives the hourly
-Nous token expiry (it only refreshes while Hermes runs). A missing token just
-means auto-draft is skipped; the report + Telegram alert still work.
+  The LLM credential is re-read per network call via resilient_client() so a long
+  run survives the hourly Nous token expiry. A missing credential just means
+  auto-draft is skipped; the report + Telegram alert still work.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,7 +35,7 @@ os.environ.setdefault("HUMORHIST_LLM_MODEL", "tencent/hy3:free")
 
 
 def log(msg: str) -> None:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {msg}"
     print(line, flush=True)
     LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -69,8 +68,8 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    import humorhist.db as db
     import humorhist.buffer as buf
+    import humorhist.db as db
     from humorhist import telegram as tg
 
     conn = db.connect(args.db)
