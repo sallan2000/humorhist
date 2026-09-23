@@ -592,7 +592,10 @@ def test_run_review_bot_one_by_one(tmp_path):
     # GAP 3 confirm gate each draft yields TWO button messages (the Approve
     # tap, then the Confirm/Cancel gate) = 4 total for two drafts.
     button_msgs = [m for m in stub.sent if "reply_markup" in m]
-    assert len(button_msgs) == 4  # 2 drafts x (approve + confirm), not 8 simultaneously
+    # 3 per draft: the draft card (Approve/Reject/Later), the GAP 3 Confirm/Cancel
+    # gate, and the ⏭ Skip (no notes) prompt on the optional notes step. = 6 for
+    # two drafts, shown one at a time (not dumped all at once up front).
+    assert len(button_msgs) == 6
     # and the confirm gate was actually shown for each
     assert sum("confirm:approve:d1" in str(m) for m in button_msgs) == 1
     assert sum("confirm:approve:d2" in str(m) for m in button_msgs) == 1
@@ -1376,12 +1379,12 @@ def test_reviewnow_callback_when_not_deferred_is_safe(tmp_path):
     assert any("Cannot bring forward" in m["text"] for m in stub.sent)
 
 
-def test_setjoke_callback_opens_generate_or_type_menu(tmp_path):
-    """GAP 4b (extended): setjoke:<id> now offers LLM generate + type-myself,
-    instead of a bare reply box with no LLM option."""
+def test_setjoke_callback_prompts_for_joke_not_a_menu(tmp_path):
+    """The nudge's 📝 Add joke button (setjoke:<id>) must prompt for the one-line
+    joke, NOT open a copy-editing menu -- the old menu only wrote queue.post_copy
+    and never touched editor_line, so the stuck-capture nudge never cleared (HIGH-1)."""
     conn = _fresh_db(tmp_path)
-    _seed_pending(conn, "d1")
-    review.apply_review(conn, "d1", decision="approve")  # approved + queued, no joke
+    _seed_approved_queued(conn, draft_id="d1", with_copy=True)  # approved+queued, no editor_line
     stub = tg.StubTelegram()
     res = tg.handle_callback(
         conn,
@@ -1389,37 +1392,51 @@ def test_setjoke_callback_opens_generate_or_type_menu(tmp_path):
         "chat",
         {"update_id": 1, "callback_query": {"id": "cb1", "data": "setjoke:d1", "message": {"message_id": 1}}},
     )
-    assert res is None  # menu is self-contained; no awaiting state
-    menu = [m for m in stub.sent if "reply_markup" in m][-1]
-    cbs = {b["callback_data"] for b in menu["reply_markup"]["inline_keyboard"][0]}
-    assert "regencopy:d1" in cbs  # LLM generate, works with no joke/note
-    assert "editcopy:d1" in cbs   # type the joke manually
+    # returns the editor_line capture state (re-uses the /setjoke <id> path)
+    assert res is not None
+    assert res["stage"] == "editor_line"
+    assert res.get("setjoke") is True
+    assert res["decision"] == "approve"
+    # the prompt asks for the joke, and NO copy-editing menu was sent
+    texts = [m["text"] for m in stub.sent]
+    assert any("one-line joke" in t for t in texts)
+    assert not any("reply_markup" in m for m in stub.sent)  # no regencopy/editcopy mis-route
 
 
-def test_setjoke_menu_generate_works_with_no_joke(tmp_path, monkeypatch):
-    """From the 'Add joke' menu, tapping Generate copy (LLM) regenerates note-free."""
+def test_setjoke_callback_resolves_stuck_capture(tmp_path):
+    """End-to-end: nudge button -> reply with joke -> editor_line set + no longer stuck."""
     conn = _fresh_db(tmp_path)
-    _seed_approved_queued(conn, draft_id="d1", with_copy=False)
-    assert conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()["editor_line"] is None
+    _seed_approved_queued(conn, draft_id="d1", with_copy=True)
+    assert review.stuck_captures(conn), "precondition: d1 is a stuck capture"
 
-    def fake_fill(conn2, llm, draft_id=None, force=False):
-        cw.set_post_copy(conn2, draft_id or "d1", "LLM draft from angles, no joke needed.")
-        return 1
-
-    import humorhist.copywriter as cw
-
-    monkeypatch.setattr(cw, "fill_post_copy", fake_fill)
-    monkeypatch.setattr(tg, "_get_llm", lambda chat_id, client: object())
     stub = tg.StubTelegram()
     res = tg.handle_callback(
         conn,
         stub,
         "chat",
-        {"update_id": 1, "callback_query": {"id": "cb1", "data": "regencopy:d1", "message": {"message_id": 1}}},
+        {"update_id": 1, "callback_query": {"id": "cb1", "data": "setjoke:d1", "message": {"message_id": 1}}},
     )
-    assert res is None
-    new_copy = conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"]
-    assert new_copy == "LLM draft from angles, no joke needed."
+    assert res is not None
+    awaiting = {
+        "d1": {
+            "note_message_id": res["note_message_id"],
+            "stage": res["stage"],
+            "decision": res["decision"],
+            "setjoke": res["setjoke"],
+        }
+    }
+    # reply with the joke
+    tg.handle_text(
+        conn,
+        stub,
+        "chat",
+        awaiting,
+        _text_update(2, "Emus for the win.", res["note_message_id"]),
+    )
+    row = conn.execute("SELECT editor_line FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_line"] == "Emus for the win."
+    assert review.stuck_captures(conn) == []  # no longer stuck
+    assert "Joke saved" in stub.sent[-1]["text"]
 
 
 def test_reopen_callback_sends_draft_back_to_pending(tmp_path):
@@ -2122,3 +2139,133 @@ def test_image_command_skips_without_key(tmp_path, monkeypatch):
     stub = tg.StubTelegram(updates=_message_batch("/image d1", 1))
     tg.run_review_bot(conn, stub, "chat", max_iterations=5)
     assert any("HUMORHIST_IMAGE_API_KEY" in m["text"] for m in stub.sent)
+
+
+# --- /publish (read-only export) -----------------------------------------------
+
+
+def test_publish_command_dms_read_only_export(tmp_path):
+    """HIGH-3: /publish DM's the queued, copy-bearing posts for manual pasting.
+
+    Read-only: it prints copy + link + image + readiness, posts NOTHING to any
+    platform and changes NOTHING in the DB. The text must match the shared
+    review.format_publish_export, so CLI and Telegram can't drift."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, draft_id="d1", with_copy=True)
+    before = conn.execute("SELECT post_copy, post_copy_at FROM queue WHERE draft_id='d1'").fetchall()
+    stub = tg.StubTelegram(updates=_message_batch("/publish", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    full = "\n".join(m["text"] for m in stub.sent)
+    assert "France invaded Mexico over a pastry shop." in full
+    assert "ready to paste manually" in full
+    # nothing was posted: no photo, no platform side-effect message
+    assert not any("photo" in m for m in stub.sent)
+    # DB untouched: post_copy unchanged
+    after = conn.execute("SELECT post_copy, post_copy_at FROM queue WHERE draft_id='d1'").fetchall()
+    assert after == before
+    # the DM text matches the shared formatter exactly
+    rows = [r for r in review.queued_drafts(conn) if r.get("post_copy")]
+    assert review.format_publish_export(conn, rows) in full
+
+
+def test_publish_command_empty_when_nothing_posted(tmp_path):
+    """HIGH-3: /publish with no copy-bearing queue rows tells you what to do."""
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=_message_batch("/publish", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Nothing queued with post copy yet" in m["text"] for m in stub.sent)
+
+
+def test_publish_command_skips_drafts_without_copy(tmp_path):
+    """A queued draft with no post_copy yet is omitted from the export."""
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn, draft_id="d1", with_copy=False)
+    stub = tg.StubTelegram(updates=_message_batch("/publish", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Nothing queued with post copy yet" in m["text"] for m in stub.sent)
+    assert not any("ready to paste manually" in m["text"] for m in stub.sent)
+
+
+# --- /notes (typed command) ----------------------------------------------------
+
+
+def test_notes_command_usage_without_id(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram(updates=_message_batch("/notes", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("Usage: /notes <draft_id>" in m["text"] for m in stub.sent)
+
+
+def test_notes_command_unknown_draft(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram(updates=_message_batch("/notes nope", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    assert any("No such draft" in m["text"] for m in stub.sent)
+
+
+def test_notes_command_on_pending_opens_steering_prompt(tmp_path):
+    """/notes <id> on a pending draft opens the same angle-steer prompt as the
+    Add notes button -- the typed shortcut for that button."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram(updates=_message_batch("/notes d1", 1))
+    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    full = "\n".join(m["text"] for m in stub.sent)
+    assert "STEER" in full
+    assert "/skip to keep the current angles" in full
+
+
+def test_callback_skipnotes_dismisses_notes(tmp_path):
+    """MEDIUM-4: the ⏭ Skip (no notes) button answers the callback and sends a
+    clean 'no notes saved' message (one-tap alternative to typing /skip)."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = tg.StubTelegram()
+    res = tg.handle_callback(
+        conn,
+        stub,
+        "chat",
+        {
+            "update_id": 1,
+            "callback_query": {
+                "id": "cb1",
+                "data": "skipnotes:d1",
+                "message": {"message_id": 10},
+            },
+        },
+    )
+    assert res == {"skipped": "d1"}
+    assert "cb1" in stub.answered
+    assert any("No notes saved for `d1`" in m["text"] for m in stub.sent)
+
+
+def test_skipnotes_button_clears_optional_notes(tmp_path):
+    """End-to-end: approve -> joke -> notes prompt -> tap ⏭ Skip. The optional
+    notes capture is dismissed without typing /skip, and no note is stored."""
+    conn = _fresh_db(tmp_path)
+    _seed_pending(conn, "d1")
+    stub = _SeqStub(
+        [
+            _message_batch("/reviewdraft", 1),
+            _callback_batch("d1", 2),  # approve -> confirm gate
+            _confirm_batch("d1", 3),  # confirm -> commits, joke prompt opened
+            _message_batch("emu tax dodge joke", 4),  # reply joke -> notes prompt w/ ⏭ Skip
+            [
+                {
+                    "update_id": 5,
+                    "callback_query": {
+                        "id": "cb-skip",
+                        "data": "skipnotes:d1",
+                        "message": {"message_id": 105},
+                    },
+                }
+            ],
+        ]
+    )
+    tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    assert "cb-skip" in stub.answered
+    assert any("No notes saved for `d1`" in m["text"] for m in stub.sent)
+    row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
+    assert row["editor_notes"] is None

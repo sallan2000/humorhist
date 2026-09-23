@@ -365,6 +365,37 @@ def send_pending_drafts(conn: sqlite3.Connection, client: TelegramTransport, cha
     return sent
 
 
+def _open_notes_prompt(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str, draft_id: str) -> dict:
+    """Open the notes / angle-steer prompt for a draft; return the awaiting entry.
+
+    For a *pending* draft the reply regenerates the angles using the note as
+    steering (``regenerate_angles=True``); for an already-approved draft the
+    reply is stored as a free note with ``merge=True`` so an existing
+    ``editor_line`` is never clobbered. Shared by the ``notes:<id>`` callback
+    and the ``/notes <id>`` typed command so the two can't drift.
+    """
+    row = conn.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if row is None:
+        client.send_message(chat_id, f"⚠️ No such draft: `{draft_id}`.")
+        return {"error": True}
+    is_pending = row["status"] == "pending"
+    prompt = (
+        f"Reply with a note to STEER the angles for pending draft `{draft_id}` "
+        f"(or /skip to keep the current angles):"
+        if is_pending
+        else f"Notes for already-approved draft `{draft_id}`. Reply here "
+        f"(or send /skip to leave the existing notes untouched):"
+    )
+    note = client.send_message(chat_id, prompt)
+    return {
+        "draft_id": draft_id,
+        "note_message_id": note["message_id"],
+        "stage": "notes",
+        "decision": "approve",
+        "regenerate_angles": bool(is_pending),
+    }
+
+
 def handle_callback(
     conn: sqlite3.Connection,
     client: TelegramTransport,
@@ -433,25 +464,15 @@ def handle_callback(
     if data.startswith("notes:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="add notes")
-        # For a *pending* draft, a note should regenerate the angles (steering),
-        # not just store text. For an already-approved draft, store the note.
-        row = conn.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,)).fetchone()
-        is_pending = row and row["status"] == "pending"
-        prompt = (
-            f"Reply with a note to STEER the angles for pending draft `{draft_id}` "
-            f"(or /skip to keep the current angles):"
-            if is_pending
-            else f"Notes for already-approved draft `{draft_id}`. Reply here "
-            f"(or send /skip to leave the existing notes untouched):"
-        )
-        note = client.send_message(chat_id, prompt)
-        return {
-            "draft_id": draft_id,
-            "note_message_id": note["message_id"],
-            "stage": "notes",
-            "decision": "approve",
-            "regenerate_angles": bool(is_pending),
-        }
+        return _open_notes_prompt(conn, client, chat_id, draft_id)
+    if data.startswith("skipnotes:"):
+        # ⏭ Skip (no notes): dismiss the optional notes prompt. Equivalent to a
+        # /skip reply, but a one-tap button so the reviewer never has to type it.
+        _, _, draft_id = data.partition(":")
+        client.answer_callback_query(cq["id"], text="skipped")
+        client.send_message(chat_id, f"⏭️ No notes saved for `{draft_id}`.")
+        return {"skipped": draft_id}
+
     if data.startswith("later:"):
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="deferred 30d")
@@ -516,28 +537,31 @@ def handle_callback(
         )
         return None
     if data.startswith("setjoke:"):
-        # GAP 4b fix (extended): an approved+queued draft whose joke (editor_line)
-        # was never filled. Previously this dropped straight into a bare reply box
-        # with no LLM option. Now it opens the same choice menu as the copy editor
-        # so Generate/Regenerate is always one tap away (works with no note yet).
+        # A stuck-capture nudge (from /status) or the 📝 Add joke button: the
+        # draft is approved+queued but its one-line joke (editor_line) is blank.
+        # Prompt for the joke directly. The reply is captured by handle_text's
+        # editor_line stage with setjoke=True, which calls review.set_editor_line
+        # — a targeted UPDATE that fills editor_line WITHOUT touching notes/queue.
+        #
+        # The OLD code opened a copy-editing menu (regencopy/editcopy) here, which
+        # only wrote queue.post_copy and never touched editor_line — so the
+        # stuck-capture nudge never cleared. Copy editing stays reachable via the
+        # 📝 Copy / editmenu buttons on an approved draft instead.
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="add joke")
-        menu = {
-            "inline_keyboard": [
-                [
-                    {"text": "🔄 Generate copy (LLM)", "callback_data": f"regencopy:{draft_id}"},
-                    {"text": "✏️ Write joke myself", "callback_data": f"editcopy:{draft_id}"},
-                ]
-            ]
-        }
-        client.send_message(
+        note = client.send_message(
             chat_id,
-            f"How do you want to fill the post copy for `{draft_id}`?\n"
-            f"• 🔄 Generate copy — ask the LLM for fresh copy (works with or without a joke/note)\n"
-            f"• ✏️ Write joke myself — reply with your one-line joke, then copy is generated from it",
-            reply_markup=menu,
+            f"Reply with the one-line joke (editor_line) for approved "
+            f"draft `{draft_id}` — the human voice that steers post copy "
+            f"(or /skip to leave it blank):",
         )
-        return None
+        return {
+            "draft_id": draft_id,
+            "note_message_id": note["message_id"],
+            "stage": "editor_line",
+            "decision": "approve",
+            "setjoke": True,
+        }
     if data.startswith("editmenu:"):
         # GAP fix: the ✏️ Edit button now opens a CHOICE menu (Regenerate vs type
         # manually) instead of dropping straight into a bare reply box. Regenerate
@@ -737,6 +761,9 @@ def handle_text(
         note = client.send_message(
             chat_id,
             f"Got it. Optionally reply with longer notes for `{draft_id}` (or /skip to finish):",
+            reply_markup={"inline_keyboard": [
+                [{"text": "⏭ Skip (no notes)", "callback_data": f"skipnotes:{draft_id}"}],
+            ]},
         )
         awaiting[draft_id] = {
             "note_message_id": note["message_id"],
@@ -780,6 +807,8 @@ HELP_TEXT = (
     "HumorHist review bot — the whole pipeline runs from here.\n\n"
     "QUICK START: /reviewdraft to decide on pending drafts · /listqueue to manage "
     "approved ones · /status for progress · /help for everything.\n\n"
+    "Tip: /reviewdraft fast commits on the first tap (skips the Confirm gate) — "
+    "undo from /listapproved or /listqueue.\n\n"
     "DISCOVERY & DRAFTING\n"
     "/harvest - top up the candidate pool from seed + Wikipedia lists\n"
     "/screen [limit] - LLM-score unscored pool candidates (funny_score)\n"
@@ -794,7 +823,8 @@ HELP_TEXT = (
     "    /later <id> defers a pending draft 30 days (#id shown in /listapproved)\n"
     "    /listlater - list deferred drafts; tap to bring one forward now\n"
     "    /reviewnow [<id>] - bring a deferred draft (or ALL) back for review\n"
-    "    /setjoke <id> - set the one-line joke on an approved draft (blank-capture fix)\n"
+    "/setjoke <id> - set the one-line joke on an approved draft (fixes a blank capture)\n"
+    "/notes <id> - steer angles (pending draft) or add notes (approved); reply to the prompt\n"
     "/listapproved - list approved drafts with their #id; tap one to open it\n"
     "    each row also has a ❌ Reject button (confirm-gated) to un-approve it\n"
     "/listrejected - list rejected drafts; tap one to reopen for re-review\n"
@@ -813,6 +843,7 @@ HELP_TEXT = (
     "/queue remove <id> - pull a draft back out of the queue (kept approved)\n"
     "/image <id> - (re)generate the story image for an approved+queued draft\n"
     "/status - approved / rejected / pending breakdown (+ stuck-capture nudge)\n"
+    "/publish - read-only export of queued posts (copy + link + image + checklist) for manual posting\n"
     "/help - this message\n\n"
     "The bot also nudges you with 🆕 N new draft(s) when fresh drafts appear."
 )
@@ -1226,6 +1257,29 @@ def telegram_queue(conn, client, chat_id, *, action: str = "list", draft_id: str
         send_queue_list(conn, client, chat_id)
 
 
+def telegram_publish(conn: sqlite3.Connection, client: TelegramTransport, chat_id: str) -> None:
+    """Inbound /publish: read-only DM export of queued, copy-bearing posts.
+
+    Messages each queued draft's post copy + 'learn more' link + story image
+    path + a per-draft readiness checklist (copy / joke / image), exactly
+    mirroring `humorhist publish` on the CLI. NOTHING is posted to any platform
+    and NOTHING in the DB changes — the editor still pastes by hand. The text is
+    built by ``review.format_publish_export`` so the CLI and Telegram outputs
+    can't drift.
+    """
+    rows = review.queued_drafts(conn)
+    rows = [r for r in rows if r.get("post_copy")]
+    if not rows:
+        client.send_message(
+            chat_id,
+            "Nothing queued with post copy yet. Run /queue enqueue and "
+            "/viewcopy <id> + 🔄 Regenerate, or use `humorhist queue --enqueue` "
+            "and `humorhist copy regen` on the CLI.",
+        )
+        return
+    _send_long(client, chat_id, review.format_publish_export(conn, rows))
+
+
 def telegram_draft(conn, client, chat_id, *, count: int = 3, min_score: float = 7.0) -> None:
     """Inbound /draft: fact-check + generate angles for top pool candidates.
 
@@ -1355,6 +1409,11 @@ def run_review_bot(
                         "note_message_id": res["note_message_id"],
                         "stage": res.get("stage", "editor_line"),
                         "decision": res.get("decision", "approve"),
+                        # Propagate setjoke so handle_text routes the reply through
+                        # review.set_editor_line (targeted UPDATE) instead of the
+                        # full apply_review re-approve path, which would clobber
+                        # any existing editor_notes with NULL.
+                        "setjoke": res.get("setjoke", False),
                     }
             elif res and "note_message_id" in res:
                 # notes: button from /listapproved
@@ -1362,6 +1421,9 @@ def run_review_bot(
             elif res and "editcopy_message_id" in res:
                 # post-copy edit prompt: register so the next reply is captured
                 awaiting[res["draft_id"]] = {"editcopy_message_id": res["editcopy_message_id"]}
+            elif res and "skipped" in res:
+                # ⏭ Skip (no notes) button: clear the optional notes capture.
+                awaiting.pop(res["skipped"], None)
             return
         msg = upd.get("message")
         if not msg:
@@ -1475,6 +1537,21 @@ def run_review_bot(
                     "decision": "approve",
                     "setjoke": True,
                 }
+        elif cmd == "/notes":
+            # /notes <id> opens the angle-steer / notes prompt — the typed shortcut
+            # for the ✏️ Add notes button on a draft's content view. For a *pending
+            # draft the reply regenerates the angles (steering); for an approved
+            # draft it stores a note (merge=True so editor_line is preserved). The
+            # prompt is built by _open_notes_prompt (shared with the notes:<id>
+            # callback so the two entry points can't drift).
+            rest = text.split(maxsplit=1)
+            if len(rest) < 2:
+                client.send_message(chat_id, "Usage: /notes <draft_id>")
+            else:
+                did = rest[1].strip()
+                entry = _open_notes_prompt(conn, client, chat_id, did)
+                if not entry.get("error"):
+                    awaiting[did] = entry
         elif cmd == "/suggest":
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
@@ -1517,6 +1594,11 @@ def run_review_bot(
                 telegram_queue(conn, client, chat_id, action="remove", draft_id=bits[1] if len(bits) > 1 else None)
             else:
                 telegram_queue(conn, client, chat_id, action=action)
+        elif cmd == "/publish":
+            # Read-only export: DM the queued, copy-bearing posts (copy + link + image
+            # + readiness checklist) so the editor can paste by hand. NOTHING is posted
+            # and NOTHING in the DB changes. Mirrors `humorhist publish` on the CLI.
+            telegram_publish(conn, client, chat_id)
         elif cmd == "/image":
             # /image <id>  -> (re)generate the story image for an approved+queued draft
             rest = text.split(maxsplit=1)

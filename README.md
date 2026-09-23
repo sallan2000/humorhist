@@ -188,16 +188,18 @@ the weekly timer, etc.) — you don't have to remember to poll it.
 
 **Commands**
 
-    /reviewdraft   review pending drafts one by one (✅ Approve / ❌ Reject / ⏸ Later)
+    /reviewdraft   review pending drafts one by one (✅ Approve / ❌ Reject / ⏸ Later)  (`/reviewdraft fast` commits on the first tap, skipping the confirm gate)
                   a tap opens a Confirm/Cancel gate so a fat-finger can't commit;
                   on Approve confirm, the bot asks for your one-line joke, then notes
     /listlater    list deferred drafts; tap one to bring it forward now
     /reviewnow [<id>]  bring a deferred (/later) draft — or ALL — back for review
     /setjoke <id> set the one-line joke on an approved draft (fixes a blank capture)
+    /notes <id>    pending: steer the angles with a note (regenerates on reply);
+                   approved: add editor notes (same as the Add notes button)
     /later <id>    defer a pending draft 30 days
     /listapproved  list drafts you've greenlit; tap to open, or ❌ Reject
     /listrejected  list rejected drafts; tap one to reopen for re-review
-    /listqueue     list approved+queued drafts; ✏️ copy, ↩️ Remove, ❌ Reject, ↩️ Reopen per row
+    /listqueue     list approved+queued drafts; ✏️ copy, 🗑 Remove, ❌ Reject, ↩️ Reopen per row
     /viewcopy <id> open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)
     /queue         list the publish queue (approved+queued drafts)
     /queue enqueue  sweep approved drafts into the queue
@@ -209,6 +211,8 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /buffer        buffer health report + on-demand top-up
     /buffer enqueue  also sweep approved drafts into the queue
     /status        approved / rejected / pending breakdown (+ stuck-capture nudge)
+    /publish       read-only export of queued posts (copy + link + image + readiness)
+                   for manual pasting — DM'd to your chat; nothing posted automatically
     /help          this list
 
 **Examples** (what you type → what happens)
@@ -238,8 +242,9 @@ the weekly timer, etc.) — you don't have to remember to poll it.
         one-line joke (the human voice); you send it → "📝 Saved. Optional notes?"
         → /skip. The story image + "learn more" link are generated later, at the
         publish step (`/queue enqueue` or `/buffer enqueue`) — see below.
-        On a *pending* draft, send /notes then your steer ("lean into the
-        bureaucracy") to regenerate the angles with that as steering.
+        On a *pending* draft, tap the **Add notes** button on its content view, then reply
+        with your steer (e.g. "lean into the bureaucracy") to regenerate the angles
+        with that as steering.
 
     /later d4f1a2b3
         → "⏸ `d4f1a2b3` deferred 30 days." (drops out of review until then.)
@@ -266,7 +271,7 @@ the weekly timer, etc.) — you don't have to remember to poll it.
 
     /listqueue
         → "📋 Queued drafts (3) — edit copy before publishing:" with one row
-          per draft: ✏️ <title> (open copy), ↩️ Remove (keep approved), ❌ Reject
+          per draft: ✏️ <title> (open copy), 🗑 Remove (keep approved), ❌ Reject
           (with confirm — fully un-approves), and ↩️ Reopen (back to pending).
 
     /viewcopy d4f1a2b3
@@ -310,14 +315,14 @@ for unattended use).
    bot asks for your **one-line joke** (the human voice), then optional notes —
    type the joke and send it, or reply `/skip` to leave it blank. (The joke is
    attached as `editor_line` and steers the generated post copy.) On a *pending*
-   draft you can also send **/notes** to steer the angles with your note.
+   draft you can also send **/notes <id>** to steer the angles with your note.
 4. **Only after you've decided that draft does the next one arrive.** One at a
    time — no wall of drafts. When all are done you get "✅ All caught up". If new
    drafts are generated later (by the weekly timer, `/draft`, or `/harvest`), the
    bot proactively sends "🆕 N new draft(s) awaiting review" — or just send
    **/reviewdraft** again to pick them up. On **Approve** the bot next asks for
    your one-line joke (the human voice), then optional notes; on a *pending* draft
-   you can also send **/notes** to steer the angles with your note.
+   you can also send **/notes <id>** to steer the angles with your note.
 
 **Browse and annotate approved drafts**
 
@@ -357,7 +362,7 @@ available); it warns (does not block) if your edit exceeds the active limit.
 **Telegram**
 
     /listqueue     list queued drafts, each row with ✏️ Edit copy,
-                   ↩️ Remove (keep approved), ❌ Reject (with confirm),
+                   🗑 Remove (keep approved), ❌ Reject (with confirm),
                    ↩️ Reopen (back to pending)
     /viewcopy <id> open a draft's post copy with inline ✏️ Edit / 🔄 Regenerate
 
@@ -426,7 +431,7 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-325 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed; the real Telegram/FAL HTTP transports are mocked with respx).
+368 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed; the real Telegram/FAL HTTP transports are mocked with respx).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -480,7 +485,7 @@ surfaced as a nudge on `/status` and fixable with `/setjoke <id>` (GAP 4b).
 And an approved draft can now be un-approved or sent back to pending entirely
 from Telegram: `/listapproved` carries a ❌ Reject button and `/listqueue` rows
 carry ❌ Reject (confirm-gated) + ↩️ Reopen buttons. The CLI equivalents
-(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 349 passing.
+(`reviewnow`, `setjoke`, `reopen`) were added alongside. Tests: 368 passing.
 
 Manual posting (by design — no auto-post):
 - `humorhist publish` exports every queued, copy-bearing draft: the post text
@@ -493,7 +498,8 @@ Manual posting (by design — no auto-post):
   the posting step. No `posts` table, no platform credentials, no timer.
 
 Until you post manually, "publishing" means: read the approved draft with
-`humorhist publish`, copy the text + image into your client.
+`humorhist publish` (or `/publish` in Telegram, which DM's the same export), then
+copy the text + image into your client.
 
 -------------------------------------------------------------------------------
 ## Scheduling (weekly discovery)
@@ -542,4 +548,4 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
         weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
         fill_approved_copy.py  one-shot: generate post copy for approved+queued drafts
-    tests/                  pytest suite (325 tests)
+    tests/                  pytest suite (368 tests)

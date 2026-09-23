@@ -269,6 +269,44 @@ def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def format_publish_export(conn: sqlite3.Connection, rows: list[dict]) -> str:
+    """Render the read-only 'publish' export for queued, copy-bearing drafts.
+
+    Pure formatting — sends nothing, writes nothing. Each row shows the post
+    copy, the 'learn more' source link and story image path (when present), and
+    a readiness checklist (``copy OK | joke OK | image ...``) so the editor can
+    see at a glance which queued posts are paste-ready. Shared by the CLI
+    (``cmd_publish``) and the Telegram ``/publish`` command so the two can't
+    drift; callers filter to copy-bearing rows first.
+    """
+    joke_by_draft: dict[str, str | None] = {}
+    for r in rows:
+        d = conn.execute("SELECT editor_line FROM drafts WHERE id = ?", (r["draft_id"],)).fetchone()
+        joke_by_draft[r["draft_id"]] = (d["editor_line"] if d else None)
+    parts: list[str] = [f"{len(rows)} post(s) ready to paste manually:", ""]
+    for r in rows:
+        short = r.get("short_code") or r["draft_id"]
+        parts.append(f"── {short} — {r['title']}")
+        parts.append(r["post_copy"])
+        link = r.get("source_link")
+        if link:
+            parts.append(f"learn more: {link}")
+        img = r.get("image_path")
+        if img:
+            parts.append(f"image: {img}")
+        has_joke = bool(joke_by_draft.get(r["draft_id"]))
+        has_img = bool(img)
+        flags = [
+            "copy OK",
+            "joke OK" if has_joke else "joke MISSING",
+            "image OK" if has_img else "image none (optional)",
+        ]
+        parts.append("  readiness: " + " | ".join(flags))
+        parts.append("")
+    parts.append("Post these by hand on your platforms. Nothing was sent automatically.")
+    return "\n".join(parts)
+
+
 def deferred_drafts(conn: sqlite3.Connection) -> list[dict]:
     """Return pending drafts currently deferred (``defer_until`` in the future).
 

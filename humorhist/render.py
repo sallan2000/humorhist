@@ -25,6 +25,14 @@ def render_draft(row, pool=None) -> str:
     out.append("=" * 70)
     out.append(f"DRAFT {row['id']} — {title} ({year})")
     out.append(f"status: {row['status']}")
+    # Phone-skimmable TL;DR: lead with the hook (or top angle) so a reviewer on a
+    # small screen gets the gist before the dense facts/angles/sources dump below.
+    hook = (angles.get("suggested_hook") or "").strip()
+    if not hook:
+        first = next(iter(angles.get("angles", [])), None) or {}
+        hook = (first.get("angle_name") or first.get("setup") or "").strip()
+    if hook:
+        out.append(f"📱 TL;DR: {hook}")
     out.append("=" * 70)
 
     out.append("\n--- VERIFIED FACTS ---")

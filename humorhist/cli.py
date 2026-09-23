@@ -734,33 +734,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         print("Nothing queued with post copy yet. Run `humorhist queue --enqueue` and `humorhist copy regen` first.")
         return 0
 
-    # Pull joke (editor_line) from drafts to build the readiness checklist.
-    joke_by_draft = {}
-    for r in rows:
-        d = conn.execute("SELECT editor_line FROM drafts WHERE id = ?", (r["draft_id"],)).fetchone()
-        joke_by_draft[r["draft_id"]] = (d["editor_line"] if d else None)
-
-    print(f"{len(rows)} post(s) ready to paste manually:\n")
-    for r in rows:
-        short = r.get("short_code") or r["draft_id"]
-        print(f"── {short} — {r['title']}")
-        print(r["post_copy"])
-        link = r.get("source_link")
-        if link:
-            print(f"\nlearn more: {link}")
-        img = r.get("image_path")
-        if img:
-            print(f"image: {img}")
-        # Post-readiness checklist (no image is optional / FAL-gated).
-        has_joke = bool(joke_by_draft.get(r["draft_id"]))
-        has_img = bool(img)
-        flags = []
-        flags.append("copy OK")
-        flags.append("joke OK" if has_joke else "joke MISSING")
-        flags.append("image OK" if has_img else "image none (optional)")
-        print("  readiness: " + " | ".join(flags))
-        print()
-    print("Post these by hand on your platforms. Nothing was sent automatically.")
+    print(review.format_publish_export(conn, rows))
     return 0
 
 
