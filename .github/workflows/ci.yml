@@ -22,4 +22,4 @@ jobs:
       - name: Bandit (security scan)
         run: bandit -c pyproject.toml -r humorhist
       - name: Tests
-        run: pytest tests/ -q
+        run: python -m pytest tests/ -q
