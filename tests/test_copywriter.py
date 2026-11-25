@@ -7,6 +7,7 @@ no-key safe-skip, and idempotent fill.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -224,3 +225,154 @@ def test_fill_post_copy_force_overwrites_existing(tmp_path, monkeypatch):
     assert (
         conn.execute("SELECT post_copy FROM queue WHERE draft_id='d1'").fetchone()["post_copy"] == "Regenerated copy."
     )
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_copy_respects_caller_transaction_and_rollback(tmp_path, manual):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    _enqueue(conn, "d1")
+    conn.execute("UPDATE pool SET title = 'uncommitted' WHERE id = 'pool-x'")
+    if manual:
+        cw.set_post_copy(conn, "d1", "Hand edited copy.")
+    else:
+        assert cw.fill_post_copy(conn, StubClient([{"post": "Generated copy."}])) == 1
+    assert conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT title FROM pool").fetchone()[0] == "Pastry War"
+    assert conn.execute("SELECT post_copy FROM queue").fetchone()[0] is None
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_copy_commits_when_no_caller_transaction(tmp_path, manual):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    _enqueue(conn, "d1")
+    if manual:
+        cw.set_post_copy(conn, "d1", "Hand edited copy.")
+    else:
+        assert cw.fill_post_copy(conn, StubClient([{"post": "Generated copy."}])) == 1
+    assert not conn.in_transaction
+    other = db.connect(str(tmp_path / "test.sqlite"))
+    assert other.execute("SELECT post_copy FROM queue").fetchone()[0] is not None
+    other.close()
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize("existing", [None, "published copy"])
+def test_published_rows_are_not_generated_or_edited(tmp_path, force, scoped, existing):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    _enqueue(conn, "d1")
+    conn.execute("UPDATE queue SET published=1, post_copy=?", (existing,))
+    conn.commit()
+
+    class NoCalls:
+        def complete_json(self, *args, **kwargs):
+            pytest.fail("published row must not trigger generation")
+
+    assert cw.fill_post_copy(conn, NoCalls(), draft_id="d1" if scoped else None, force=force) == 0
+    cw.set_post_copy(conn, "d1", "edited")
+    assert conn.execute("SELECT post_copy FROM queue").fetchone()[0] == existing
+
+
+@pytest.mark.parametrize("change", ["published", "copy", "status"])
+def test_fill_rechecks_row_after_generation(tmp_path, monkeypatch, change):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    _enqueue(conn, "d1")
+    other = db.connect(str(tmp_path / "test.sqlite"))
+
+    def generate(*args):
+        assert not conn.in_transaction
+        if change == "published":
+            other.execute("UPDATE queue SET published=1")
+        elif change == "copy":
+            other.execute("UPDATE queue SET post_copy='editor copy'")
+        else:
+            other.execute("UPDATE drafts SET status='rejected'")
+        other.commit()
+        return "Generated copy."
+
+    monkeypatch.setattr(cw, "generate_post_copy", generate)
+    assert cw.fill_post_copy(conn, StubClient([])) == 0
+    assert not conn.in_transaction
+    row = conn.execute("SELECT post_copy FROM queue").fetchone()
+    assert row[0] == ("editor copy" if change == "copy" else None)
+    other.close()
+
+
+def test_batch_generates_before_any_write(tmp_path, monkeypatch):
+    conn = _fresh_db(tmp_path)
+    for draft_id in ("d1", "d2"):
+        _make_draft(conn, draft_id)
+        _enqueue(conn, draft_id)
+    calls = []
+
+    def generate(client, draft, pool, limit):
+        assert not conn.in_transaction
+        calls.append(draft["id"])
+        return "Generated copy."
+
+    monkeypatch.setattr(cw, "generate_post_copy", generate)
+    assert cw.fill_post_copy(conn, StubClient([])) == 2
+    assert set(calls) == {"d1", "d2"}
+
+
+@pytest.mark.parametrize("caller_transaction", [False, True])
+def test_later_batch_write_failure_rolls_back_only_batch(tmp_path, caller_transaction):
+    conn = _fresh_db(tmp_path)
+    for draft_id in ("d1", "d2"):
+        _make_draft(conn, draft_id)
+        _enqueue(conn, draft_id)
+    conn.execute("""CREATE TRIGGER fail_second BEFORE UPDATE OF post_copy ON queue
+                    WHEN NEW.draft_id = 'd2'
+                    BEGIN SELECT RAISE(ABORT, 'injected write failure'); END""")
+    conn.commit()
+    if caller_transaction:
+        conn.execute("UPDATE pool SET title='caller change' WHERE id='pool-x'")
+    with pytest.raises(sqlite3.IntegrityError, match="injected write failure"):
+        cw.fill_post_copy(conn, StubClient([{"post": "First generated copy."}, {"post": "Second generated copy."}]))
+    assert conn.in_transaction == caller_transaction
+    assert [r[0] for r in conn.execute("SELECT post_copy FROM queue ORDER BY id")] == [None, None]
+    if caller_transaction:
+        assert conn.execute("SELECT title FROM pool").fetchone()[0] == "caller change"
+        conn.commit()
+        other = db.connect(str(tmp_path / "test.sqlite"))
+        assert other.execute("SELECT title FROM pool").fetchone()[0] == "caller change"
+        assert [r[0] for r in other.execute("SELECT post_copy FROM queue ORDER BY id")] == [None, None]
+        other.close()
+
+
+@pytest.mark.parametrize("same_text", [False, True])
+def test_force_regen_preserves_intervening_manual_edit(tmp_path, monkeypatch, same_text):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    _enqueue(conn, "d1")
+    assert cw.set_post_copy(conn, "d1", "Original copy.") == 1
+    conn.execute("UPDATE queue SET post_copy_at='old timestamp'")
+    conn.commit()
+    other = db.connect(str(tmp_path / "test.sqlite"))
+
+    def generate(*args):
+        assert cw.set_post_copy(other, "d1", "Original copy." if same_text else "New editor copy.") == 1
+        return "Regenerated copy."
+
+    monkeypatch.setattr(cw, "generate_post_copy", generate)
+    assert cw.fill_post_copy(conn, StubClient([]), force=True) == 0
+    assert conn.execute("SELECT post_copy FROM queue").fetchone()[0] == (
+        "Original copy." if same_text else "New editor copy."
+    )
+    other.close()
+
+
+def test_set_post_copy_returns_updated_count(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    _enqueue(conn, "d1")
+    assert cw.set_post_copy(conn, "missing", "Copy") == 0
+    assert cw.set_post_copy(conn, "d1", "Copy") == 1
+    conn.execute("UPDATE queue SET published=1")
+    conn.commit()
+    assert cw.set_post_copy(conn, "d1", "Copy") == 0

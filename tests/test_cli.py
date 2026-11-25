@@ -374,6 +374,29 @@ def test_copy_edit_launches_editor_and_saves(dbpath, monkeypatch, capsys):
     assert row["post_copy"] == "My hand-edited, funnier version."
 
 
+@pytest.mark.parametrize("change", ["published", "missing"])
+def test_copy_edit_reports_queue_disappearing_during_edit(dbpath, monkeypatch, capsys, change):
+    from humorhist import cli as cli_mod
+
+    _seed_approved_with_queue(dbpath)
+
+    def editor(initial):
+        other = db.connect(dbpath)
+        if change == "published":
+            other.execute("UPDATE queue SET published=1 WHERE draft_id='d1'")
+        else:
+            other.execute("DELETE FROM queue WHERE draft_id='d1'")
+        other.commit()
+        other.close()
+        return "Unsaved editor text"
+
+    monkeypatch.setattr(cli_mod, "_launch_editor", editor)
+    assert cli_mod.cmd_copy_edit(argparse.Namespace(db=dbpath, draft_id="d1")) == 1
+    out = capsys.readouterr().out
+    assert "not saved" in out
+    assert "Saved " not in out
+
+
 def test_copy_edit_falls_back_to_prompt_without_editor(dbpath, monkeypatch, capsys):
     from humorhist import cli as cli_mod
 

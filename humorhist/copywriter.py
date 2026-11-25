@@ -162,34 +162,35 @@ def fill_post_copy(
     available) the function is a no-op returning 0, so callers can always call
     it safely without crashing the approve path.
 
-    Returns the number of rows newly filled.
+    Published rows are never regenerated. If the caller already has a
+    transaction, its commit or rollback remains the caller's responsibility;
+    otherwise successful writes are committed here. Generation is performed
+    before writing, though an existing caller transaction cannot be suspended.
+
+    Returns the number of queue rows updated. A row changed during generation
+    is skipped even with ``force``; the copy text and timestamp act as a
+    best-effort optimistic version check.
     """
     limit = limit if limit is not None else char_limit()
     if client is None:
         return 0
 
+    sql = """
+        SELECT q.id AS queue_id, q.draft_id AS draft_id,
+               q.post_copy AS original_copy, q.post_copy_at AS original_copy_at
+        FROM queue q
+        JOIN drafts d ON d.id = q.draft_id
+        WHERE d.status = 'approved' AND q.published = 0
+    """
+    params = ()
     if draft_id is not None:
-        sql = """
-            SELECT q.draft_id AS draft_id
-            FROM queue q
-            JOIN drafts d ON d.id = q.draft_id
-            WHERE d.status = 'approved' AND q.draft_id = ?
-        """
-        if not force:
-            sql += " AND q.post_copy IS NULL"
-        rows = conn.execute(sql, (draft_id,)).fetchall()
-    else:
-        sql = """
-            SELECT q.draft_id AS draft_id
-            FROM queue q
-            JOIN drafts d ON d.id = q.draft_id
-            WHERE d.status = 'approved'
-        """
-        if not force:
-            sql += " AND q.post_copy IS NULL"
-        rows = conn.execute(sql).fetchall()
+        sql += " AND q.draft_id = ?"
+        params = (draft_id,)
+    if not force:
+        sql += " AND q.post_copy IS NULL"
+    rows = conn.execute(sql, params).fetchall()
 
-    filled = 0
+    generated = []
     for r in rows:
         did = r["draft_id"]
         draft = conn.execute("SELECT * FROM drafts WHERE id = ?", (did,)).fetchone()
@@ -201,22 +202,39 @@ def fill_post_copy(
         except Exception as exc:  # noqa: BLE001 - one bad draft must not abort the fill
             print(f"[copywriter] failed for {did}: {exc}")
             continue
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "UPDATE queue SET post_copy = ?, post_copy_at = ? WHERE draft_id = ?",
-            (copy, now, did),
-        )
-        filled += 1
-    if filled:
-        conn.commit()
+        generated.append((r["queue_id"], r["original_copy"], r["original_copy_at"], copy))
+
+    if not generated:
+        return 0
+    filled = 0
+    # Releasing an outermost savepoint commits; a nested one leaves the caller's
+    # transaction open. Roll back the whole batch if any individual write fails.
+    conn.execute("SAVEPOINT copywriter_fill")
+    try:
+        for queue_id, original_copy, original_copy_at, copy in generated:
+            now = datetime.now(UTC).isoformat()
+            sql = """UPDATE queue SET post_copy = ?, post_copy_at = ?
+                     WHERE id = ? AND published = 0
+                     AND post_copy IS ? AND post_copy_at IS ?
+                     AND EXISTS (SELECT 1 FROM drafts d
+                                 WHERE d.id = queue.draft_id AND d.status = 'approved')"""
+            filled += conn.execute(sql, (copy, now, queue_id, original_copy, original_copy_at)).rowcount
+        conn.execute("RELEASE SAVEPOINT copywriter_fill")
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT copywriter_fill")
+        conn.execute("RELEASE SAVEPOINT copywriter_fill")
+        raise
     return filled
 
 
-def set_post_copy(conn: sqlite3.Connection, draft_id: str, copy: str) -> None:
-    """Store an editor's manually edited copy for a queued draft."""
+def set_post_copy(conn: sqlite3.Connection, draft_id: str, copy: str) -> int:
+    """Store editor copy on unpublished rows; return the number updated."""
+    caller_transaction = conn.in_transaction
     now = datetime.now(UTC).isoformat()
-    conn.execute(
-        "UPDATE queue SET post_copy = ?, post_copy_at = ? WHERE draft_id = ?",
+    updated = conn.execute(
+        "UPDATE queue SET post_copy = ?, post_copy_at = ? WHERE draft_id = ? AND published = 0",
         (copy, now, draft_id),
-    )
-    conn.commit()
+    ).rowcount
+    if not caller_transaction:
+        conn.commit()
+    return updated

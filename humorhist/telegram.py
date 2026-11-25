@@ -13,7 +13,7 @@ host is behind Cloudflare/NAT and does not expose ports.
 
 Config (env, never in the repo):
     HUMORHIST_TELEGRAM_BOT_TOKEN   required for real calls
-    HUMORHIST_TELEGRAM_CHAT_ID      your chat id to DM (the reviewer)
+    HUMORHIST_TELEGRAM_CHAT_ID      reviewer's private numeric chat/user ID
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -35,6 +36,22 @@ import humorhist.review as review
 logger = logging.getLogger("humorhist.telegram")
 
 API_BASE = "https://api.telegram.org"
+
+
+class _TelegramURLLogFilter(logging.Filter):
+    """Keep httpx's ordinary INFO request log from exposing Bot API tokens."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = re.sub(r"(https://api\.telegram\.org/bot)[^/\s]+", r"\1[REDACTED]", message)
+        if redacted != message:
+            record.msg, record.args = redacted, ()
+        return True
+
+
+_httpx_logger = logging.getLogger("httpx")
+if not any(isinstance(item, _TelegramURLLogFilter) for item in _httpx_logger.filters):
+    _httpx_logger.addFilter(_TelegramURLLogFilter())
 
 
 def _resolve_image_dir(image_dir: str | None) -> str | None:
@@ -170,6 +187,37 @@ class TelegramError(RuntimeError):
     """Raised when a Bot API call fails."""
 
 
+def _authorized_update(update: dict, chat_id: str) -> bool:
+    """Accept only the configured user's private messages and button taps.
+
+    Inline callbacks have no private message and are intentionally rejected.
+    Telegram private chat IDs are the same as the corresponding user IDs.
+    """
+    if not isinstance(update, dict):
+        return False
+    callback = update.get("callback_query")
+    if callback is not None:
+        if not isinstance(callback, dict):
+            return False
+        message = callback.get("message")
+        sender = callback.get("from")
+    else:
+        message = update.get("message")
+        sender = message.get("from") if isinstance(message, dict) else None
+    if not isinstance(message, dict) or not isinstance(sender, dict):
+        return False
+    chat = message.get("chat")
+    if not isinstance(chat, dict) or chat.get("type") != "private":
+        return False
+    expected = str(chat_id)
+    return (
+        chat.get("id") is not None
+        and sender.get("id") is not None
+        and str(chat["id"]) == expected
+        and str(sender["id"]) == expected
+    )
+
+
 class TelegramClient:
     """Real Bot API client (long-poll). Token from env or constructor."""
 
@@ -201,7 +249,8 @@ class TelegramClient:
                 last = exc
                 if attempt < self.max_retries:
                     time.sleep(2**attempt)
-        raise TelegramError(f"Telegram call {method} failed: {last}")
+        detail = str(last).replace(self.token, "[REDACTED]")
+        raise TelegramError(f"Telegram call {method} failed: {detail}") from None
 
     def get_updates(self, offset: int = 0, timeout: int = 0) -> list[dict]:
         return self._call(
@@ -245,7 +294,8 @@ class TelegramClient:
                     last = exc
                     if attempt < self.max_retries:
                         time.sleep(2**attempt)
-            raise TelegramError(f"Telegram sendPhoto failed: {last}")
+            detail = str(last).replace(self.token, "[REDACTED]")
+            raise TelegramError(f"Telegram sendPhoto failed: {detail}") from None
         params["photo"] = photo
         if caption is not None:
             params["caption"] = caption
@@ -724,8 +774,11 @@ def handle_text(
             return {"editcopy_cancelled": draft_id}
         from humorhist.copywriter import set_post_copy
 
-        set_post_copy(conn, draft_id, text)
+        updated = set_post_copy(conn, draft_id, text)
         awaiting.pop(draft_id, None)
+        if not updated:
+            client.send_message(chat_id, f"Post copy not saved for `{draft_id}`: no unpublished queue row.")
+            return {"editcopy_failed": draft_id}
         client.send_message(chat_id, f"Post copy saved for `{draft_id}`.")
         return {"editcopy_saved": draft_id}
 
@@ -1373,12 +1426,20 @@ def run_review_bot(
     ``once=True`` keeps the legacy dump behaviour (send summary + all pending,
     process queued updates once) for one-shot CLI runs and tests.
     """
+    # Reject group IDs, usernames and ambiguous/non-canonical numeric forms
+    # before reading the database or contacting the transport.
+    if not isinstance(chat_id, str) or re.fullmatch(r"[1-9][0-9]*", chat_id) is None:
+        raise ValueError("chat_id must be a positive numeric private chat/user ID")
     offset_ref = [0]
     awaiting: dict[str, dict] = {}
     decided = 0
 
     def _handle(upd: dict) -> None:
         offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
+        # Acknowledge rejected updates in the polling offset, but never dispatch
+        # them or mutate a pending review session's state.
+        if not _authorized_update(upd, chat_id):
+            return
         # ⏭ Next button: re-enter the (non-modal) review session to pull the
         # next pending draft, without the user typing /reviewdraft again.
         if "callback_query" in upd:
@@ -1617,6 +1678,10 @@ def run_review_bot(
             _send_one(conn, client, chat_id, row)
         for upd in client.get_updates(offset=offset_ref[0], timeout=0):
             _handle(upd)
+        if offset_ref[0]:
+            # This confirms only IDs below the offset. Any newer updates in
+            # the response remain unconfirmed for the next polling session.
+            client.get_updates(offset=offset_ref[0], timeout=0)
         return decided
 
     client.send_message(

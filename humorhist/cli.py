@@ -637,7 +637,9 @@ def cmd_copy_edit(args: argparse.Namespace) -> int:
     limit = cw.char_limit()
     if len(edited) > limit:
         print(f"WARNING: copy is {len(edited)} chars, over the {limit} limit.")
-    cw.set_post_copy(conn, args.draft_id, edited)
+    if not cw.set_post_copy(conn, args.draft_id, edited):
+        print(f"Copy not saved for {args.draft_id}: no unpublished queue row.")
+        return 1
     print(f"Saved {len(edited)}/{limit} chars for {args.draft_id}.")
     return 0
 

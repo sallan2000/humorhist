@@ -8,12 +8,44 @@ be stored as notes, and the bot must send one message per pending draft.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 import humorhist.db as db
 import humorhist.review as review
 import humorhist.telegram as tg
+
+
+@pytest.fixture(autouse=True)
+def _supply_legacy_update_identity(monkeypatch):
+    """Give older synthetic polling fixtures the private identity Telegram sends.
+
+    Security tests use their own unmodified transport in test_telegram_security.
+    """
+    run = tg.run_review_bot
+
+    def run_with_identity(conn, client, chat_id, **kwargs):
+        get_updates = client.get_updates
+
+        def authenticated_updates(*args, **kw):
+            updates = deepcopy(get_updates(*args, **kw))
+            for update in updates:
+                callback = update.get("callback_query")
+                message = callback.get("message") if callback else update.get("message")
+                if message is None:
+                    continue
+                message.setdefault("chat", {}).setdefault("id", chat_id)
+                message["chat"].setdefault("type", "private")
+                (callback if callback else message).setdefault("from", {"id": chat_id})
+            return updates
+
+        monkeypatch.setattr(client, "get_updates", authenticated_updates)
+        return run(conn, client, chat_id, **kwargs)
+
+    monkeypatch.setattr(tg, "run_review_bot", run_with_identity)
 
 
 def _fresh_db(tmp_path: Path):
@@ -333,7 +365,7 @@ def test_run_review_bot_once_pumps_callback(tmp_path):
         ]
     )
 
-    decided = tg.run_review_bot(conn, stub, "chat", once=True)
+    decided = tg.run_review_bot(conn, stub, "12345", once=True)
 
     assert decided == 1
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
@@ -345,7 +377,7 @@ def test_run_review_bot_no_pending_sends_notice(tmp_path):
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram()
 
-    decided = tg.run_review_bot(conn, stub, "chat", once=True)
+    decided = tg.run_review_bot(conn, stub, "12345", once=True)
 
     # no pending drafts, no updates -> nothing decided; but the loop now opens
     # with a (silent-when-empty) reviewed-summary message.
@@ -359,7 +391,7 @@ def test_notify_new_drafts_used_for_nudge(tmp_path):
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram()
 
-    n = tg.run_review_bot(conn, stub, "chat", once=True)
+    n = tg.run_review_bot(conn, stub, "12345", once=True)
     # run_review_bot sends the pending draft (with buttons) but NOT the
     # "N drafts awaiting" nudge text -- that is notify_new_drafts's job.
     assert n == 0
@@ -442,7 +474,7 @@ def test_telegram_review_sends_summary_first(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram(updates=[])
-    tg.run_review_bot(conn, stub, "chat", once=True)
+    tg.run_review_bot(conn, stub, "12345", once=True)
     # first message is the summary, second is the pending draft
     assert len(stub.sent) == 2
     assert "Review progress" in stub.sent[0]["text"]
@@ -479,7 +511,7 @@ def test_handle_text_fallback_when_single_awaiting(tmp_path):
     conn.commit()
     stub = tg.StubTelegram()
     awaiting = {"d1": {"note_message_id": "note1"}}
-    upd = {"update_id": 5, "message": {"message_id": 10, "chat": {"id": "chat"}, "text": "tighten the third angle"}}
+    upd = {"update_id": 5, "message": {"message_id": 10, "chat": {"id": 12345}, "text": "tighten the third angle"}}
     res = tg.handle_text(conn, stub, "chat", awaiting, upd)
     assert res == {"noted": "d1"}
     row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
@@ -554,7 +586,7 @@ def _message_batch(text, update_id=1):
     return [
         {
             "update_id": update_id,
-            "message": {"message_id": 100 + update_id, "chat": {"id": "chat"}, "text": text},
+            "message": {"message_id": 100 + update_id, "chat": {"id": 12345}, "text": text},
         }
     ]
 
@@ -580,7 +612,7 @@ def test_run_review_bot_one_by_one(tmp_path):
             _message_batch("/skip", 8),
         ]
     )
-    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    decided = tg.run_review_bot(conn, stub, "12345", max_iterations=50)
     assert decided == 2
     # both drafts persisted as approved, in decision order
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
@@ -630,7 +662,7 @@ def test_next_button_advances_to_next_draft(tmp_path):
             _message_batch("/skip", 6),
         ]
     )
-    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    decided = tg.run_review_bot(conn, stub, "12345", max_iterations=50)
     assert decided == 2
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "approved"
     assert conn.execute("SELECT status FROM drafts WHERE id='d2'").fetchone()["status"] == "approved"
@@ -667,7 +699,7 @@ def test_review_session_waits_for_joke_before_next_draft(tmp_path):
             _message_batch("/skip", 8),
         ]
     )
-    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=60)
+    decided = tg.run_review_bot(conn, stub, "12345", max_iterations=60)
 
     # d1's joke was captured before any d2 button could be shown
     assert (
@@ -740,7 +772,7 @@ def test_listapproved_add_notes_via_button(tmp_path):
     assert res and res["draft_id"] == "d1"
     awaiting = {"d1": {"note_message_id": res["note_message_id"]}}
     # 2) user replies with the note
-    note_upd = {"update_id": 2, "message": {"message_id": 101, "chat": {"id": "chat"}, "text": "lead with the emus"}}
+    note_upd = {"update_id": 2, "message": {"message_id": 101, "chat": {"id": 12345}, "text": "lead with the emus"}}
     r = tg.handle_text(conn, stub, "chat", awaiting, note_upd)
     assert r == {"noted": "d1"}
     row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
@@ -754,9 +786,9 @@ def test_unknown_command_is_rejected(tmp_path):
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram()
     stub.get_updates = lambda offset=0, timeout=0: [
-        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/bogus"}}
+        {"update_id": 1, "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/bogus"}}
     ]
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     # the bot replied with the unknown-command message
     assert any("Unknown command" in m["text"] for m in stub.sent)
 
@@ -905,6 +937,25 @@ def _seed_approved_queued(conn, draft_id="d1", with_copy=True):
         f"INSERT INTO queue (draft_id, scheduled_for, published, post_copy) VALUES ('{draft_id}', NULL, 0, {copy})"
     )
     conn.commit()
+
+
+@pytest.mark.parametrize("change", ["published", "missing"])
+def test_editcopy_reports_disappearing_queue_row(tmp_path, change):
+    conn = _fresh_db(tmp_path)
+    _seed_approved_queued(conn)
+    if change == "published":
+        conn.execute("UPDATE queue SET published=1 WHERE draft_id='d1'")
+    else:
+        conn.execute("DELETE FROM queue WHERE draft_id='d1'")
+    conn.commit()
+    stub = tg.StubTelegram()
+    awaiting = {"d1": {"editcopy_message_id": 123}}
+    result = tg.handle_text(conn, stub, "chat", awaiting, {
+        "message": {"text": "Unsaved copy", "reply_to_message": {"message_id": 123}}
+    })
+    assert result == {"editcopy_failed": "d1"}
+    assert "not saved" in stub.sent[-1]["text"]
+    assert not awaiting
 
 
 def test_send_queue_list_shows_copy_and_char_count(tmp_path):
@@ -1063,7 +1114,7 @@ def test_reject_in_review_session_counts_decision_without_joke_prompt(tmp_path):
             _message_batch("/skip", 5),
         ]
     )
-    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    decided = tg.run_review_bot(conn, stub, "12345", max_iterations=50)
     assert decided == 2  # both decisions counted, including the reject
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()["status"] == "rejected"
     assert conn.execute("SELECT status FROM drafts WHERE id='d2'").fetchone()["status"] == "approved"
@@ -1091,7 +1142,7 @@ def test_review_command_while_capture_open_stays_responsive(tmp_path):
             _message_batch("/status", 3),      # a command mid-capture: handled immediately
         ]
     )
-    decided = tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    decided = tg.run_review_bot(conn, stub, "12345", max_iterations=50)
     # the approve for d1 was committed
     assert decided == 1
     # the /status command was actually handled, not dropped on the floor
@@ -1230,10 +1281,10 @@ def test_jokes_command_dispatch(tmp_path):
     _seed_approved_queued(conn, "d1", with_copy=True)  # stuck: no editor_line
     stub = tg.StubTelegram(
         updates=[
-            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/jokes"}},
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/jokes"}},
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     full = "\n".join(m["text"] for m in stub.sent)
     assert "Pastry War" in full
     assert "missing their one-line joke" in full
@@ -1250,10 +1301,10 @@ def test_view_command_re_reads_any_draft_from_phone(tmp_path):
     _seed_pending(conn, "d1")  # a pending draft, not in queue/listapproved
     stub = tg.StubTelegram(
         updates=[
-            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/view d1"}},
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/view d1"}},
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     # the draft body was sent (rendered), incl. the topic + sources
     full = "\n".join(m["text"] for m in stub.sent)
     assert "Pool X" in full  # the seeded pending draft's pool title
@@ -1264,10 +1315,10 @@ def test_view_command_missing_id_shows_usage(tmp_path):
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram(
         updates=[
-            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/view"}},
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/view"}},
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Usage: /view <draft_id>" in m["text"] for m in stub.sent)
 
 
@@ -1275,10 +1326,10 @@ def test_view_command_unknown_id_is_safe(tmp_path):
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram(
         updates=[
-            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/view nope"}},
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/view nope"}},
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("No such draft" in m["text"] for m in stub.sent)
 
 
@@ -1536,10 +1587,10 @@ def test_listrejected_command_dispatches(tmp_path):
     _seed_rejected(conn, "d1")
     stub = tg.StubTelegram(
         updates=[
-            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/listrejected"}},
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/listrejected"}},
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Pastry War" in m["text"] for m in stub.sent)
 
 
@@ -1635,11 +1686,8 @@ def test_editor_line_approve_without_llm_skips_copy_gracefully(tmp_path, monkeyp
     assert any("one-line joke" in m["text"] for m in stub.sent)
 
 
-def test_enqueue_generates_story_image_and_persists(tmp_path, monkeypatch):
-    """On enqueue (the publish step), story image gen must run when an image
-    client is available, persist prompt + path on the queue row, and the
-    generated PNG must exist on disk. Image generation is OFF the approve flow.
-    """
+def test_enqueue_skips_story_image_and_explicit_generation_persists(tmp_path, monkeypatch):
+    """Approval and enqueue are free of image calls; explicit generation works."""
     import humorhist.imagegen as ig
     from humorhist.llm import StubClient
 
@@ -1656,16 +1704,18 @@ def test_enqueue_generates_story_image_and_persists(tmp_path, monkeypatch):
     _seed_pending(conn, "d1")
     img_dir = tmp_path / "images"
 
-    # approve first (apply_review auto-enqueues WITHOUT an image dir, so no image
-    # is generated yet — it is deferred to the explicit publish/enqueue step)
+    # Approval auto-enqueues without generating an image.
     tg.handle_callback(conn, tg.StubTelegram(), "chat", _callback_update(1, "cb1", "approve", "d1"))
     tg.handle_callback(conn, tg.StubTelegram(), "chat", _confirm_update(2, "cb2", "approve", "d1"))
     assert db.get_image(conn, "d1")["image_path"] is None
 
-    # now the publish/enqueue step generates the image via the backfill path
+    # Repeated enqueue never generates or retries an image.
     import humorhist.review as review
 
     review.enqueue_approved(conn, image_dir=str(img_dir))
+    assert not img_client.prompts
+    assert db.get_image(conn, "d1")["image_path"] is None
+    ig.generate_image_for_queue(conn, "d1", out_dir=img_dir)
 
     info = db.get_image(conn, "d1")
     assert info is not None
@@ -1703,8 +1753,7 @@ def test_enqueue_sets_learn_more_source_link(tmp_path, monkeypatch):
 
 def test_approve_skips_image_when_no_image_client(tmp_path, monkeypatch):
     """When no image credential is available, approve must still succeed and NOT
-    send a photo -- image generation now happens at enqueue (publish), so an
-    approve with no image key simply defers the (skipped) image to that step."""
+    send a photo; generation only happens on explicit request."""
     from humorhist.imagegen import ImageUnavailable
     from humorhist.llm import StubClient
 
@@ -1875,10 +1924,10 @@ def test_run_review_bot_later_command(tmp_path):
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram(
         updates=[
-            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/later d1"}},
+            {"update_id": 1, "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/later d1"}},
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     row = conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()
     assert row["defer_until"] is not None
     assert any("deferred 30 days" in m["text"] for m in stub.sent)
@@ -1893,11 +1942,11 @@ def test_run_review_bot_suggest_command(tmp_path):
         updates=[
             {
                 "update_id": 1,
-                "message": {"message_id": 9, "chat": {"id": "chat"}, "text": "/suggest The Dancing Plague of 1518"},
+                "message": {"message_id": 9, "chat": {"id": 12345}, "text": "/suggest The Dancing Plague of 1518"},
             },
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     row = conn.execute(
         "SELECT title, status, source_name FROM pool WHERE title='The Dancing Plague of 1518'"
     ).fetchone()
@@ -1977,7 +2026,7 @@ def test_harvest_command_runs_and_reports(tmp_path, monkeypatch):
         raising=False,
     )
     stub = tg.StubTelegram(updates=_message_batch("/harvest", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Harvesting new events" in m["text"] for m in stub.sent)
     assert any("Harvest done" in m["text"] and "Pool now" in m["text"] for m in stub.sent)
 
@@ -1991,7 +2040,7 @@ def test_screen_command_skips_without_llm(tmp_path, monkeypatch):
     monkeypatch.setattr("humorhist.llm.resilient_client", _boom)
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram(updates=_message_batch("/screen", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("LLM unavailable" in m["text"] for m in stub.sent)
 
 
@@ -2015,7 +2064,7 @@ def test_draft_command_runs_and_reports(tmp_path, monkeypatch):
     monkeypatch.setattr("humorhist.drafting.draft_candidates", fake_draft)
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram(updates=_message_batch("/draft 2", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Drafting 2 candidate(s)" in m["text"] for m in stub.sent)
     assert any("Drafted 1 new draft(s)" in m["text"] for m in stub.sent)
     assert conn.execute("SELECT status FROM drafts WHERE id='nd1'").fetchone()["status"] == "pending"
@@ -2031,7 +2080,7 @@ def test_buffer_command_reports_health(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "resilient_client", lambda: StubClient([{}]))
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram(updates=_message_batch("/buffer", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("BUFFER" in m["text"] for m in stub.sent)
 
 
@@ -2046,7 +2095,7 @@ def test_buffer_enqueue_command_sweeps_approved(tmp_path, monkeypatch):
     conn.execute("UPDATE drafts SET status='approved' WHERE id='d1'")
     conn.commit()
     stub = tg.StubTelegram(updates=_message_batch("/buffer enqueue", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Enqueued 1 approved draft(s)" in m["text"] for m in stub.sent)
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
 
@@ -2073,11 +2122,11 @@ def test_proactive_nudge_on_new_pending_draft(tmp_path, monkeypatch):
     stub = tg.StubTelegram(
         updates=[
             *_message_batch("/draft", 1),
-            {"update_id": 2, "message": {"message_id": 102, "chat": {"id": "chat"}, "text": "/status"}},
-            {"update_id": 3, "message": {"message_id": 103, "chat": {"id": "chat"}, "text": "/noop"}},
+            {"update_id": 2, "message": {"message_id": 102, "chat": {"id": 12345}, "text": "/status"}},
+            {"update_id": 3, "message": {"message_id": 103, "chat": {"id": 12345}, "text": "/noop"}},
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5, poll_timeout=1)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5, poll_timeout=1)
     assert any("🆕 1 new draft(s) awaiting review" in m["text"] for m in stub.sent)
 
 
@@ -2092,7 +2141,7 @@ def test_queue_command_lists_queue(tmp_path, monkeypatch):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)
     stub = tg.StubTelegram(updates=_message_batch("/queue", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Queued drafts" in m["text"] for m in stub.sent)
 
 
@@ -2106,7 +2155,7 @@ def test_queue_enqueue_sweeps_approved(tmp_path, monkeypatch):
     conn.execute("UPDATE drafts SET status='approved' WHERE id='d1'")
     conn.commit()
     stub = tg.StubTelegram(updates=_message_batch("/queue enqueue", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Enqueued 1 approved draft(s)" in m["text"] for m in stub.sent)
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is not None
 
@@ -2119,7 +2168,7 @@ def test_queue_remove_pulls_draft_back(tmp_path, monkeypatch):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)
     stub = tg.StubTelegram(updates=_message_batch("/queue remove d1", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Removed `d1` from the queue" in m["text"] for m in stub.sent)
     assert conn.execute("SELECT 1 FROM queue WHERE draft_id='d1'").fetchone() is None
     # draft stays approved (not deleted)
@@ -2156,7 +2205,7 @@ def test_image_command_generates_and_sends(tmp_path, monkeypatch):
     )
 
     stub = tg.StubTelegram(updates=_message_batch("/image d1", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     # prompt message + a sent photo
     assert any("Image ready for `d1`" in m["text"] for m in stub.sent)
     assert any(m.get("photo") == b"imgbytes" for m in stub.sent)
@@ -2170,7 +2219,7 @@ def test_image_command_rejects_unknown_draft(tmp_path, monkeypatch):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn)
     stub = tg.StubTelegram(updates=_message_batch("/image ghost", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("No such draft" in m["text"] for m in stub.sent)
 
 
@@ -2184,7 +2233,7 @@ def test_image_command_skips_without_key(tmp_path, monkeypatch):
     # Real generate_image_for_queue returns None on a missing credential.
     monkeypatch.setattr("humorhist.imagegen.generate_image_for_queue", lambda *a, **k: None)
     stub = tg.StubTelegram(updates=_message_batch("/image d1", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("HUMORHIST_IMAGE_API_KEY" in m["text"] for m in stub.sent)
 
 
@@ -2201,7 +2250,7 @@ def test_publish_command_dms_read_only_export(tmp_path):
     _seed_approved_queued(conn, draft_id="d1", with_copy=True)
     before = conn.execute("SELECT post_copy, post_copy_at FROM queue WHERE draft_id='d1'").fetchall()
     stub = tg.StubTelegram(updates=_message_batch("/publish", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     full = "\n".join(m["text"] for m in stub.sent)
     assert "France invaded Mexico over a pastry shop." in full
     assert "ready to paste manually" in full
@@ -2219,7 +2268,7 @@ def test_publish_command_empty_when_nothing_posted(tmp_path):
     """HIGH-3: /publish with no copy-bearing queue rows tells you what to do."""
     conn = _fresh_db(tmp_path)
     stub = tg.StubTelegram(updates=_message_batch("/publish", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Nothing queued with post copy yet" in m["text"] for m in stub.sent)
 
 
@@ -2228,7 +2277,7 @@ def test_publish_command_skips_drafts_without_copy(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_approved_queued(conn, draft_id="d1", with_copy=False)
     stub = tg.StubTelegram(updates=_message_batch("/publish", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Nothing queued with post copy yet" in m["text"] for m in stub.sent)
     assert not any("ready to paste manually" in m["text"] for m in stub.sent)
 
@@ -2240,7 +2289,7 @@ def test_notes_command_usage_without_id(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram(updates=_message_batch("/notes", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("Usage: /notes <draft_id>" in m["text"] for m in stub.sent)
 
 
@@ -2248,7 +2297,7 @@ def test_notes_command_unknown_draft(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram(updates=_message_batch("/notes nope", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     assert any("No such draft" in m["text"] for m in stub.sent)
 
 
@@ -2258,7 +2307,7 @@ def test_notes_command_on_pending_opens_steering_prompt(tmp_path):
     conn = _fresh_db(tmp_path)
     _seed_pending(conn, "d1")
     stub = tg.StubTelegram(updates=_message_batch("/notes d1", 1))
-    tg.run_review_bot(conn, stub, "chat", max_iterations=5)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
     full = "\n".join(m["text"] for m in stub.sent)
     assert "STEER" in full
     assert "/skip to keep the current angles" in full
@@ -2311,7 +2360,7 @@ def test_skipnotes_button_clears_optional_notes(tmp_path):
             ],
         ]
     )
-    tg.run_review_bot(conn, stub, "chat", max_iterations=50)
+    tg.run_review_bot(conn, stub, "12345", max_iterations=50)
     assert "cb-skip" in stub.answered
     assert any("No notes saved for `d1`" in m["text"] for m in stub.sent)
     row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()

@@ -10,6 +10,7 @@ production transport that runs at publish time.
 from __future__ import annotations
 
 import httpx
+import pytest
 import respx
 
 import humorhist.imagegen as ig
@@ -36,12 +37,12 @@ def test_generate_happy_path():
                 200,
                 json={
                     "status": "completed",
-                    "images": [{"url": "https://cdn.fal.ai/img1.png"}],
+                    "images": [{"url": "https://v3.fal.media/img1.png"}],
                 },
             )
         )
         # 3) download the image bytes
-        rt.get("https://cdn.fal.ai/img1.png").mock(
+        rt.get("https://v3.fal.media/img1.png").mock(
             return_value=httpx.Response(200, content=b"PNG-BYTES")
         )
         client = _client()
@@ -58,10 +59,10 @@ def test_generate_leading_slash_model_stripped():
         )
         rt.get("https://queue.fal.run/status/x").mock(
             return_value=httpx.Response(
-                200, json={"status": "completed", "images": [{"url": "https://cdn.fal.ai/u"}]}
+                200, json={"status": "completed", "images": [{"url": "https://v3.fal.media/u"}]}
             )
         )
-        rt.get("https://cdn.fal.ai/u").mock(return_value=httpx.Response(200, content=b"BBB"))
+        rt.get("https://v3.fal.media/u").mock(return_value=httpx.Response(200, content=b"BBB"))
         # model supplied with a leading slash -> client strips it
         client = ig.FalClient(api_key="K", model="/fal-ai/flux/dev", timeout=5.0)
         assert client.generate("x") == b"BBB"
@@ -131,23 +132,10 @@ def test_generate_missing_api_key_raises(monkeypatch):
         raise AssertionError("expected ImageError for missing key")
 
 
-def test_generate_retries_then_succeeds():
-    calls = {"n": 0}
-
-    def _flaky(request):
-        calls["n"] += 1
-        if calls["n"] < 3:
-            return httpx.Response(500)
-        return httpx.Response(200, json={"status_url": "https://queue.fal.run/status/r"})
-
+def test_generate_does_not_retry_paid_submission():
     with respx.mock(assert_all_called=False) as rt:
-        rt.post(f"{FAL}/fal-ai/flux/dev").mock(side_effect=_flaky)
-        rt.get("https://queue.fal.run/status/r").mock(
-            return_value=httpx.Response(
-                200, json={"status": "completed", "images": [{"url": "https://cdn.fal.ai/u"}]}
-            )
-        )
-        rt.get("https://cdn.fal.ai/u").mock(return_value=httpx.Response(200, content=b"RETRY-OK"))
+        route = rt.post(f"{FAL}/fal-ai/flux/dev").mock(return_value=httpx.Response(500))
         client = ig.FalClient(api_key="K", timeout=5.0, max_retries=2)
-        assert client.generate("p") == b"RETRY-OK"
-    assert calls["n"] == 3
+        with pytest.raises(ig.ImageError, match="not retried"):
+            client.generate("p")
+        assert route.call_count == 1

@@ -63,14 +63,38 @@ repo):
     HUMORHIST_CHAR_LIMIT      Optional. Max length of generated post copy
                               (default 280). Raise it (e.g. 280 -> 400) if you
                               later post to a platform with a larger limit.
-    HUMORHIST_IMAGE_API_KEY   Optional. Enables story-image generation at the
-                              publish step (FAL FLUX). When unset, publish still
-                              works; the image is skipped silently.
+    HUMORHIST_IMAGE_PROVIDER  Optional: fal (default for backward compatibility)
+                              or openai. OpenAI is never selected implicitly.
+    HUMORHIST_IMAGE_API_KEY   FAL key only; enables FAL story images when set.
+    OPENAI_API_KEY            Separate OpenAI key, used only with provider=openai.
     HUMORHIST_IMAGE_STYLE     Optional. One of: editorial-historical (default),
                               editorial-cartoon, meme.
     HUMORHIST_IMAGE_DIR       Optional. Where generated PNGs are written
                               (default: <data dir>/images).
-    HUMORHIST_IMAGE_MODEL     Optional. FAL model id (default: fal-ai/flux/dev).
+    HUMORHIST_IMAGE_MODEL     Optional. FAL model id (default: fal-ai/flux/dev),
+                              or OpenAI gpt-image-2.5-flare (default),
+                              gpt-image-2.5-sunburst, gpt-image-2, gpt-image-1.5.
+    HUMORHIST_IMAGE_QUALITY   OpenAI only: low (default), medium, or high.
+
+Image generation may incur provider charges, and image-prompt generation can
+also use the configured LLM. OpenAI sends one 1024x1024 PNG request per image.
+Both providers make no automatic retries of a paid submission, including on
+timeouts: a failed response may still have incurred a charge. Check your
+provider dashboard before manually retrying. Set provider budgets/spending limits.
+OpenAI lists `gpt-image-1.5` and `gpt-image-2` as deprecated; check its
+[deprecations page](https://developers.openai.com/api/docs/deprecations) before
+using those legacy choices.
+Approval, enqueue and queue backfill never generate images automatically.
+Generate one explicitly with `python -m humorhist.cli image <draft_id>` or
+Telegram `/image <draft_id>`; repeating either command requests another paid
+image, including when the previous request may have timed out.
+
+For example, to opt into OpenAI explicitly (set the key securely in your
+environment, never in the repository):
+
+    export HUMORHIST_IMAGE_PROVIDER=openai
+    export HUMORHIST_IMAGE_MODEL=gpt-image-2.5-flare
+    export HUMORHIST_IMAGE_QUALITY=low
 
 The client speaks the OpenAI-compatible /chat/completions schema, so any
 provider that exposes that endpoint works — point BASE_URL at it and set the
@@ -158,13 +182,27 @@ decided on.
 1. Create a bot via @BotFather and copy the token it gives you.
 2. Find its username (also from @BotFather) and **open that bot in Telegram /
    send it any message** — this registers your chat so the bot can DM you.
-3. Get your numeric chat id. After messaging the bot, run:
+3. Get your private numeric chat id. After messaging the bot, run the following;
+   enter the bot token at the hidden prompt, not in a command or shell history:
 
-       curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" \
-         | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['result'][0]['message']['chat']['id'] if r.get('result') else 'message the bot first')"
+       python3 - <<'PY'
+       import getpass
+       import json
+       from urllib.request import urlopen
 
-   (Only one process may poll `getUpdates` at a time — don't run this curl while
-   the review loop is running, or it will show empty.)
+       token = getpass.getpass('Telegram bot token: ')
+       try:
+           with urlopen('https://api.telegram.org/bot' + token + '/getUpdates', timeout=15) as response:
+               updates = json.load(response).get('result', [])
+       except Exception:
+           raise SystemExit('Telegram request failed; check the token and connection') from None
+       chats = [u['message']['chat'] for u in updates if 'message' in u]
+       private = [c['id'] for c in chats if c.get('type') == 'private']
+       print(private[0] if private else 'Message the bot privately first')
+       PY
+
+   Only one process may poll `getUpdates` at a time. Stop the review loop before
+   running this, then restart it afterward. Never share the token.
 4. Put the token and chat id in a local `.env` (gitignored — never commit it):
 
        HUMORHIST_TELEGRAM_BOT_TOKEN=123456:ABC...
@@ -241,8 +279,8 @@ the weekly timer, etc.) — you don't have to remember to poll it.
         committed until you tap "Yes, Approve"/"Yes, Reject" (↩️ Cancel backs
         out with no change). After a confirmed Approve the bot asks for your
         one-line joke (the human voice); you send it → "📝 Saved. Optional notes?"
-        → /skip. The story image + "learn more" link are generated later, at the
-        publish step (`/queue enqueue` or `/buffer enqueue`) — see below.
+        → /skip. The source link is populated on enqueue. Images are generated
+        only when explicitly requested with `/image <draft_id>` — see below.
         On a *pending* draft, tap the **Add notes** button on its content view, then reply
         with your steer (e.g. "lean into the bureaucracy") to regenerate the angles
         with that as steering.
@@ -437,7 +475,8 @@ The comic-angle prompt that most affects output quality lives in:
 
     pytest tests/
 
-371 tests, no network calls (LLM, Wikipedia, FAL image, and Telegram are stubbed; the real Telegram/FAL HTTP transports are mocked with respx).
+The tests make no network calls (LLM, Wikipedia, image providers, and Telegram
+are stubbed; the real HTTP transports are mocked with respx).
 
 -------------------------------------------------------------------------------
 ## Project status
@@ -455,19 +494,12 @@ The **B+ copy loop** is done (2026-08-06): on approve, post copy is generated
 `copy show/edit/regen` commands and Telegram `/listqueue` + `/viewcopy`
 (inline ✏️ Edit / 🔄 Regenerate). See "Phase 4: post copy" above.
 
-**Story images (A+B, 2026-08-08):** an AI image representing the story is
-generated at the **publish step** (`/queue enqueue` or `/buffer enqueue`) — not
-on approve — so it lands when a draft is about to be published. It uses FAL FLUX
-(gated by `HUMORHIST_IMAGE_API_KEY`), writes the PNG to `data/images/<draft_id>.png`
-(gitignored), and persists the prompt + path on the `queue` row
-(`image_prompt` / `image_path`) so a future publisher can attach them. At the
-same step each queued draft also gets a **"learn more" link** derived from the
-pool's `source_url` (the Wikipedia/article behind the story), stored on the
-queue row as `source_link` and shown in `/listapproved`, `/queue`, and the draft
-view. Both are best-effort: with no image key the image is skipped silently and
-the link is still set when a source exists; the rest of the pipeline is
-unaffected. Images and the key are kept out of git (`.env` and `data/images/`
-are gitignored).
+**Story images:** request an image explicitly with CLI `image <draft_id>` or
+Telegram `/image <draft_id>`. Approval and enqueue never generate one
+automatically. The configured FAL or OpenAI provider writes a PNG to
+`data/images/<draft_id>.png` (gitignored) and persists its prompt and path on
+the queue row. Enqueue separately populates a **"learn more" link** from the
+pool's `source_url`, without calling an image provider. Keep keys out of git.
 
 **Telegram-primary (2026-08-07):** the entire pipeline is now drivable from
 Telegram, not just review/edit. From chat you can `/harvest` the pool,

@@ -7,6 +7,7 @@ both call apply_review(), so this is where the behaviour lives and is tested.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -359,3 +360,112 @@ def test_set_editor_line_rejects_unknown(tmp_path):
         pass
     else:
         raise AssertionError("expected ValueError for unknown draft")
+
+
+@pytest.mark.parametrize("operation", ["approve", "reject", "reopen"])
+def test_review_queue_failure_rolls_back_draft_and_queue(tmp_path, operation):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    if operation != "approve":
+        review.apply_review(conn, "d1", decision="approve", notes="original")
+    before = dict(conn.execute("SELECT * FROM drafts WHERE id='d1'").fetchone())
+    queue_before = [dict(r) for r in conn.execute("SELECT * FROM queue")]
+    verb = "INSERT" if operation == "approve" else "DELETE"
+    conn.execute(f"CREATE TRIGGER fail_queue BEFORE {verb} ON queue BEGIN SELECT RAISE(ABORT, 'queue failure'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="queue failure"):
+        if operation == "reopen":
+            review.reopen_draft(conn, "d1")
+        else:
+            review.apply_review(conn, "d1", decision=operation, notes="changed")
+    assert dict(conn.execute("SELECT * FROM drafts WHERE id='d1'").fetchone()) == before
+    assert [dict(r) for r in conn.execute("SELECT * FROM queue")] == queue_before
+    assert not conn.in_transaction
+
+
+def test_enqueue_batch_failure_rolls_back_all_inserts(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "approved")
+    _make_draft(conn, "d2", "approved")
+    conn.execute("""CREATE TRIGGER fail_second BEFORE INSERT ON queue
+                    WHEN NEW.draft_id = 'd2'
+                    BEGIN SELECT RAISE(ABORT, 'queue failure'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="queue failure"):
+        review.enqueue_approved(conn)
+    assert list(conn.execute("SELECT * FROM queue")) == []
+    assert not conn.in_transaction
+
+
+def test_review_respects_caller_transaction_and_source_link(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    conn.execute("UPDATE pool SET source_url='https://example.com/story' WHERE id='pool-x'")
+    review.apply_review(conn, "d1", decision="approve")
+    assert conn.in_transaction
+    assert conn.execute("SELECT source_link FROM queue").fetchone()[0] == "https://example.com/story"
+    conn.rollback()
+    assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()[0] == "pending"
+    assert list(conn.execute("SELECT * FROM queue")) == []
+
+
+def test_failed_review_preserves_caller_transaction(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    conn.execute("CREATE TRIGGER fail_queue BEFORE INSERT ON queue BEGIN SELECT RAISE(ABORT, 'queue failure'); END")
+    conn.execute("UPDATE pool SET title='uncommitted' WHERE id='pool-x'")
+    with pytest.raises(sqlite3.IntegrityError, match="queue failure"):
+        review.apply_review(conn, "d1", decision="approve")
+    assert conn.in_transaction
+    assert conn.execute("SELECT title FROM pool").fetchone()[0] == "uncommitted"
+    assert conn.execute("SELECT status FROM drafts").fetchone()[0] == "pending"
+    conn.rollback()
+    assert conn.execute("SELECT title FROM pool").fetchone()[0] == "Pool X"
+
+
+def test_enqueue_never_generates_images_even_on_repeated_backfill(tmp_path, monkeypatch):
+    from humorhist import imagegen
+
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "approved")
+    _make_draft(conn, "d2", "approved")
+    calls = []
+    monkeypatch.setattr(imagegen, "generate_image_for_queue", lambda *a, **k: calls.append(conn.in_transaction))
+    conn.execute("BEGIN")
+    assert review.enqueue_approved(conn, image_dir=str(tmp_path)) == 2
+    assert calls == []
+    conn.commit()
+    assert review.enqueue_approved(conn, image_dir=str(tmp_path)) == 0
+    assert review.enqueue_approved(conn, image_dir=str(tmp_path)) == 0
+    _make_draft(conn, "d3", "approved")
+    assert review.enqueue_approved(conn, image_dir=str(tmp_path)) == 1
+    assert review.enqueue_approved(conn, image_dir=str(tmp_path)) == 0
+    assert calls == []
+    assert conn.execute("SELECT count(*) FROM queue WHERE image_path IS NULL").fetchone()[0] == 3
+
+
+def test_publish_export_excludes_published_rows(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "approved")
+    _make_draft(conn, "d2", "approved")
+    review.enqueue_approved(conn)
+    conn.execute("UPDATE queue SET post_copy = 'old copy', published = 1 WHERE draft_id = 'd1'")
+    conn.execute("UPDATE queue SET post_copy = 'new copy' WHERE draft_id = 'd2'")
+    conn.commit()
+    rows = review.queued_drafts(conn)
+    assert [r["draft_id"] for r in rows] == ["d2"]
+    export = review.format_publish_export(conn, rows)
+    assert "1 post(s)" in export and "new copy" in export
+    assert "old copy" not in export
+
+
+def test_link_backfill_respects_caller_transaction(tmp_path):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1", "approved")
+    review.enqueue_approved(conn)
+    conn.execute("UPDATE pool SET source_url = ? WHERE id = 'pool-x'", ("https://en.wikipedia.org/wiki/Example",))
+    conn.commit()
+    conn.execute("BEGIN")
+    review.enqueue_approved(conn, image_dir=str(tmp_path))
+    assert conn.execute("SELECT source_link FROM queue WHERE draft_id = 'd1'").fetchone()[0]
+    assert conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT source_link FROM queue WHERE draft_id = 'd1'").fetchone()[0] is None

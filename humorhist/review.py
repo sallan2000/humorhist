@@ -9,7 +9,9 @@ be unit-tested without a network or a tty.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
+from functools import wraps
 
 import humorhist.db as db
 
@@ -22,6 +24,30 @@ _VALID_DECISIONS = {APPROVE, REJECT}
 # Statuses that are still within the review gate. Once a draft has left this
 # set (e.g. Phase 4 marked it "used") it is no longer reviewable here.
 _REVIEWABLE_STATUSES = {"pending", "approved", "rejected"}
+
+
+@contextmanager
+def _transaction(conn: sqlite3.Connection):
+    """Keep caller-owned transactions open while making our work atomic."""
+    conn.execute("SAVEPOINT review_operation")
+    try:
+        yield
+        conn.execute("RELEASE SAVEPOINT review_operation")
+    except BaseException:
+        # SQLite can already have rolled back the entire transaction (e.g. a
+        # RAISE(ROLLBACK) trigger); do not mask the original error in cleanup.
+        with suppress(sqlite3.Error):
+            conn.execute("ROLLBACK TO SAVEPOINT review_operation")
+            conn.execute("RELEASE SAVEPOINT review_operation")
+        raise
+
+
+def _atomic(func):
+    @wraps(func)
+    def wrapper(conn, *args, **kwargs):
+        with _transaction(conn):
+            return func(conn, *args, **kwargs)
+    return wrapper
 
 
 def pending_drafts(conn: sqlite3.Connection) -> list[dict]:
@@ -79,6 +105,7 @@ def reviewed_summary(conn: sqlite3.Connection) -> dict:
     return summary
 
 
+@_atomic
 def apply_review(
     conn: sqlite3.Connection,
     draft_id: str,
@@ -151,7 +178,6 @@ def apply_review(
             draft_id,
         ),
     )
-    conn.commit()
     # Keep the Phase 4 queue consistent with the decision: an approval is
     # immediately ready to publish; a rejection (or an approve->reject flip)
     # must not linger in the queue.
@@ -161,11 +187,10 @@ def apply_review(
         remove_from_queue(conn, draft_id)
 
 
+@_atomic
 def remove_from_queue(conn: sqlite3.Connection, draft_id: str) -> int:
     """Delete any queue row for `draft_id` (e.g. after a reject/flip). Returns count removed."""
     cur = conn.execute("DELETE FROM queue WHERE draft_id = ?", (draft_id,))
-    if cur.rowcount:
-        conn.commit()
     return cur.rowcount
 
 
@@ -183,69 +208,48 @@ def enqueue_approved(
     `scheduled_for` is an optional ISO timestamp; when omitted the row is left
     unscheduled (published = 0) for the publisher to pick up in arrival order.
 
-    When `image_dir` is given, each newly-queued draft also gets a best-effort
-    story image (and a persisted 'learn more' source link) — this is the
-    *publish-time* generation step (image moved off the approve flow so it aligns
-    with "about to be published"). Both are best-effort: a missing image
-    credential or generation failure is logged and skipped, never blocking the
-    enqueue.
+    Source links are populated best-effort without network access. `image_dir`
+    is accepted for compatibility but never triggers image generation; use an
+    explicit image command to avoid bulk charges and automatic retries.
     """
-    approved = conn.execute("SELECT id FROM drafts WHERE status = 'approved'").fetchall()
-    already = {r["draft_id"] for r in conn.execute("SELECT draft_id FROM queue")}
-    inserted = 0
-    for r in approved:
-        draft_id = r["id"]
-        if draft_id in already:
-            continue
-        conn.execute(
-            "INSERT INTO queue (draft_id, scheduled_for, published) VALUES (?, ?, 0)",
-            (draft_id, scheduled_for),
-        )
-        inserted += 1
-        # Publish-time artifacts (best-effort): shortened 'learn more' link +
-        # story image. None of this blocks the enqueue.
-        _populate_publish_artifacts(conn, draft_id, image_dir=image_dir)
-    if inserted:
-        conn.commit()
-    # When an image dir is supplied (the explicit publish/enqueue step), also
-    # backfill artifacts for drafts already sitting in the queue without them —
-    # e.g. rows auto-enqueued at approve time (where image_dir was not yet known,
-    # or an image/link was skipped). This keeps the publish step idempotent and
-    # makes it the single place images are generated.
+    inserted_ids = []
+    with _transaction(conn):
+        approved = conn.execute("SELECT id FROM drafts WHERE status = 'approved'").fetchall()
+        already = {r["draft_id"] for r in conn.execute("SELECT draft_id FROM queue")}
+        for r in approved:
+            draft_id = r["id"]
+            if draft_id in already:
+                continue
+            conn.execute(
+                "INSERT INTO queue (draft_id, scheduled_for, published) VALUES (?, ?, 0)",
+                (draft_id, scheduled_for),
+            )
+            inserted_ids.append(draft_id)
+    # Source links are local; image generation is always an explicit operation.
+    for draft_id in inserted_ids:
+        _populate_publish_artifacts(conn, draft_id)
+    # Preserve the old link-backfill behavior without generating paid images.
     if image_dir:
-        for r in conn.execute("SELECT draft_id FROM queue WHERE image_path IS NULL").fetchall():
-            _populate_publish_artifacts(conn, r["draft_id"], image_dir=image_dir)
-    return inserted
+        for r in conn.execute("SELECT draft_id FROM queue WHERE source_link IS NULL AND published = 0").fetchall():
+            _populate_publish_artifacts(conn, r["draft_id"])
+    return len(inserted_ids)
 
 
-def _populate_publish_artifacts(conn: sqlite3.Connection, draft_id: str, *, image_dir: str | None = None) -> None:
-    """Best-effort: persist a 'learn more' source link (always, if a source
-    exists) and a story image (only if ``image_dir`` is given and image is
-    available).
-
-    A reader-facing convenience: the link points at the original article
-    (Wikipedia, etc.) behind the story; the image is generated via FAL FLUX.
-    Either failing is logged and swallowed — the draft still enters the queue.
-    """
+def _populate_publish_artifacts(conn: sqlite3.Connection, draft_id: str) -> None:
+    """Best-effort: persist a local 'learn more' source link if one exists."""
     # 1) Shortened 'learn more' link (no network; derived from pool.source_url).
     try:
         import humorhist.db as db
 
         url, name = db.pool_source_url(conn, draft_id)
         if url:
-            db.set_source_link(conn, draft_id, db.shorten_url(url, shorten=False))
+            with _transaction(conn):
+                conn.execute(
+                    "UPDATE queue SET source_link = ? WHERE draft_id = ?",
+                    (db.shorten_url(url, shorten=False), draft_id),
+                )
     except Exception as exc:  # noqa: BLE001
         print(f"[queue] source link not set for {draft_id}: {exc}")
-
-    # 2) Story image (best-effort; only when a target dir is supplied).
-    if image_dir:
-        try:
-            from humorhist import imagegen as ig
-
-            ig.generate_image_for_queue(conn, draft_id, out_dir=image_dir)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[queue] image not generated for {draft_id}: {exc}")
-
 
 def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
     """Return queued (unpublished) drafts, oldest first, joined to pool title.
@@ -263,6 +267,7 @@ def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
             FROM queue q
             LEFT JOIN drafts d ON d.id = q.draft_id
             LEFT JOIN pool p ON p.id = d.pool_id
+            WHERE q.published = 0
             ORDER BY q.id ASC
             """
         )
@@ -395,6 +400,7 @@ def rejected_drafts(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+@_atomic
 def reopen_draft(conn: sqlite3.Connection, draft_id: str) -> None:
     """Send a rejected (or approved) draft back to 'pending' for re-review.
 
@@ -419,7 +425,6 @@ def reopen_draft(conn: sqlite3.Connection, draft_id: str) -> None:
         """,
         (draft_id,),
     )
-    conn.commit()
     # Keep the queue consistent: a reopened draft is not approved, so it must
     # not linger in the publish queue.
     remove_from_queue(conn, draft_id)
