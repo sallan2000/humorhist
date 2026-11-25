@@ -7,6 +7,7 @@ first.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import re
 import sqlite3
@@ -99,6 +100,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_queue_copy_columns(conn)
     _ensure_queue_image_columns(conn)
     _ensure_queue_link_column(conn)
+    _ensure_queue_publication_column(conn)
     _ensure_defer_column(conn)
     _ensure_pool_note_column(conn)
     # Dedup: normalized_title lets the same event arriving from different
@@ -110,7 +112,61 @@ def migrate(conn: sqlite3.Connection) -> None:
     # the primary key). Backfill any rows that lack one.
     _ensure_short_code_columns(conn)
     _backfill_short_codes(conn)
+    _install_telegram_versions(conn)
     conn.commit()
+
+
+def _install_telegram_versions(conn: sqlite3.Connection) -> None:
+    """Install persistent per-draft mutation clocks without committing caller work.
+
+    Triggers observe writes by all processes, including while the bot is down.
+    Tombstones survive deletion/reinsertion, preventing old buttons reviving.
+    """
+    names = (
+        "hh_tg_draft_insert",
+        "hh_tg_draft_update",
+        "hh_tg_draft_delete",
+        "hh_tg_queue_insert",
+        "hh_tg_queue_update",
+        "hh_tg_queue_delete",
+        "hh_tg_pool_update",
+    )
+    conn.execute("SAVEPOINT hh_telegram_version_schema")
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS telegram_draft_versions (draft_id TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+        )
+        bump = (
+            "INSERT INTO telegram_draft_versions(draft_id, version) VALUES ({ref}, 1) "
+            "ON CONFLICT(draft_id) DO UPDATE SET version=version+1;"
+        )
+        triggers = (
+            (names[0], "INSERT", "drafts", bump.format(ref="NEW.id")),
+            (names[1], "UPDATE", "drafts", bump.format(ref="OLD.id") + bump.format(ref="NEW.id")),
+            (names[2], "DELETE", "drafts", bump.format(ref="OLD.id")),
+            (names[3], "INSERT", "queue", bump.format(ref="NEW.draft_id")),
+            (names[4], "UPDATE", "queue", bump.format(ref="OLD.draft_id") + bump.format(ref="NEW.draft_id")),
+            (names[5], "DELETE", "queue", bump.format(ref="OLD.draft_id")),
+            (names[6], "UPDATE", "pool", "INSERT INTO telegram_draft_versions(draft_id, version) "
+             "SELECT id, 1 FROM drafts WHERE pool_id=OLD.id OR pool_id=NEW.id "
+             "ON CONFLICT(draft_id) DO UPDATE SET version=version+1;"),
+        )
+        for name, event, table, body in triggers:
+            when = ""
+            if event == "UPDATE":
+                # Compare every column, including newly migrated columns. This
+                # avoids no-op invalidation without overlooking material edits.
+                columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+                comparisons = [f'OLD."{col}" IS NOT NEW."{col}"' for col in columns]
+                when = " WHEN " + " OR ".join(comparisons)
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {event} ON {table}{when} BEGIN {body} END")
+        conn.execute("RELEASE SAVEPOINT hh_telegram_version_schema")
+    except BaseException:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK TO SAVEPOINT hh_telegram_version_schema")
+            conn.execute("RELEASE SAVEPOINT hh_telegram_version_schema")
+        raise
 
 
 def _ensure_short_code_columns(conn: sqlite3.Connection) -> None:
@@ -266,6 +322,13 @@ def _ensure_pool_norm_index(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_norm ON pool(normalized_title) WHERE normalized_title IS NOT NULL"
     )
+
+
+def _ensure_queue_publication_column(conn: sqlite3.Connection) -> None:
+    """Add manual publication time without changing existing publication flags."""
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(queue)")}
+    if "published_at" not in existing:
+        conn.execute("ALTER TABLE queue ADD COLUMN published_at TEXT")
 
 
 def _ensure_queue_copy_columns(conn: sqlite3.Connection) -> None:

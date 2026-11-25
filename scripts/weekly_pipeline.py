@@ -19,6 +19,7 @@ and Telegram bot use. Pass a 300s timeout since the hy3 model is slow.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from datetime import UTC, datetime
@@ -71,68 +72,93 @@ def main() -> int:
     from humorhist.harvest.screen import screen_pool
     from humorhist.harvest.seed import load_seed
     from humorhist.harvest.wikipedia_lists import harvest_wikipedia_lists
+    from humorhist.job_control import lock_path_for_db, try_acquire
 
-    conn = db.connect(args.db)
-    db.migrate(conn)
-
-    # --- 1. Harvest (idempotent upsert) -----------------------------------
-    if not args.no_harvest:
-        log("HARVEST: seed events")
-        try:
-            log(f"  seed: {load_seed(conn)}")
-        except Exception as exc:  # noqa: BLE001
-            log(f"  seed FAILED: {str(exc)[:200]}")
-        log("HARVEST: wikipedia lists")
-        try:
-            log(f"  wikipedia: {harvest_wikipedia_lists(conn)}")
-        except Exception as exc:  # noqa: BLE001
-            log(f"  wikipedia FAILED: {str(exc)[:200]}")
-    else:
-        log("HARVEST: skipped (--no-harvest)")
-
-    # --- 2. Screen unscored (idempotent: NULL funny_score only) ------------
-    before = conn.execute("SELECT COUNT(*) n FROM pool WHERE funny_score IS NULL").fetchone()["n"]
-    log(f"SCREEN: {before} unscored pool items")
+    failures = []
+    conn = None
     try:
-        res = screen_pool(conn, _llm(), batch_size=20)
-        log(f"  screen result: {res}")
+        conn = db.connect(args.db)
+        db.migrate(conn)
     except Exception as exc:  # noqa: BLE001
-        log(f"  screen FAILED: {str(exc)[:200]}")
+        log(f"SETUP FAILED: {type(exc).__name__}")
+        if conn is not None:
+            conn.close()
+        return 1
 
-    # --- 3. Draft net-new (draft_one skips existing drafts) ----------------
-    pending_before = conn.execute(
-        "SELECT COUNT(*) n FROM drafts WHERE status='pending'"
-    ).fetchone()["n"]
-    log(f"DRAFT: drafting up to {args.draft_count} net-new candidates")
+    def failed(phase, exc):
+        name = type(exc).__name__
+        failures.append(f"{phase}:{name}")
+        log(f"{phase} FAILED: {name}")
+
     try:
-        result = draft_candidates(
-            conn, _llm(), count=args.draft_count, min_score=args.min_score
-        )
-        log(f"  draft result: {result}")
-    except Exception as exc:  # noqa: BLE001
-        log(f"  draft FAILED: {str(exc)[:200]}")
-        result = {"drafted": 0}
+        if not args.no_harvest:
+            for name, action in (("seed", load_seed), ("wikipedia", harvest_wikipedia_lists)):
+                try:
+                    if name == "wikipedia":
+                        # Harvest logs raw provider exceptions; report only its counts.
+                        logger = logging.getLogger("humorhist.harvest.wikipedia_lists")
+                        was_disabled = logger.disabled
+                        logger.disabled = True
+                        try:
+                            summary = action(conn)
+                        finally:
+                            logger.disabled = was_disabled
+                    else:
+                        summary = action(conn)
+                    log(f"HARVEST {name}: inserted={summary['inserted']}"
+                        f" pages_failed={summary.get('pages_failed', 0)}")
+                    if summary.get("pages_failed"):
+                        failures.append(f"{name}:pages_failed")
+                except Exception as exc:  # noqa: BLE001
+                    failed(name, exc)
+        else:
+            log("HARVEST: skipped (--no-harvest)")
 
-    pending_after = conn.execute(
-        "SELECT COUNT(*) n FROM drafts WHERE status='pending'"
-    ).fetchone()["n"]
-    fresh = pending_after - pending_before
-
-    # --- 4. Nudge (best effort) --------------------------------------------
-    chat_id = os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
-    if fresh and chat_id and os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
         try:
-            from humorhist import telegram as tg
+            before = conn.execute("SELECT COUNT(*) n FROM pool WHERE funny_score IS NULL").fetchone()["n"]
+            log(f"SCREEN: {before} unscored pool items")
+            res = screen_pool(conn, _llm(), batch_size=20)
+            log(f"SCREEN: scored={res['scored']} batches={res['batches']} failed_batches={res['failed_batches']}")
+            if res["failed_batches"]:
+                failures.append("screen:failed_batches")
+            if res["scored"] < before:
+                failures.append("screen:incomplete")
+        except Exception as exc:  # noqa: BLE001
+            failed("screen", exc)
 
-            n = tg.notify_new_drafts(conn, tg.TelegramClient(), chat_id)
-            log(f"NOTIFY: nudged Telegram with {n} pending draft(s)")
-        except Exception as exc:  # noqa: BLE001 - nudge must never break the run
-            log(f"NOTIFY: skipped ({str(exc)[:120]})")
-    else:
-        log(f"NOTIFY: skipped (fresh={fresh}, chat configured={bool(chat_id)})")
+        fresh = None
+        try:
+            lock = try_acquire(lock_path_for_db(conn))
+            if lock is None:
+                failures.append("draft:busy")
+                log("DRAFT: busy (another drafting job holds the lock)")
+            else:
+                with lock:
+                    result = draft_candidates(conn, _llm(), count=args.draft_count, min_score=args.min_score)
+                    fresh = result["drafted"]
+                    log(f"DRAFT: selected={result['selected']} drafted={fresh} failed={result['failed']}")
+                    if result["failed"]:
+                        failures.append("draft:failed")
+        except Exception as exc:  # noqa: BLE001
+            failed("draft", exc)
 
-    log(f"DONE. fresh pending drafts this run: {fresh}")
-    return 0
+        chat_id = os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
+        if fresh and chat_id and os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
+            try:
+                from humorhist import telegram as tg
+
+                n = tg.notify_new_drafts(conn, tg.TelegramClient(), chat_id)
+                log(f"NOTIFY: nudged Telegram with {n} pending draft(s)")
+            except Exception as exc:  # noqa: BLE001
+                failed("notify", exc)
+        else:
+            if fresh and not (chat_id and os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN")):
+                failures.append("notify:NotConfigured")
+            log(f"NOTIFY: skipped (fresh={fresh}, chat configured={bool(chat_id)})")
+        log(f"DONE: fresh={fresh} failures={','.join(failures) or 'none'}")
+        return int(bool(failures))
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

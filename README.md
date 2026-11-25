@@ -168,7 +168,7 @@ You can review interactively from the terminal:
 
     python -m humorhist.cli --db data/humorhist.sqlite review
 
-It walks every `pending` draft, shows it, and prompts `[a/r/s]`
+It walks pending drafts ready for review, shows them, and prompts `[a/r/s]`
 (approve/reject/skip) plus optional editor line + notes.
 
 ### 4b. Review from Telegram (optional)
@@ -224,6 +224,22 @@ startup it sends a ready message, then **proactively nudges** you with
 "🆕 N new draft(s) awaiting review" whenever fresh drafts appear (from `/draft`,
 the weekly timer, etc.) — you don't have to remember to poll it.
 
+Drafts and action prompts identify the topic by title and `#short_code`.
+For draft-targeted Telegram commands, use the displayed code with `#` (for
+example, `/view #ABC123xy`), the bare code, or the full draft ID. A bare exact
+full ID takes precedence over a matching short code; use `#` to select the
+short code in that case. Unknown or ambiguous identifiers are rejected.
+Buttons use the full ID internally. Mutating buttons and editorial prompts
+expire when their draft or queue entry changes; reopen the draft or list to
+get fresh controls. Changes to other drafts do not expire them. The bot keeps
+per-draft version clocks in SQLite, so this protection survives restarts.
+
+`/later` keeps a draft pending but hides it from ready-to-review lists for 30
+days. `/listlater` shows deferred drafts and `/reviewnow` brings one or all
+forward. The `/status` pending count is a status breakdown and **includes**
+deferred drafts, even though the review-ready list and its nudges exclude
+future deferrals.
+
 **Commands**
 
     /reviewdraft   review pending drafts one by one (✅ Approve / ❌ Reject / ⏸ Later)  (`/reviewdraft fast` commits on the first tap, skipping the confirm gate)
@@ -238,7 +254,9 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /later <id>    defer a pending draft 30 days
     /listapproved  list drafts you've greenlit; tap to open, or ❌ Reject
     /listrejected  list rejected drafts; tap one to reopen for re-review
-    /listqueue     list approved+queued drafts; ✏️ copy, 🗑 Remove, ❌ Reject, ↩️ Reopen per row
+    /listqueue     list approved+queued drafts; edit, remove, reject, reopen or mark posted
+    /listposted    list recorded posts; undo a manual posted record when needed
+    /view <id>     open any draft's full content
     /viewcopy <id> open a queued draft's post copy (✏️ Edit / 🔄 Regenerate)
     /queue         list the publish queue (approved+queued drafts)
     /queue enqueue  sweep approved drafts into the queue
@@ -267,6 +285,7 @@ the weekly timer, etc.) — you don't have to remember to poll it.
     /draft 4 8.0
         → "✍️ Drafting 4 candidate(s) (min score 8.0)…" then "✍️ Drafted 4 new
            draft(s). 9 pending total — send /reviewdraft to review them."
+           This command's count is the number currently ready for review.
            This is the only way to create drafts from chat.
 
     /suggest The Great Emu War
@@ -285,8 +304,9 @@ the weekly timer, etc.) — you don't have to remember to poll it.
         with your steer (e.g. "lean into the bureaucracy") to regenerate the angles
         with that as steering.
 
-    /later d4f1a2b3
-        → "⏸ `d4f1a2b3` deferred 30 days." (drops out of review until then.)
+    /later #ABC123xy
+        → the named title and code are deferred 30 days (still pending, but
+          not shown for review until then).
         List deferred drafts with /listlater; bring one (or all) back with
         /reviewnow [<id>].
 
@@ -325,11 +345,11 @@ the weekly timer, etc.) — you don't have to remember to poll it.
         → same list as /listqueue (approved+queued drafts).
     /queue enqueue
         → "📥 Enqueued 2 approved draft(s) into the queue." + the queue list.
-    /queue remove d4f1a2b3
-        → "↩️ Removed `d4f1a2b3` from the queue (kept approved)."
+    /queue remove #ABC123xy
+        → removes the named title and code from the queue (kept approved).
 
     /status
-        → approved / rejected / pending breakdown + buffer level; if any
+        → approved / rejected / pending breakdown; if any
            approved+queued draft is missing its one-line joke, a ⚠️ stuck-capture
            nudge lists them (or run /jokes for a dedicated list; fix with /setjoke <id>).
 
@@ -352,7 +372,7 @@ for unattended use).
    messages (Telegram caps a message at 4096 chars, so long drafts are split);
    the **✅ Approve** / **❌ Reject** buttons are on the last message of that
    draft. Tap one.
-3. Tapping a button does **not** commit instantly. It opens a **Confirm /
+3. In normal mode, tapping a button does **not** commit instantly. It opens a **Confirm /
    Cancel** gate — tap **Yes, Approve** / **Yes, Reject** to commit, or
    **↩️ Cancel** to back out with no change (this stops a fat-finger tap from
    enqueuing a draft before you can reconsider). After a confirmed Approve the
@@ -360,13 +380,11 @@ for unattended use).
    type the joke and send it, or reply `/skip` to leave it blank. (The joke is
    attached as `editor_line` and steers the generated post copy.) On a *pending*
    draft you can also send **/notes <id>** to steer the angles with your note.
-4. **Only after you've decided that draft does the next one arrive.** One at a
-   time — no wall of drafts. When all are done you get "✅ All caught up". If new
-   drafts are generated later (by the weekly timer, `/draft`, or `/harvest`), the
-   bot proactively sends "🆕 N new draft(s) awaiting review" — or just send
-   **/reviewdraft** again to pick them up. On **Approve** the bot next asks for
-   your one-line joke (the human voice), then optional notes; on a *pending* draft
-   you can also send **/notes <id>** to steer the angles with your note.
+4. Tap **Next draft** or send **/reviewdraft** again to advance. You can move
+   on without deciding: the previous draft stays pending. Navigation wraps to
+   the start of the ready list and excludes future-deferred drafts. If none are
+   ready but some are deferred, the bot points you to **/listlater**. New ready
+   drafts can also trigger a nudge.
 
 **Browse and annotate approved drafts**
 
@@ -584,7 +602,7 @@ approved work is never overwritten). `Linger=yes` keeps it alive after logout.
         run_drafts.py       long-running drafting worker (token-refresh safe)
         screen_all.py       score every unscored row
         rescreen_60.py      one-off: re-score the originally-screened rows
-        regen_drafts.py     regenerate existing drafts + draft fresh ones
+        regen_drafts.py     skip existing drafts and draft fresh candidates (no regeneration)
         telegram_review.py  durable Telegram review-loop runner (systemd --user)
         weekly_pipeline.py  durable weekly discovery pipeline (systemd --user timer)
         fill_approved_copy.py  one-shot: generate post copy for approved+queued drafts

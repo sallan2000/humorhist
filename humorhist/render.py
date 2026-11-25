@@ -18,12 +18,15 @@ def render_draft(row, pool=None) -> str:
     """
     title = pool["title"] if pool else "(unknown)"
     year = pool["year"] if pool else ""
+    title = title or "(unknown)"
+    title = title if len(title) <= 200 else title[:199] + "…"
     brief = json.loads(row["brief_json"] or "{}")
     angles = json.loads(row["angles_json"] or "{}")
 
     out: list[str] = []
     out.append("=" * 70)
-    out.append(f"DRAFT {row['id']} — {title} ({year})")
+    short = dict(row).get("short_code") or row["id"]
+    out.append(f"DRAFT {title} (#{short}) ({year})")
     out.append(f"status: {row['status']}")
     # Phone-skimmable TL;DR: lead with the hook (or top angle) so a reviewer on a
     # small screen gets the gist before the dense facts/angles/sources dump below.

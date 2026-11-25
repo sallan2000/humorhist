@@ -40,11 +40,24 @@ def main() -> int:
     args = ap.parse_args()
 
     import humorhist.db as db
-    from humorhist.drafting import draft_one, select_candidates
-    from humorhist.llm import LLMUnavailable, resilient_client
+    from humorhist.job_control import lock_path_for_db, try_acquire
 
     conn = db.connect(args.db)
-    db.migrate(conn)
+    try:
+        db.migrate(conn)
+        lock = try_acquire(lock_path_for_db(conn))
+        if lock is None:
+            log("BUSY: another drafting job holds the lock")
+            return 1
+        with lock:
+            return _run(conn, args)
+    finally:
+        conn.close()
+
+
+def _run(conn, args) -> int:
+    from humorhist.drafting import draft_one, select_candidates
+    from humorhist.llm import LLMUnavailable, resilient_client
 
     rows = select_candidates(conn, count=args.count, min_score=args.min_score)
     log(f"selected {len(rows)} candidates (min_score={args.min_score})")
@@ -72,7 +85,7 @@ def main() -> int:
             log(f"    FAILED after {time.time()-started:.0f}s: {str(exc)[:200]}")
 
     log(f"DONE drafted={drafted} failed={failed}")
-    return 0 if drafted else 1
+    return int(bool(failed))
 
 
 if __name__ == "__main__":

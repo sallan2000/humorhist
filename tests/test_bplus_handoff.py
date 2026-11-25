@@ -135,7 +135,7 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
         "update_id": 1,
         "callback_query": {
             "id": "cb1",
-            "data": "approve:d1",
+            "data": f"approve:d1:{tg._decision_token(conn, 'd1')}",
             "message": {"message_id": 10},
         },
     }
@@ -150,7 +150,7 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
         conn,
         stub,
         "chat",
-        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1", "message": {"message_id": 10}}},
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": stub.sent[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "message": {"message_id": 10}}},
     )
     assert res2["note_message_id"] is not None
     row = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()
@@ -160,7 +160,7 @@ def test_telegram_approve_generates_post_copy(tmp_path, monkeypatch):
         conn,
         stub,
         "chat",
-        {"d1": {"note_message_id": note_msg_id, "stage": "editor_line", "decision": "approve"}},
+        {"d1": {"version": tg._decision_token(conn, "d1"), "note_message_id": note_msg_id, "stage": "editor_line", "decision": "approve"}},
         {
             "update_id": 2,
             "message": {
@@ -189,7 +189,7 @@ def test_telegram_approve_skips_copy_when_no_client(tmp_path, monkeypatch):
         "update_id": 1,
         "callback_query": {
             "id": "cb1",
-            "data": "approve:d1",
+            "data": f"approve:d1:{tg._decision_token(conn, 'd1')}",
             "message": {"message_id": 10},
         },
     }
@@ -200,7 +200,7 @@ def test_telegram_approve_skips_copy_when_no_client(tmp_path, monkeypatch):
         conn,
         stub,
         "chat",
-        {"update_id": 2, "callback_query": {"id": "cb2", "data": "confirm:approve:d1", "message": {"message_id": 10}}},
+        {"update_id": 2, "callback_query": {"id": "cb2", "data": stub.sent[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "message": {"message_id": 10}}},
     )
     assert res2 is not None and res2.get("decision") == "approve"
     status = conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()

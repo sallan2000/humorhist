@@ -141,3 +141,36 @@ def test_retry_exhausted_raises():
             pass
         else:
             raise AssertionError("expected TelegramError after retries exhausted")
+
+
+def test_long_poll_has_read_headroom_only(monkeypatch):
+    observed = []
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            observed.append(timeout)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def post(self, url, json):
+            result = [] if url.endswith("getUpdates") else {"message_id": 1}
+            return httpx.Response(200, json={"ok": True, "result": result}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(tg.httpx, "Client", FakeClient)
+    client = tg.TelegramClient(token="TESTTOKEN", timeout=30, max_retries=0)
+    assert client.get_updates(0, 30) == []
+    assert observed[-1].read == 40 and observed[-1].connect == 30
+    assert observed[-1].write == 30 and observed[-1].pool == 30
+    client.send_message("chat", "hello")
+    assert observed[-1] == 30
+    client.get_updates(0, 0)
+    assert observed[-1] == 30
+    client.get_updates(0, 90)
+    assert observed[-1].read == 100 and observed[-1].connect == 30
+    large = tg.TelegramClient(token="TESTTOKEN", timeout=120, max_retries=0)
+    large.get_updates(0, 30)
+    assert observed[-1].read == 120

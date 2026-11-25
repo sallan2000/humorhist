@@ -51,12 +51,10 @@ def _atomic(func):
 
 
 def pending_drafts(conn: sqlite3.Connection) -> list[dict]:
-    """Return all drafts with status 'pending', review-order friendly.
+    """Return pending drafts ready for review, oldest first.
 
-    Deferred drafts (``defer_until`` set in the future) sort *after* the
-    non-deferred ones, so they stay out of the review surface until their
-    window opens. Drafts whose defer window has already passed sort as normal
-    pending (the /later window expired).
+    Future-deferred drafts remain pending in the database but are excluded
+    until their defer window opens. Expired deferrals sort as normal pending.
     """
     now = datetime.now(UTC).isoformat()
     return [
@@ -65,10 +63,8 @@ def pending_drafts(conn: sqlite3.Connection) -> list[dict]:
             """
             SELECT * FROM drafts
             WHERE status = 'pending'
-            ORDER BY
-              CASE WHEN defer_until IS NOT NULL AND defer_until > ? THEN 1 ELSE 0 END,
-              created_at ASC,
-              id ASC
+              AND (defer_until IS NULL OR defer_until <= ?)
+            ORDER BY created_at ASC, id ASC
             """,
             (now,),
         )
@@ -190,8 +186,67 @@ def apply_review(
 @_atomic
 def remove_from_queue(conn: sqlite3.Connection, draft_id: str) -> int:
     """Delete any queue row for `draft_id` (e.g. after a reject/flip). Returns count removed."""
+    if conn.execute("SELECT 1 FROM queue WHERE draft_id = ? AND published = 1", (draft_id,)).fetchone():
+        raise ValueError("undo publication before removing this draft from the queue")
     cur = conn.execute("DELETE FROM queue WHERE draft_id = ?", (draft_id,))
     return cur.rowcount
+
+
+def _publication_row(conn: sqlite3.Connection, draft_id: str) -> sqlite3.Row:
+    draft = conn.execute("SELECT status FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if draft is None:
+        raise ValueError(f"no draft with id {draft_id!r}")
+    if draft["status"] != "approved":
+        raise ValueError(f"draft {draft_id!r} is not approved")
+    rows = conn.execute("SELECT id, published, published_at FROM queue WHERE draft_id = ?", (draft_id,)).fetchall()
+    if len(rows) != 1:
+        raise ValueError(f"draft {draft_id!r} must have exactly one queue row")
+    if rows[0]["published"] not in (0, 1):
+        raise ValueError(f"draft {draft_id!r} has an invalid publication state")
+    return rows[0]
+
+
+@_atomic
+def mark_posted(conn: sqlite3.Connection, draft_id: str) -> str:
+    """Record a manual post and return its UTC ISO timestamp; never post remotely.
+
+    Repeating the action returns the original timestamp. Legacy published rows
+    with no timestamp are not claimed as manual records. No copy is required.
+    """
+    row = _publication_row(conn, draft_id)
+    if row["published"] == 1:
+        if row["published_at"] is None:
+            raise ValueError("already published without a manual publication timestamp")
+        return row["published_at"]
+    if row["published_at"] is not None:
+        raise ValueError("unpublished row has an inconsistent publication timestamp")
+    now = datetime.now(UTC).isoformat()
+    cur = conn.execute("UPDATE queue SET published = 1, published_at = ? WHERE id = ?", (now, row["id"]))
+    if cur.rowcount != 1:
+        raise ValueError("publication was not recorded")
+    return now
+
+
+@_atomic
+def undo_posted(conn: sqlite3.Connection, draft_id: str, *, expected_published_at: str | None = None) -> bool:
+    """Undo a manual record; return True if changed, False if already undone.
+
+    Pass the timestamp shown on a confirmation button to prevent a stale undo
+    from reversing a later publication. Legacy published records cannot be undone.
+    """
+    row = _publication_row(conn, draft_id)
+    if row["published"] == 0:
+        if row["published_at"] is not None:
+            raise ValueError("unpublished row has an inconsistent publication timestamp")
+        return False
+    if row["published_at"] is None:
+        raise ValueError("cannot undo a legacy publication without a timestamp")
+    if expected_published_at is not None and expected_published_at != row["published_at"]:
+        raise ValueError("publication has changed since confirmation")
+    cur = conn.execute("UPDATE queue SET published = 0, published_at = NULL WHERE id = ?", (row["id"],))
+    if cur.rowcount != 1:
+        raise ValueError("publication undo was not recorded")
+    return True
 
 
 def enqueue_approved(
@@ -458,7 +513,7 @@ def stuck_captures(conn: sqlite3.Connection) -> list[dict]:
             LEFT JOIN pool p ON p.id = d.pool_id
             WHERE d.status = 'approved'
               AND d.editor_line IS NULL
-              AND EXISTS (SELECT 1 FROM queue q WHERE q.draft_id = d.id)
+              AND EXISTS (SELECT 1 FROM queue q WHERE q.draft_id = d.id AND q.published = 0)
             ORDER BY d.reviewed_at ASC, d.id ASC
             """
         )

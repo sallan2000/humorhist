@@ -279,7 +279,11 @@ def test_telegram_status_errors_without_token(dbpath, monkeypatch, capsys):
 
 def test_queue_enqueue_moves_approved(dbpath, monkeypatch, capsys):
     import humorhist.db as db
+    from humorhist.llm import StubClient
 
+    # Queue behavior is under test, not automatic LLM copy generation.
+    monkeypatch.setattr("humorhist.llm.default_client", lambda: StubClient([]))
+    monkeypatch.setattr("humorhist.copywriter.fill_post_copy", lambda *args, **kwargs: 0)
     conn = db.connect(dbpath)
     conn.execute("INSERT OR IGNORE INTO pool (id, title) VALUES ('p1','X')")
     conn.execute(

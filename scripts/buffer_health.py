@@ -10,8 +10,11 @@ Runs on a systemd --user timer (see humorhist-buffer.timer). Each run:
      Healthy buffers stay silent — no nagging when there's a week+ of content.
 
   The LLM credential is re-read per network call via resilient_client() so a long
-  run survives the hourly Nous token expiry. A missing credential just means
-  auto-draft is skipped; the report + Telegram alert still work.
+  run survives the hourly Nous token expiry. A missing credential is a failed run
+  if auto-drafting is needed; the
+  report + best-effort Telegram alert still run. Both jobs return 1 for
+  failures (including partial candidate failures or notification errors).
+  Failure summaries are for this run only; no historical state is stored.
 """
 
 from __future__ import annotations
@@ -71,37 +74,104 @@ def main() -> int:
     import humorhist.buffer as buf
     import humorhist.db as db
     from humorhist import telegram as tg
+    from humorhist.job_control import lock_path_for_db, try_acquire
 
-    conn = db.connect(args.db)
-    db.migrate(conn)
+    failures = []
 
-    client = None if args.no_auto_draft else _llm()
-    telegram = None
-    chat_id = os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
-    if not args.no_auto_draft and not os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
-        log("AUTO-DRAFT: no bot token -> LLM key path still attempted for drafting")
-    if not args.no_notify and chat_id and os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
-        telegram = tg.TelegramClient()
-    else:
-        log("NOTIFY: skipped (--no-notify or Telegram not configured)")
+    def failed(phase, exc):
+        name = type(exc).__name__
+        failures.append(f"{phase}:{name}")
+        log(f"{phase.upper()} FAILED: {name}")
 
-    result = buf.run_buffer_check(
-        conn,
-        client=client,
-        auto_draft=not args.no_auto_draft,
-        chat_id=chat_id,
-        telegram=telegram,
-    )
-    log(buf.health_message(result))
-    if result.get("drafted"):
-        log(f"AUTO-DRAFT: {result['drafted']} candidate(s) drafted")
-    if result.get("draft_error"):
-        log(f"AUTO-DRAFT error: {result['draft_error']}")
-    if result.get("notified"):
-        log("NOTIFY: low-buffer alert sent to Telegram")
-    if result.get("notify_error"):
-        log(f"NOTIFY error: {result['notify_error']}")
-    return 0
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        db.migrate(conn)
+    except Exception as exc:  # noqa: BLE001
+        failed("setup", exc)
+        if conn is not None:
+            conn.close()
+        return 1
+
+    try:
+        try:
+            health = buf.buffer_health(conn)
+        except Exception as exc:  # noqa: BLE001
+            failed("health", exc)
+            return 1
+
+        if not args.no_auto_draft and health["auto_draft"]:
+            try:
+                lock = try_acquire(lock_path_for_db(conn))
+                if lock is None:
+                    failures.append("draft:busy")
+                    log("AUTO-DRAFT: busy (another drafting job holds the lock)")
+                else:
+                    with lock:
+                        # Another run may have finished since the initial health check.
+                        if not buf.buffer_health(conn)["auto_draft"]:
+                            log("AUTO-DRAFT: skipped (buffer replenished)")
+                        else:
+                            client = _llm()
+                            if client is None:
+                                failures.append("draft:LLMUnavailable")
+                                log("AUTO-DRAFT FAILED: LLMUnavailable")
+                            else:
+                                from humorhist.drafting import draft_candidates
+
+                                result = draft_candidates(conn, client, count=buf.AUTO_DRAFT_COUNT)
+                                log(f"AUTO-DRAFT: selected={result['selected']} drafted={result['drafted']} "
+                                    f"failed={result['failed']}")
+                                if result["failed"]:
+                                    failures.append("draft:failed")
+            except Exception as exc:  # noqa: BLE001
+                failed("draft", exc)
+        else:
+            log("AUTO-DRAFT: skipped")
+
+        # Refresh after drafting, and distinguish future-deferred pending drafts.
+        # Published drafts retain approved status; do not count them as available.
+        try:
+            now = datetime.now(UTC).isoformat()
+            row = conn.execute(
+                "SELECT SUM(CASE WHEN status='pending' AND (defer_until IS NULL OR defer_until <= ?) "
+                "THEN 1 ELSE 0 END) AS ready, "
+                "SUM(CASE WHEN status='pending' AND defer_until > ? THEN 1 ELSE 0 END) AS deferred, "
+                "SUM(CASE WHEN status='approved' AND NOT EXISTS "
+                "(SELECT 1 FROM queue q WHERE q.draft_id=drafts.id AND q.published=1) "
+                "THEN 1 ELSE 0 END) AS approved, "
+                "SUM(CASE WHEN status='approved' AND EXISTS "
+                "(SELECT 1 FROM queue q WHERE q.draft_id=drafts.id AND q.published=1) "
+                "THEN 1 ELSE 0 END) AS published FROM drafts", (now, now),
+            ).fetchone()
+            health = buf.buffer_health(conn)
+            summary = (f"HEALTH: ready={row['ready'] or 0} deferred={row['deferred'] or 0} "
+                       f"approved={row['approved'] or 0} queued={health['depth']} "
+                       f"published={row['published'] or 0} level={health['level']}")
+            log(summary)
+        except Exception as exc:  # noqa: BLE001
+            failed("summary", exc)
+            summary = "HEALTH: summary unavailable"
+
+        chat_id = os.environ.get("HUMORHIST_TELEGRAM_CHAT_ID")
+        if not args.no_notify and chat_id and os.environ.get("HUMORHIST_TELEGRAM_BOT_TOKEN"):
+            if health["level"] != "silent":
+                try:
+                    message = summary + "\nFailures this run: " + (", ".join(failures) or "none")
+                    tg.TelegramClient().send_message(chat_id, message)
+                    log("NOTIFY: low-buffer alert sent to Telegram")
+                except Exception as exc:  # noqa: BLE001
+                    failed("notify", exc)
+            else:
+                log("NOTIFY: skipped (healthy buffer)")
+        else:
+            if not args.no_notify and health["level"] != "silent":
+                failures.append("notify:NotConfigured")
+            log("NOTIFY: skipped (--no-notify or Telegram not configured)")
+        log(f"DONE: failures={','.join(failures) or 'none'}")
+        return int(bool(failures))
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

@@ -228,7 +228,7 @@ def test_defer_draft_sets_defer_until_and_pends(tmp_path):
     assert conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()["defer_until"] is None
 
 
-def test_pending_drafts_orders_deferred_last(tmp_path):
+def test_pending_drafts_excludes_future_deferrals(tmp_path):
     conn = _fresh_db(tmp_path)
     _make_draft(conn, "normal", "pending")
     _make_draft(conn, "deferred", "pending")
@@ -238,7 +238,34 @@ def test_pending_drafts_orders_deferred_last(tmp_path):
     conn.commit()
     pend = review.pending_drafts(conn)
     ids = [d["id"] for d in pend]
-    assert ids == ["normal", "deferred"]  # deferred sorts after the window
+    assert ids == ["normal"]
+    assert review.reviewed_summary(conn)["pending"]["count"] == 2
+
+
+def test_only_deferred_drafts_return_after_expiry(tmp_path, monkeypatch):
+    conn = _fresh_db(tmp_path)
+    _make_draft(conn, "d1")
+    start = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    deadline = start + timedelta(days=1)
+    conn.execute("UPDATE drafts SET defer_until = ? WHERE id = 'd1'", (deadline.isoformat(),))
+    conn.commit()
+
+    class Clock(datetime):
+        current = start
+
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            return cls.current
+
+    monkeypatch.setattr(review, "datetime", Clock)
+    assert review.pending_drafts(conn) == []
+    assert [r["draft_id"] for r in review.deferred_drafts(conn)] == ["d1"]
+    Clock.current = deadline
+    assert [r["id"] for r in review.pending_drafts(conn)] == ["d1"]
+    assert review.deferred_drafts(conn) == []
+    row = conn.execute("SELECT status, defer_until FROM drafts WHERE id='d1'").fetchone()
+    assert (row["status"], row["defer_until"]) == ("pending", deadline.isoformat())
 
 
 # --- deferred_drafts / bring_forward (GAP 4) --------------------------------
@@ -279,6 +306,7 @@ def test_bring_forward_one_clears_defer(tmp_path):
     conn = _fresh_db(tmp_path)
     _make_draft(conn, "d1", "pending")
     _defer(conn, "d1")
+    assert review.pending_drafts(conn) == []
     n = review.bring_forward(conn, "d1")
     assert n == 1
     assert conn.execute("SELECT defer_until FROM drafts WHERE id='d1'").fetchone()["defer_until"] is None
@@ -306,10 +334,12 @@ def test_bring_forward_all_clears_every_deferred(tmp_path):
     _defer(conn, "d1")
     _defer(conn, "d2")
     # d3 not deferred
+    assert [d["id"] for d in review.pending_drafts(conn)] == ["d3"]
     n = review.bring_forward(conn)  # no id -> all deferred
     assert n == 2
     remaining = {r["draft_id"] for r in review.deferred_drafts(conn)}
     assert remaining == set()
+    assert [d["id"] for d in review.pending_drafts(conn)] == ["d1", "d2", "d3"]
 
 
 # --- stuck_captures / set_editor_line (GAP 4b) -------------------------------

@@ -4,8 +4,9 @@ __pycache__/
 # generated story images (one .png per approved draft; not code, not for github)
 data/images/
 
-# pooled drafts / copy, and the live sqlite db
+# pooled drafts / copy, the live sqlite db, and private database backups
 data/*.sqlite
+data/backups/
 
 # runtime logs (no secrets, but not code)
 data/*.log

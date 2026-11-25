@@ -17,6 +17,7 @@ drip publishing). The thresholds come straight from the plan:
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
 # Depth thresholds (in unpublished queued drafts == days of buffer).
 SILENT_THRESHOLD = 7
@@ -34,8 +35,12 @@ def buffer_depth(conn: sqlite3.Connection) -> int:
 
 
 def pending_count(conn: sqlite3.Connection) -> int:
-    """Number of drafts still awaiting a review decision."""
-    row = conn.execute("SELECT count(*) AS n FROM drafts WHERE status = 'pending'").fetchone()
+    """Number of pending drafts available for review now, excluding deferrals."""
+    row = conn.execute(
+        "SELECT count(*) AS n FROM drafts WHERE status = 'pending' "
+        "AND (defer_until IS NULL OR defer_until <= ?)",
+        (datetime.now(UTC).isoformat(),),
+    ).fetchone()
     return int(row["n"])
 
 
@@ -101,29 +106,42 @@ def run_buffer_check(
     only when the level is ``nudge``/``escalate`` (silent => no nag). Best-effort:
     auto-draft and Telegram failures are reported in the returned dict, never raised.
 
-    Returns the health dict plus ``drafted`` (count auto-drafted) and
-    ``notified`` (bool).
+    Returns the health dict plus ``drafted``, ``draft_started``, ``draft_error``
+    and ``notified``. A busy lock is reported as a draft error, not success.
     """
     health = buffer_health(conn)
     result: dict = dict(health)
 
     drafted = 0
     draft_error = None
+    draft_started = False
     if auto_draft and health["auto_draft"] and client is not None:
         try:
             from humorhist.drafting import draft_candidates
+            from humorhist.job_control import lock_path_for_db, try_acquire
 
-            res = draft_candidates(conn, client, count=AUTO_DRAFT_COUNT)
-            drafted = res["drafted"]
+            lock = try_acquire(lock_path_for_db(conn))
+            if lock is None:
+                draft_error = "busy: another drafting job holds the lock"
+            else:
+                with lock:
+                    # The previous job may have replenished the buffer already.
+                    if buffer_health(conn)["auto_draft"]:
+                        draft_started = True
+                        res = draft_candidates(conn, client, count=AUTO_DRAFT_COUNT)
+                        drafted = res["drafted"]
+                        if res.get("failed"):
+                            draft_error = f"{res['failed']} candidate(s) failed"
         except Exception as exc:  # noqa: BLE001 - monitor must never crash the cron
             draft_error = str(exc)
     result["drafted"] = drafted
     result["draft_error"] = draft_error
+    result["draft_started"] = draft_started
 
     notified = False
     if telegram is not None and chat_id and health["level"] != "silent":
         try:
-            will_draft = bool(auto_draft and client is not None)
+            will_draft = draft_started
             telegram.send_message(chat_id, health_message(health, will_draft=will_draft))
             notified = True
         except Exception as exc:  # noqa: BLE001

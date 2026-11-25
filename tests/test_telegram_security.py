@@ -80,7 +80,11 @@ def test_authorized_callback_commits_review(tmp_path):
     conn.execute("INSERT INTO drafts (id, pool_id, brief_json, angles_json, status, created_at) "
                  "VALUES ('d1', 'p', '{}', '{}', 'pending', '2026-01-01')")
     conn.commit()
-    stub = tg.StubTelegram([callback(1, "confirm:reject:d1")])
+    token = tg._decision_token(conn, "d1")
+    stub = tg.StubTelegram()
+    tg.handle_callback(conn, stub, str(CHAT), callback(0, f"reject:d1:{token}"))
+    confirm = stub.sent[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    stub._updates = [callback(1, confirm)]
     assert tg.run_review_bot(conn, stub, str(CHAT), once=True) == 1
     assert conn.execute("SELECT status FROM drafts WHERE id='d1'").fetchone()[0] == "rejected"
     assert "1" in stub.answered

@@ -68,14 +68,23 @@ def cmd_screen(args: argparse.Namespace) -> int:
 
 def cmd_draft(args: argparse.Namespace) -> int:
     from humorhist.drafting import draft_candidates
+    from humorhist.job_control import lock_path_for_db, try_acquire
     from humorhist.llm import default_client
 
     conn = _open_db(args.db)
-    client = default_client()
-    print(f"Drafting {args.count} candidates (min score {args.min_score})...")
-    result = draft_candidates(conn, client, count=args.count, min_score=args.min_score)
-    print("Result:", result)
-    return 0
+    try:
+        lock = try_acquire(lock_path_for_db(conn))
+        if lock is None:
+            print("Drafting busy: another drafting job holds the lock.")
+            return 1
+        with lock:
+            client = default_client()
+            print(f"Drafting {args.count} candidates (min score {args.min_score})...")
+            result = draft_candidates(conn, client, count=args.count, min_score=args.min_score)
+            print("Result:", result)
+            return int(bool(result.get("failed")))
+    finally:
+        conn.close()
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -185,7 +194,7 @@ def cmd_buffer(args: argparse.Namespace) -> int:
         chat_id=chat_id,
         telegram=telegram,
     )
-    will_draft = bool(args.auto_draft and client is not None)
+    will_draft = result.get("draft_started", False)
     print(buf.health_message(result, will_draft=will_draft))
     if result.get("drafted"):
         print(f"Auto-drafted {result['drafted']} candidate(s).")
@@ -193,7 +202,7 @@ def cmd_buffer(args: argparse.Namespace) -> int:
         print(f"(auto-draft error: {result['draft_error']})")
     if result.get("notified"):
         print("(low-buffer alert sent to Telegram)")
-    return 0
+    return int(bool(result.get("draft_error")))
 
 
 def render_draft(row, pool=None) -> str:

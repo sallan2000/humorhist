@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Regenerate existing drafts under the new prompts, then draft fresh candidates.
+"""Preserve existing drafts and draft fresh candidates.
 
-Both phases build their LLM client from the unattended credential path
-(HUMORHIST_LLM_API_KEY, falling back to the live Nous OAuth token) via
-resilient_client(), re-creating the client each item so a long run survives the
-hourly token expiry.
-
-  1. REGEN: re-run draft_one on the pool items backing the existing drafts,
-     replacing their brief/angles with output from the current (post
-     taste-filter-removal) prompts.
-  2. FRESH: draft N new candidates from pool rows still status='new' with
-     funny_score >= min_score.
-
-Runs as a durable systemd --user unit.
+Despite this script's historical name, it does not regenerate existing drafts:
+replacing user-reviewed or edited content is not supported. The fresh phase uses
+resilient_client() and selects pool rows with status='new' and sufficient score.
 """
 
 from __future__ import annotations
@@ -57,42 +48,29 @@ def main() -> int:
     args = ap.parse_args()
 
     import humorhist.db as db
-    from humorhist.drafting import draft_candidates, draft_one
-    from humorhist.llm import LLMUnavailable, resilient_client
+    from humorhist.job_control import lock_path_for_db, try_acquire
 
     conn = db.connect(args.db)
-    db.migrate(conn)
+    try:
+        db.migrate(conn)
+        lock = try_acquire(lock_path_for_db(conn))
+        if lock is None:
+            log("BUSY: another drafting job holds the lock")
+            return 1
+        with lock:
+            return _run(conn, args)
+    finally:
+        conn.close()
 
-    # --- Phase 1: regenerate existing drafts -------------------------------
-    existing = conn.execute(
-        "SELECT DISTINCT pool_id FROM drafts"
-    ).fetchall()
-    pool_ids = [r["pool_id"] for r in existing]
-    log(f"REGEN: {len(pool_ids)} existing draft pool items to regenerate")
 
-    regen_ok, regen_fail = 0, 0
-    for pid in pool_ids:
-        row = db.get_pool_item(conn, pid)
-        if row is None:
-            log(f"  skip {pid}: pool row missing")
-            continue
-        title = row["title"]
-        log(f"  regen {title[:50]!r}")
-        try:
-            client = resilient_client(timeout=300.0)
-        except LLMUnavailable as exc:
-            log(f"    SKIP {title[:40]}: no LLM credential ({exc})")
-            regen_fail += 1
-            continue
-        try:
-            did = draft_one(conn, client, row)
-            regen_ok += 1
-            log(f"    OK {did}")
-        except Exception as exc:  # noqa: BLE001
-            regen_fail += 1
-            log(f"    FAILED: {str(exc)[:200]}")
+def _run(conn, args) -> int:
+    from humorhist.drafting import draft_candidates
+    from humorhist.llm import LLMUnavailable, resilient_client
 
-    log(f"REGEN done: ok={regen_ok} failed={regen_fail}")
+    # Existing drafts may contain editorial work; never replace them here.
+    existing = conn.execute("SELECT COUNT(DISTINCT pool_id) n FROM drafts").fetchone()["n"]
+    log(f"REGEN: skipped {existing} existing draft pool item(s); "
+        "no regeneration occurred (replacement is not supported)")
 
     # --- Phase 2: fresh candidates ----------------------------------------
     log(f"FRESH: drafting {args.fresh_count} new candidates (min_score={args.min_score})")
@@ -100,7 +78,7 @@ def main() -> int:
         client = resilient_client(timeout=300.0)
     except LLMUnavailable as exc:
         log(f"FRESH: no LLM credential -- skipping ({exc})")
-        result = {"drafted": 0, "failed": 0}
+        result = {"drafted": 0, "failed": 1}
     else:
         log("  drafting...")
         result = draft_candidates(
@@ -125,7 +103,7 @@ def main() -> int:
             log(f"NOTIFY: nudged Telegram with {n} pending draft(s)")
         except Exception as exc:  # noqa: BLE001 - nudge must never break the run
             log(f"NOTIFY: skipped ({str(exc)[:120]})")
-    return 0
+    return int(bool(result.get("failed")))
 
 
 if __name__ == "__main__":

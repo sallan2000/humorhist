@@ -168,8 +168,8 @@ def fill_post_copy(
     before writing, though an existing caller transaction cannot be suspended.
 
     Returns the number of queue rows updated. A row changed during generation
-    is skipped even with ``force``; the copy text and timestamp act as a
-    best-effort optimistic version check.
+    is skipped even with ``force``; the queue copy and the draft and pool
+    snapshots act as a best-effort optimistic version check.
     """
     limit = limit if limit is not None else char_limit()
     if client is None:
@@ -202,7 +202,8 @@ def fill_post_copy(
         except Exception as exc:  # noqa: BLE001 - one bad draft must not abort the fill
             print(f"[copywriter] failed for {did}: {exc}")
             continue
-        generated.append((r["queue_id"], r["original_copy"], r["original_copy_at"], copy))
+        generated.append((r["queue_id"], did, r["original_copy"], r["original_copy_at"],
+                          dict(draft), dict(pool) if pool else None, copy))
 
     if not generated:
         return 0
@@ -211,14 +212,29 @@ def fill_post_copy(
     # transaction open. Roll back the whole batch if any individual write fails.
     conn.execute("SAVEPOINT copywriter_fill")
     try:
-        for queue_id, original_copy, original_copy_at, copy in generated:
+        for queue_id, did, original_copy, original_copy_at, draft, pool, copy in generated:
             now = datetime.now(UTC).isoformat()
-            sql = """UPDATE queue SET post_copy = ?, post_copy_at = ?
-                     WHERE id = ? AND published = 0
+            # Compare every captured column, including editor notes and future
+            # input fields, in the same statement as the write. IS handles NULL.
+            def matches(alias, snapshot):
+                return " AND ".join(
+                    f'{alias}."{name.replace(chr(34), chr(34) * 2)}" IS ?' for name in snapshot
+                )
+
+            pool_check = (
+                f"EXISTS (SELECT 1 FROM pool p WHERE p.id = d.pool_id AND {matches('p', pool)})"
+                if pool is not None
+                else "NOT EXISTS (SELECT 1 FROM pool p WHERE p.id = d.pool_id)"
+            )
+            sql = f"""UPDATE queue SET post_copy = ?, post_copy_at = ?
+                     WHERE id = ? AND draft_id IS ? AND published = 0
                      AND post_copy IS ? AND post_copy_at IS ?
                      AND EXISTS (SELECT 1 FROM drafts d
-                                 WHERE d.id = queue.draft_id AND d.status = 'approved')"""
-            filled += conn.execute(sql, (copy, now, queue_id, original_copy, original_copy_at)).rowcount
+                                 WHERE d.id = queue.draft_id AND d.status = 'approved'
+                                 AND {matches('d', draft)} AND {pool_check})"""
+            params = (copy, now, queue_id, did, original_copy, original_copy_at,
+                      *draft.values(), *(pool.values() if pool is not None else ()))
+            filled += conn.execute(sql, params).rowcount
         conn.execute("RELEASE SAVEPOINT copywriter_fill")
     except BaseException:
         conn.execute("ROLLBACK TO SAVEPOINT copywriter_fill")
