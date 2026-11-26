@@ -77,7 +77,7 @@ def test_fetch_extract_sends_user_agent():
     route = respx.get(SUMMARY_URL).mock(return_value=httpx.Response(200, json={"extract": EXTRACT}))
     fetch_wikipedia_extract("Emu War")
     ua = route.calls[0].request.headers["User-Agent"]
-    assert ua == "humorhist/0.1 (personal history project; contact: stevie@local)"
+    assert ua == "HumorHistBot/0.1 (https://github.com/sallan2000/humorhist) httpx/0.28"
 
 
 # --- validate_brief ---------------------------------------------------------

@@ -2430,3 +2430,16 @@ def test_skipnotes_button_clears_optional_notes(tmp_path, monkeypatch):
     assert any("No notes saved for Pool X (#d1)" in m["text"] for m in stub.sent)
     row = conn.execute("SELECT editor_notes FROM drafts WHERE id='d1'").fetchone()
     assert row["editor_notes"] is None
+
+
+def test_screen_status_never_requests_llm(tmp_path, monkeypatch):
+    conn = _fresh_db(tmp_path)
+    conn.execute("CREATE TABLE screen_attempts (pool_id TEXT PRIMARY KEY, state TEXT NOT NULL)")
+    conn.execute("INSERT INTO screen_attempts VALUES ('test-id', 'pending')")
+    conn.commit()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("screen status must not construct an LLM")
+    monkeypatch.setattr(tg, 'telegram_screen', forbidden)
+    stub = tg.StubTelegram(updates=_message_batch('/screen status', 1))
+    tg.run_review_bot(conn, stub, '12345', max_iterations=5)
+    assert any('pending=1' in m['text'] for m in stub.sent)

@@ -69,7 +69,7 @@ def main() -> int:
 
     import humorhist.db as db
     from humorhist.drafting import draft_candidates, format_failure_counts
-    from humorhist.harvest.screen import screen_pool
+    from humorhist.harvest.screen import format_screen_failures, screen_pool
     from humorhist.harvest.seed import load_seed
     from humorhist.harvest.wikipedia_lists import harvest_wikipedia_lists
     from humorhist.job_control import lock_path_for_db, try_acquire
@@ -107,8 +107,9 @@ def main() -> int:
                     else:
                         summary = action(conn)
                     log(f"HARVEST {name}: inserted={summary['inserted']}"
-                        f" pages_failed={summary.get('pages_failed', 0)}")
-                    if summary.get("pages_failed"):
+                        f" pages_failed={summary.get('pages_failed', 0)}"
+                        f" pages_unattempted={summary.get('pages_unattempted', 0)}")
+                    if summary.get("pages_failed") or summary.get("pages_unattempted"):
                         failures.append(f"{name}:pages_failed")
                 except Exception as exc:  # noqa: BLE001
                     failed(name, exc)
@@ -120,6 +121,9 @@ def main() -> int:
             log(f"SCREEN: {before} unscored pool items")
             res = screen_pool(conn, _llm(), batch_size=20)
             log(f"SCREEN: scored={res['scored']} batches={res['batches']} failed_batches={res['failed_batches']}")
+            reasons = format_screen_failures(res.get("failures"))
+            log(f"SCREEN: unscored={max(0, before - res['scored'])} skipped={res.get('skipped', 0)}"
+                + (f" reasons={reasons}" if reasons else ""))
             if res["failed_batches"]:
                 failures.append("screen:failed_batches")
             if res["scored"] < before:
@@ -137,8 +141,9 @@ def main() -> int:
                 with lock:
                     result = draft_candidates(conn, _llm(), count=args.draft_count, min_score=args.min_score)
                     fresh = result["drafted"]
-                    log(f"DRAFT: selected={result['selected']} drafted={fresh} failed={result['failed']}")
-                    if result["failed"]:
+                    log(f"DRAFT: selected={result['selected']} drafted={fresh} failed={result['failed']}"
+                        f" unattempted={result.get('unattempted', 0)}")
+                    if result["failed"] or result.get("unattempted"):
                         failures.append("draft:failed")
                         diagnostics = format_failure_counts(result.get("failures"))
                         if diagnostics:

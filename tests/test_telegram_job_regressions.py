@@ -112,3 +112,34 @@ def test_expired_cancel_never_holds_intent_mutex(conn):
             return super().answer_callback_query(*args, **kwargs)
 
     tg.handle_callback(conn, CheckLock(), "123", {"callback_query": {"id": "x", "data": "cancel:d1:missing"}})
+
+
+def test_screen_message_redacts_and_counts_reasons(conn, monkeypatch):
+    conn.execute("INSERT INTO pool (id,title,status) VALUES ('p','p','new')")
+    conn.commit()
+    monkeypatch.setattr(tg, "_get_llm", lambda *a: object())
+    monkeypatch.setattr("humorhist.harvest.screen.screen_pool", lambda *a, **kw: {
+        "scored": 0, "batches": 1, "failed_batches": 1, "skipped": 0,
+        "failures": [{"category": "http_error", "status": 403, "error": "secret"},
+                     {"category": "secret-token", "status": "secret"}],
+    })
+    stub = tg.StubTelegram()
+    tg.telegram_screen(conn, stub, "123").result(5)
+    text = stub.sent[-1]["text"]
+    assert "http_error_http_403=1" in text and "unknown=1" in text
+    assert "secret" not in text
+
+
+def test_limited_screen_shows_blocked_without_marking_incomplete(conn, monkeypatch):
+    from humorhist.llm import StubClient
+
+    conn.executemany("INSERT INTO pool (id,title,status) VALUES (?, ?, 'new')", [(str(n), str(n)) for n in range(2)])
+    conn.execute("CREATE TABLE screen_attempts (pool_id TEXT PRIMARY KEY, state TEXT NOT NULL)")
+    conn.execute("INSERT INTO screen_attempts VALUES ('0', 'failed')")
+    conn.commit()
+    monkeypatch.setattr(tg, "_get_llm", lambda *a: StubClient([[{"n": 1, "score": 5}]]))
+    stub = tg.StubTelegram()
+    tg.telegram_screen(conn, stub, "123", limit=1).result(5)
+    text = stub.sent[-1]["text"]
+    assert "scored=1/1" in text and "blocked=1" in text and "unscored=0" in text
+    assert "incomplete" not in text

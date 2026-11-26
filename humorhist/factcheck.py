@@ -12,15 +12,16 @@ so tests inject ``StubClient`` and never touch the network.
 
 from __future__ import annotations
 
+import time
 import urllib.parse
 from typing import Any
 
 import httpx
 
 from humorhist.llm import LLMClient, LLMError
+from humorhist.wikipedia import USER_AGENT, WikipediaCooldown, request
 
 WIKI_SUMMARY_API = "https://en.wikipedia.org/api/rest_v1/page/summary/"
-USER_AGENT = "humorhist/0.1 (personal history project; contact: stevie@local)"
 
 #: Allowed values for ``dates.precision``.
 PRECISIONS = ("day", "month", "year", "approx", "unknown")
@@ -48,6 +49,10 @@ _MAX_ATTEMPTS = 2
 
 class FactCheckError(RuntimeError):
     """Raised when fetching an extract or producing a valid brief fails."""
+
+    status_code: int | None = None
+    local_cooldown: bool = False
+    source_attempted: bool = False
 
 
 FACTCHECK_SYSTEM_PROMPT = """\
@@ -124,8 +129,26 @@ def fetch_wikipedia_extract(title_or_url: str, client: httpx.Client | None = Non
 
     owns_client = client is None
     http = client or httpx.Client(timeout=30.0)
+    hop = 0
     try:
-        resp = http.get(url, headers=headers, follow_redirects=True)
+        for hop in range(3):
+            resp = request(http, url, headers=headers, follow_redirects=False)
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            location = resp.headers.get("Location")
+            if hop == 2 or not location:
+                raise FactCheckError("Wikipedia redirect limit reached or location missing")
+            next_url = urllib.parse.urljoin(url, location)
+            target = urllib.parse.urlsplit(next_url)
+            if target.scheme != "https" or target.netloc != "en.wikipedia.org":
+                raise FactCheckError("Wikipedia redirect to unsupported origin")
+            time.sleep(0.5)
+            url = next_url
+    except WikipediaCooldown as exc:
+        error = FactCheckError(str(exc))
+        error.local_cooldown = True
+        error.source_attempted = hop > 0
+        raise error from exc
     except httpx.HTTPError as exc:
         raise FactCheckError(f"failed to fetch Wikipedia extract for {title!r}: {exc}") from exc
     finally:
@@ -133,7 +156,9 @@ def fetch_wikipedia_extract(title_or_url: str, client: httpx.Client | None = Non
             http.close()
 
     if resp.status_code != 200:
-        raise FactCheckError(f"Wikipedia returned HTTP {resp.status_code} for {title!r}")
+        error = FactCheckError(f"Wikipedia returned HTTP {resp.status_code} for {title!r}")
+        error.status_code = resp.status_code
+        raise error
 
     try:
         body = resp.json()

@@ -292,3 +292,15 @@ def test_buffer_early_failure_attempts_one_redacted_alert(jobs, monkeypatch, pha
     assert job.main() == 1
     assert len(messages) == 1 and f"{phase}:RuntimeError" in messages[0]
     assert "secret-token-and-url" not in "\n".join(lines + messages)
+
+
+def test_weekly_screen_reasons_are_sanitized(jobs, monkeypatch):
+    weekly, _, lines = jobs
+    monkeypatch.setattr(screen, "screen_pool", lambda *a, **kw: {
+        "scored": 0, "batches": 1, "failed_batches": 1, "skipped": 9,
+        "failures": [{"category": "http_error", "status": 429, "error": "secret-token"}],
+    })
+    assert weekly.main() == 1
+    text = "\n".join(lines)
+    assert "http_error_http_429=1" in text and "skipped=9" in text
+    assert "secret-token" not in text

@@ -135,7 +135,7 @@ def test_fetch_page_wikitext_sets_user_agent(respx_mock):
     fetch_page_wikitext("Foo")
     assert route.called
     request = route.calls.last.request
-    assert request.headers["User-Agent"].startswith("humorhist/")
+    assert request.headers["User-Agent"] == "HumorHistBot/0.1 (https://github.com/sallan2000/humorhist) httpx/0.28"
 
 
 # --------------------------------------------------------------------------- #
