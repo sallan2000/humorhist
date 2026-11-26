@@ -329,7 +329,7 @@ def queued_drafts(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def format_publish_export(conn: sqlite3.Connection, rows: list[dict]) -> str:
+def format_publish_export(conn: sqlite3.Connection, rows: list[dict], *, include_image_path: bool = True) -> str:
     """Render the read-only 'publish' export for queued, copy-bearing drafts.
 
     Pure formatting — sends nothing, writes nothing. Each row shows the post
@@ -337,7 +337,8 @@ def format_publish_export(conn: sqlite3.Connection, rows: list[dict]) -> str:
     a readiness checklist (``copy OK | joke OK | image ...``) so the editor can
     see at a glance which queued posts are paste-ready. Shared by the CLI
     (``cmd_publish``) and the Telegram ``/publish`` command so the two can't
-    drift; callers filter to copy-bearing rows first.
+    drift; callers filter to copy-bearing rows first. When image paths are
+    hidden, report only that a path is recorded, not that the file is usable.
     """
     joke_by_draft: dict[str, str | None] = {}
     for r in rows:
@@ -352,14 +353,17 @@ def format_publish_export(conn: sqlite3.Connection, rows: list[dict]) -> str:
         if link:
             parts.append(f"learn more: {link}")
         img = r.get("image_path")
-        if img:
+        if img and include_image_path:
             parts.append(f"image: {img}")
         has_joke = bool(joke_by_draft.get(r["draft_id"]))
         has_img = bool(img)
+        image_status = "image none (optional)"
+        if has_img:
+            image_status = "image OK" if include_image_path else "image path recorded (availability not checked)"
         flags = [
             "copy OK",
             "joke OK" if has_joke else "joke MISSING",
-            "image OK" if has_img else "image none (optional)",
+            image_status,
         ]
         parts.append("  readiness: " + " | ".join(flags))
         parts.append("")
