@@ -30,6 +30,15 @@ class LLMError(RuntimeError):
     """Raised when the LLM call fails or returns unusable output."""
 
 
+class LLMCallError(LLMError):
+    """Structured provider failure; message never contains provider data."""
+
+    def __init__(self, category: str, status: int | None = None):
+        self.category = category
+        self.status = status
+        super().__init__(f"LLM failure: {category}" + (f" (HTTP {status})" if status else ""))
+
+
 class LLMUnavailable(RuntimeError):
     """Raised when no usable LLM credential is available at call time.
 
@@ -117,6 +126,7 @@ class NousClient:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_off: bool = False,
+        _single_attempt: bool = False,
     ) -> Any:
         if not self.api_key:
             raise LLMError("no API key: set HUMORHIST_LLM_API_KEY or pass api_key explicitly")
@@ -144,7 +154,8 @@ class NousClient:
         }
 
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        retries = 0 if _single_attempt else self.max_retries
+        for attempt in range(retries + 1):
             try:
                 with httpx.Client(timeout=self.timeout) as client:
                     resp = client.post(
@@ -160,10 +171,20 @@ class NousClient:
                 return extract_json(content)
             except Exception as exc:  # noqa: BLE001 - retry on any transient failure
                 last_error = exc
-                if attempt < self.max_retries:
+                if attempt < retries:
                     time.sleep(2**attempt)
 
-        raise LLMError(f"LLM call failed after {self.max_retries + 1} attempts: {last_error}")
+        if isinstance(last_error, httpx.HTTPStatusError):
+            raise LLMCallError("http_error", last_error.response.status_code) from None
+        if isinstance(last_error, httpx.TimeoutException):
+            raise LLMCallError("timeout") from None
+        if isinstance(last_error, httpx.RequestError):
+            raise LLMCallError("network_error") from None
+        raise LLMCallError("invalid_response") from None
+
+    def complete_json_once(self, system: str, user: str, **kwargs: Any) -> Any:
+        """Make exactly one request, including on ambiguous failures."""
+        return self.complete_json(system, user, _single_attempt=True, **kwargs)
 
 
 class StubClient:
@@ -205,6 +226,9 @@ class StubClient:
         if isinstance(nxt, str):
             return extract_json(nxt)
         return nxt
+
+    def complete_json_once(self, system: str, user: str, **kwargs: Any) -> Any:
+        return self.complete_json(system, user, **kwargs)
 
 
 def default_client() -> LLMClient:

@@ -17,10 +17,12 @@ from __future__ import annotations
 import logging
 import re
 import time
+import urllib.parse
 
 import httpx
 
 import humorhist.db as db
+from humorhist.wikipedia import USER_AGENT, WikipediaCooldown, parse_retry_after, request
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +37,6 @@ DEFAULT_PAGES: list[str] = [
 
 API_URL = "https://en.wikipedia.org/w/api.php"
 
-# Wikimedia rate-limits default/absent User-Agents aggressively; always set one.
-USER_AGENT = "humorhist/0.1 (personal history project; contact: stevie@local)"
 
 # Namespaces whose links we drop entirely (they are not candidate titles).
 _LINK_NAMESPACES = {"file", "image", "category", "media", "filepath", "commons"}
@@ -62,9 +62,13 @@ def _extract_redirect_target(wikitext: str) -> str | None:
 class HarvestError(Exception):
     """Raised when a Wikipedia API fetch fails or a page is missing/malformed."""
 
-    def __init__(self, message: str, *, status_code: int | None = None):
+    local_cooldown: bool = False
+    source_attempted: bool = False
+
+    def __init__(self, message: str, *, status_code: int | None = None, retry_after: float | None = None):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +76,9 @@ class HarvestError(Exception):
 # --------------------------------------------------------------------------- #
 
 
-def fetch_page_wikitext(title: str, client: httpx.Client | None = None) -> str:
+def fetch_page_wikitext(
+    title: str, client: httpx.Client | None = None, *, sleep_seconds: float = DEFAULT_SLEEP_SECONDS
+) -> str:
     """Return the wikitext for a Wikipedia page via the MediaWiki parse API.
 
     Calls ``https://en.wikipedia.org/w/api.php`` with
@@ -111,7 +117,13 @@ def fetch_page_wikitext(title: str, client: httpx.Client | None = None) -> str:
                 raise HarvestError(
                     f"too many redirects following Wikipedia page {title!r} (possible redirect loop at {target!r})"
                 )
-            wikitext = _fetch_raw(target, client, params, headers)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+            try:
+                wikitext = _fetch_raw(target, client, params, headers)
+            except HarvestError as exc:
+                exc.source_attempted = True
+                raise
         return wikitext
     finally:
         if own_client:
@@ -127,9 +139,28 @@ def _fetch_raw(
     """Perform one parse API call and return the wikitext string (or raise)."""
     req_params = dict(params)
     req_params["page"] = title
-    resp = client.get(API_URL, params=req_params, headers=headers)
+    url = API_URL
+    try:
+        for hop in range(3):
+            resp = request(client, url, params=req_params if hop == 0 else None,
+                           headers=headers, follow_redirects=False)
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            location = resp.headers.get("Location")
+            if hop == 2 or not location:
+                raise HarvestError("Wikipedia redirect limit reached or location missing")
+            url = urllib.parse.urljoin(str(resp.request.url), location)
+            target = urllib.parse.urlsplit(url)
+            if target.scheme != "https" or target.netloc != "en.wikipedia.org":
+                raise HarvestError("Wikipedia redirect to unsupported origin")
+    except WikipediaCooldown as exc:
+        error = HarvestError(str(exc))
+        error.local_cooldown = True
+        error.source_attempted = hop > 0
+        raise error from exc
     if resp.status_code != 200:
-        raise HarvestError(f"Wikipedia returned HTTP {resp.status_code}", status_code=resp.status_code)
+        raise HarvestError(f"Wikipedia returned HTTP {resp.status_code}", status_code=resp.status_code,
+                           retry_after=parse_retry_after(resp.headers.get("Retry-After")))
     try:
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - surface as HarvestError
@@ -424,6 +455,7 @@ def harvest_wikipedia_lists(
         "skipped_duplicate": 0,
         "skipped_invalid": 0,
         "pages_failed": 0,
+        "pages_unattempted": 0,
         "http_403": 0,
         "http_429": 0,
         "http_other": 0,
@@ -436,9 +468,17 @@ def harvest_wikipedia_lists(
         client = httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=30.0)
     try:
         for idx, page in enumerate(pages):
+            if idx and sleep_seconds > 0:
+                time.sleep(sleep_seconds)
             try:
-                wikitext = fetch_page_wikitext(page, client=client)
+                wikitext = fetch_page_wikitext(page, client=client, sleep_seconds=sleep_seconds)
             except HarvestError as exc:
+                if getattr(exc, "local_cooldown", False):
+                    attempted = int(exc.source_attempted)
+                    summary["pages_failed"] += attempted
+                    summary["other_failed"] += attempted
+                    summary["pages_unattempted"] = len(pages) - idx - attempted
+                    break
                 if exc.status_code in (403, 429):
                     key = f"http_{exc.status_code}"
                 elif exc.status_code is not None:
@@ -448,6 +488,9 @@ def harvest_wikipedia_lists(
                 summary[key] += 1
                 logger.warning("Wikipedia page fetch failed: %s", key)
                 summary["pages_failed"] += 1
+                if exc.status_code in (403, 429):
+                    summary["pages_unattempted"] = len(pages) - idx - 1
+                    break
                 continue
             except httpx.RequestError:
                 logger.warning("Wikipedia page fetch failed: network error")
@@ -483,9 +526,6 @@ def harvest_wikipedia_lists(
                 else:
                     summary["skipped_duplicate"] += 1
 
-            # Be polite: pause between fetches (skippable for tests).
-            if sleep_seconds and idx < len(pages) - 1:
-                time.sleep(sleep_seconds)
     finally:
         if own_client:
             client.close()

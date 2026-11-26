@@ -1385,6 +1385,7 @@ HELP_TEXT = (
     "DISCOVERY & DRAFTING\n"
     "/harvest - top up the candidate pool from seed + Wikipedia lists\n"
     "/screen [limit] - LLM-score unscored pool candidates (funny_score)\n"
+    "/screen status - inspect blocked screening attempts (no LLM request)\n"
     "/draft [count] [min_score] - fact-check + generate angles for top candidates\n"
     "/suggest <topic> - add an editor-suggested event to the pool\n\n"
     "REVIEW\n"
@@ -1870,12 +1871,17 @@ def telegram_harvest(conn, client, chat_id, *, seed: bool = True, wikipedia: boo
             try:
                 result = harvest_wikipedia_lists(worker)
                 failed = result['pages_failed']
-                failures += bool(failed)
+                failures += bool(failed or result.get("pages_unattempted"))
                 lines.append(
                     f"Wikipedia: {result['inserted']} added, {result['skipped_duplicate']} already in pool, "
                     f"{result['skipped_invalid']} invalid; {result['pages_fetched']} pages read, "
                     f"{failed} pages failed."
                 )
+                if result.get("pages_unattempted", 0):
+                    lines.append(
+                        f"Wikipedia: {result['pages_unattempted']} pages not attempted "
+                        "after access denial or rate limiting."
+                    )
                 reasons = []
                 for key, label in (
                     ("http_403", "access denied (HTTP 403)"),
@@ -1919,7 +1925,7 @@ def telegram_screen(conn, client, chat_id, *, batch_size: int = 20, limit: int |
         return None
 
     def work(worker):
-        from humorhist.harvest.screen import screen_pool
+        from humorhist.harvest.screen import format_screen_failures, screen_pool
 
         selected = worker.execute(
             "SELECT COUNT(*) FROM (SELECT 1 FROM pool WHERE funny_score IS NULL LIMIT ?)",
@@ -1928,11 +1934,15 @@ def telegram_screen(conn, client, chat_id, *, batch_size: int = 20, limit: int |
         result = screen_pool(worker, llm, batch_size=batch_size, limit=limit)
         # Results may contain provider errors; report only safe counters.
         scored = result["scored"]
-        incomplete = max(0, selected - scored)
+        selected = result.get("selected", selected)
+        incomplete = result.get("unscored", max(0, selected - scored))
         status = "⚠️ Screening incomplete" if incomplete or result["failed_batches"] else "🔍 Screened"
+        reasons = format_screen_failures(result.get("failures"))
         client.send_message(
             chat_id, f"{status}: scored={scored}/{selected}, batches={result['batches']}, "
-            f"failed_batches={result['failed_batches']}, unscored={incomplete}."
+            f"failed_batches={result['failed_batches']}, unscored={incomplete}, "
+            f"skipped={result.get('skipped', 0)}, blocked={result.get('blocked', 0)}."
+            + (f" Reasons: {reasons}." if reasons else "")
         )
 
     return _telegram_job(
@@ -2021,11 +2031,12 @@ def telegram_buffer(conn, client, chat_id, *, enqueue: bool = False, auto_draft:
             result = draft_candidates(worker, llm, count=buf.AUTO_DRAFT_COUNT)
         if result.get("drafted"):
             _record_announced(worker, result)
-        if result.get("failed"):
+        if result.get("failed") or result.get("unattempted"):
             outcome = "partially completed" if result.get("drafted") else "failed"
             client.send_message(
                 chat_id, f"⚠️ Buffer top-up {outcome}: drafted={result.get('drafted', 0)}, "
-                f"failed={result['failed']}. Check application state before retrying."
+                f"failed={result.get('failed', 0)}, selected={result.get('selected', 0)}, "
+                f"unattempted={result.get('unattempted', 0)}. Check application state before retrying."
             )
         elif result.get("drafted"):
             client.send_message(chat_id, f"✍️ Auto-drafted {result['drafted']} candidate(s). Send /reviewdraft.")
@@ -2115,9 +2126,11 @@ def telegram_draft(conn, client, chat_id, *, count: int = 3, min_score: float = 
 
         details = describe_failure_counts(result.get("failures"))
         failure_note = f" Failures: {details}." if details else ""
+        if result.get("unattempted", 0):
+            failure_note += f" Not attempted after Wikipedia access denial or rate limiting: {result['unattempted']}."
         client.send_message(
             chat_id,
-            f"✍️ Drafted {drafted} new draft(s). {pending} pending total — "
+            f"✍️ Drafted {drafted} new draft(s). Selected: {result.get('selected', 0)}. {pending} pending total — "
             f"send /reviewdraft to review them. Failed: {failed}.{failure_note}",
         )
         _record_announced(worker, result)
@@ -2515,8 +2528,20 @@ def run_review_bot(
         elif cmd == "/screen":
             # optional /screen [limit]
             rest = text.split(maxsplit=1)
-            limit = int(rest[1]) if len(rest) > 1 and rest[1].strip().isdigit() else None
-            telegram_screen(conn, client, chat_id, limit=limit)
+            if len(rest) > 1 and rest[1].strip().lower() == "status":
+                from humorhist.harvest.screen import screen_attempt_status
+                attempts = screen_attempt_status(conn)
+                pending = sum(r["state"] == "pending" for r in attempts)
+                failed = sum(r["state"] == "failed" for r in attempts)
+                client.send_message(
+                    chat_id, f"Screening reservations: pending={pending}, failed={failed}, total={len(attempts)}. "
+                    "Use CLI screen-status for IDs and README recovery instructions; retries may incur charges."
+                )
+            elif len(rest) == 1 or rest[1].strip().isdigit():
+                limit = int(rest[1]) if len(rest) > 1 else None
+                telegram_screen(conn, client, chat_id, limit=limit)
+            else:
+                client.send_message(chat_id, "Usage: /screen [limit] or /screen status")
         elif cmd == "/draft":
             # optional /draft [count] [min_score]
             bits = text.split()[1:]

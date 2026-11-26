@@ -113,6 +113,8 @@ def run_buffer_check(
     result: dict = dict(health)
 
     drafted = 0
+    selected = 0
+    unattempted = 0
     draft_error = None
     draft_started = False
     if auto_draft and health["auto_draft"] and client is not None:
@@ -130,11 +132,15 @@ def run_buffer_check(
                         draft_started = True
                         res = draft_candidates(conn, client, count=AUTO_DRAFT_COUNT)
                         drafted = res["drafted"]
-                        if res.get("failed"):
-                            draft_error = f"{res['failed']} candidate(s) failed"
-        except Exception as exc:  # noqa: BLE001 - monitor must never crash the cron
-            draft_error = str(exc)
+                        selected = res.get("selected", 0)
+                        unattempted = res.get("unattempted", 0)
+                        if res.get("failed") or unattempted:
+                            draft_error = f"{res.get('failed', 0)} candidate(s) failed; {unattempted} unattempted"
+        except Exception:  # noqa: BLE001 - monitor must never crash the cron
+            draft_error = "draft failed"
     result["drafted"] = drafted
+    result["selected"] = selected
+    result["unattempted"] = unattempted
     result["draft_error"] = draft_error
     result["draft_started"] = draft_started
 

@@ -42,12 +42,16 @@ def cmd_harvest(args: argparse.Namespace) -> int:
         print("Loading seed events...")
         print("  seed:", load_seed(conn))
 
+    failed = False
     if not args.seed_only:
         print("Harvesting Wikipedia lists (this takes a moment)...")
-        print("  wikipedia:", harvest_wikipedia_lists(conn))
+        result = harvest_wikipedia_lists(conn)
+        print("  wikipedia:", result)
+        failed = bool(result.get("pages_failed") or result.get("pages_unattempted"))
 
     print("\nPool totals:", db.counts(conn))
-    return 0
+    conn.close()
+    return int(failed)
 
 
 def cmd_screen(args: argparse.Namespace) -> int:
@@ -57,13 +61,28 @@ def cmd_screen(args: argparse.Namespace) -> int:
     conn = _open_db(args.db)
     client = default_client()
     print(f"Screening unscored candidates (batch={args.batch_size}, limit={args.limit})...")
-    result = screen_pool(conn, client, batch_size=args.batch_size, limit=args.limit)
+    result = screen_pool(conn, client, batch_size=args.batch_size, limit=args.limit,
+                         retry_failed=args.retry_failed)
     print("Result:", result)
 
     cur = conn.execute("SELECT count(*) AS n, round(avg(funny_score),2) AS avg FROM pool WHERE funny_score IS NOT NULL")
     row = cur.fetchone()
     print(f"Scored so far: {row['n']} (avg {row['avg']})")
-    return 0
+    return int(bool(result.get("unscored") or result.get("failed_batches")))
+
+
+def cmd_screen_status(args: argparse.Namespace) -> int:
+    from humorhist.harvest.screen import screen_attempt_status
+
+    conn = _open_db(args.db)
+    try:
+        rows = screen_attempt_status(conn)
+        for row in rows:
+            print(f"{row['state']}  {row['pool_id']}  score={row['funny_score']}  {row['title']}")
+        print(f"{len(rows)} screening reservations. See README for recovery; retries may incur charges.")
+        return 0
+    finally:
+        conn.close()
 
 
 def cmd_draft(args: argparse.Namespace) -> int:
@@ -82,7 +101,7 @@ def cmd_draft(args: argparse.Namespace) -> int:
             print(f"Drafting {args.count} candidates (min score {args.min_score})...")
             result = draft_candidates(conn, client, count=args.count, min_score=args.min_score)
             print("Result:", result)
-            return int(bool(result.get("failed")))
+            return int(bool(result.get("failed") or result.get("unattempted")))
     finally:
         conn.close()
 
@@ -762,7 +781,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("screen", help="LLM-score unscored candidates")
     s.add_argument("--batch-size", type=int, default=20)
     s.add_argument("--limit", type=int, default=None)
+    s.add_argument("--retry-failed", action="store_true",
+                   help="explicitly retry previously failed screening attempts (may incur charges)")
     s.set_defaults(func=cmd_screen)
+
+    ss = sub.add_parser("screen-status", help="inspect blocked screening attempts without making requests")
+    ss.set_defaults(func=cmd_screen_status)
 
     d = sub.add_parser("draft", help="fact-check + generate angles")
     d.add_argument("--count", type=int, default=3)

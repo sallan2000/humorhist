@@ -18,7 +18,7 @@ def test_http_status_checked_before_json(respx_mock):
 
 
 def test_harvest_classifies_http_and_network_without_leaking(respx_mock, tmp_path, caplog):
-    responses = [httpx.Response(403, text="secret-body"), httpx.ConnectError("secret-url")]
+    responses = [httpx.Response(500, text="secret-body"), httpx.ConnectError("secret-url")]
     respx_mock.get(API_URL).mock(side_effect=responses)
     conn = db.connect(str(tmp_path / "db.sqlite"))
     db.migrate(conn)
@@ -27,7 +27,7 @@ def test_harvest_classifies_http_and_network_without_leaking(respx_mock, tmp_pat
     finally:
         conn.close()
     assert result["pages_failed"] == 2
-    assert result["http_403"] == 1 and result["network_failed"] == 1
+    assert result["http_other"] == 1 and result["network_failed"] == 1
     assert "secret" not in caplog.text
 
 

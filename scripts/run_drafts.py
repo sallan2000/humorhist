@@ -66,7 +66,10 @@ def _run(conn, args) -> int:
         return 0
 
     drafted, failed = 0, 0
+    unattempted = 0
     for i, row in enumerate(rows, 1):
+        if i > 1:
+            time.sleep(0.5)
         title = row["title"]
         log(f"({i}/{len(rows)}) drafting: {title[:60]}")
         try:
@@ -83,8 +86,11 @@ def _run(conn, args) -> int:
         except Exception as exc:  # noqa: BLE001
             failed += 1
             log(f"    FAILED after {time.time()-started:.0f}s: {str(exc)[:200]}")
+            if getattr(exc, "stop_source", False):
+                unattempted = len(rows) - i
+                break
 
-    log(f"DONE drafted={drafted} failed={failed}")
+    log(f"DONE drafted={drafted} failed={failed} unattempted={unattempted}")
     return int(bool(failed))
 
 

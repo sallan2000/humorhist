@@ -138,7 +138,7 @@ def test_nous_client_retries_then_succeeds():
 def test_nous_client_raises_after_exhausting_retries():
     respx.post(f"{DEFAULT_BASE_URL}/chat/completions").mock(return_value=httpx.Response(500))
     client = NousClient(api_key="k", max_retries=1)
-    with pytest.raises(LLMError, match="failed after 2 attempts"):
+    with pytest.raises(LLMError, match="http_error"):
         client.complete_json("s", "u")
 
 

@@ -69,8 +69,12 @@ def main() -> int:
             break
         log(f"loop | scored_so_far={scored_total}")
         result = screen_pool(
-            conn, client, batch_size=args.batch_size, limit=args.limit
+            conn, client, batch_size=args.batch_size, limit=None if args.limit is None else args.limit - scored_total
         )
+        if result["failed_batches"]:
+            failed_total += result["failed_batches"]
+            scored_total += result["scored"]
+            break  # do not continue after a systemic provider failure
         if result["scored"] == 0:
             break  # nothing left to score
         scored_total += result["scored"]
@@ -84,7 +88,14 @@ def main() -> int:
         "SELECT round(avg(funny_score),2) AS a FROM pool WHERE funny_score IS NOT NULL"
     ).fetchone()["a"]
     log(f"DONE scored_total={scored_total} failed={failed_total} | unscored_left={left} | avg={avg}")
-    return 0
+    has_attempts = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='screen_attempts'"
+    ).fetchone()
+    blocked = conn.execute(
+        "SELECT COUNT(*) FROM screen_attempts a JOIN pool p ON p.id=a.pool_id WHERE p.funny_score IS NULL"
+    ).fetchone()[0] if has_attempts else 0
+    log(f"blocked={blocked}")
+    return int(bool(failed_total or blocked or (left and (args.limit is None or scored_total < args.limit))))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
+import time
 from collections import Counter
 from datetime import UTC, datetime
 
@@ -37,9 +38,11 @@ CATEGORIES = frozenset({"unavailable", "provider", "source", "factcheck", "valid
 class DraftStageError(Exception):
     """A deliberately redacted failure at a known drafting stage."""
 
-    def __init__(self, stage: str, category: str):
+    def __init__(self, stage: str, category: str, *, stop_source: bool = False, unattempted: bool = False):
         self.stage = stage
         self.category = category
+        self.stop_source = stop_source
+        self.unattempted = unattempted
         super().__init__(f"{stage}:{category}")
 
 
@@ -65,7 +68,11 @@ def _stage(stage, fn, *args, **kwargs):
     except Exception as exc:
         # Exception messages, chained tracebacks and dynamic class names can
         # contain provider URLs or credentials; expose only fixed vocabulary.
-        raise DraftStageError(stage, _category(stage, exc)) from None
+        raise DraftStageError(stage, _category(stage, exc), stop_source=(
+            stage == "extract" and isinstance(exc, FactCheckError)
+            and (getattr(exc, "status_code", None) in (403, 429) or getattr(exc, "local_cooldown", False))
+        ), unattempted=(stage == "extract" and getattr(exc, "local_cooldown", False)
+                        and not getattr(exc, "source_attempted", False))) from None
 
 
 def format_failure_counts(failures) -> str:
@@ -210,18 +217,31 @@ def draft_candidates(
     drafted: list[str] = []
     failures: list[dict] = []
 
-    for row in rows:
+    stop_source = False
+    unattempted = 0
+    for index, row in enumerate(rows):
+        if stop_source:
+            unattempted += 1
+            continue
+        if index:
+            time.sleep(0.5)
         try:
             drafted.append(draft_one(conn, client, row, http_client=http_client))
         except Exception as exc:  # noqa: BLE001 - one bad candidate must not abort the run
+            if isinstance(exc, DraftStageError) and exc.unattempted:
+                unattempted += 1
+                stop_source = True
+                continue
             stage = exc.stage if isinstance(exc, DraftStageError) and exc.stage in STAGES else "unknown"
             category = exc.category if isinstance(exc, DraftStageError) and exc.category in CATEGORIES else "unexpected"
             failures.append({"pool_id": row["id"], "stage": stage, "category": category})
+            stop_source = isinstance(exc, DraftStageError) and exc.stop_source
 
     return {
         "selected": len(rows),
         "drafted": len(drafted),
         "failed": len(failures),
+        **({"unattempted": unattempted} if unattempted else {}),
         "draft_ids": drafted,
         "failures": failures,
     }
