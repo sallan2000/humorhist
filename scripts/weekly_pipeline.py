@@ -68,7 +68,7 @@ def main() -> int:
     args = ap.parse_args()
 
     import humorhist.db as db
-    from humorhist.drafting import draft_candidates
+    from humorhist.drafting import draft_candidates, format_failure_counts
     from humorhist.harvest.screen import screen_pool
     from humorhist.harvest.seed import load_seed
     from humorhist.harvest.wikipedia_lists import harvest_wikipedia_lists
@@ -80,13 +80,14 @@ def main() -> int:
         conn = db.connect(args.db)
         db.migrate(conn)
     except Exception as exc:  # noqa: BLE001
-        log(f"SETUP FAILED: {type(exc).__name__}")
+        name = type(exc).__name__ if type(exc) in (RuntimeError, ValueError, OSError) else "Error"
+        log(f"SETUP FAILED: {name}")
         if conn is not None:
             conn.close()
         return 1
 
     def failed(phase, exc):
-        name = type(exc).__name__
+        name = type(exc).__name__ if type(exc) in (RuntimeError, ValueError, OSError) else "Error"
         failures.append(f"{phase}:{name}")
         log(f"{phase} FAILED: {name}")
 
@@ -139,6 +140,9 @@ def main() -> int:
                     log(f"DRAFT: selected={result['selected']} drafted={fresh} failed={result['failed']}")
                     if result["failed"]:
                         failures.append("draft:failed")
+                        diagnostics = format_failure_counts(result.get("failures"))
+                        if diagnostics:
+                            log(f"DRAFT failures: {diagnostics}")
         except Exception as exc:  # noqa: BLE001
             failed("draft", exc)
 

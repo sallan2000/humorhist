@@ -229,3 +229,38 @@ def test_draft_candidates_returns_summary_shape(conn, monkeypatch):
     assert set(result) == {"selected", "drafted", "failed", "draft_ids", "failures"}
     assert result["drafted"] == 1
     assert len(result["draft_ids"]) == 1
+
+
+@pytest.mark.parametrize("target,stage,exception,category", [
+    ("_row_to_item", "prepare", RuntimeError, "unexpected"),
+    ("fetch_wikipedia_extract", "extract", FactCheckError, "source"),
+    ("factcheck", "factcheck", FactCheckError, "factcheck"),
+    ("factcheck", "factcheck", drafting.LLMError, "provider"),
+    ("generate_angles", "angles", drafting.AnglesError, "validation"),
+    ("_persist_draft", "persist", drafting.sqlite3.OperationalError, "database"),
+])
+def test_failure_stage_is_structured_and_redacted(conn, monkeypatch, target, stage, exception, category):
+    _add(conn, "one", score=9)
+    _stub_extract(monkeypatch)
+    monkeypatch.setattr(drafting, "factcheck", lambda *a: _brief())
+    monkeypatch.setattr(drafting, "generate_angles", lambda *a: _angles())
+    calls = []
+    def fail(*args, **kwargs):
+        calls.append(1)
+        raise exception("https://secret.example/token=private")
+    monkeypatch.setattr(drafting, target, fail)
+    result = drafting.draft_candidates(conn, StubClient([]), count=1)
+    assert result["failures"] == [{"pool_id": "one", "stage": stage, "category": category}]
+    assert result["failed"] == 1 and result["drafted"] == 0
+    assert calls == [1]
+    row = db.get_pool_item(conn, "one")
+    assert row is not None and row["status"] == "new"
+    assert "secret" not in repr(result)
+
+
+def test_failure_aggregation_accepts_only_fixed_vocabulary():
+    failures = [{"stage": "extract", "category": "validation"}] * 2 + [
+        {"stage": "https://secret", "category": "secret"}, {"error": "secret"}, None]
+    assert drafting.format_failure_counts(failures) == (
+        "extract:validation=2, unknown:unexpected=2")
+    assert drafting.format_failure_counts(None) == ""
