@@ -19,7 +19,7 @@ def conn(tmp_path):
 def test_screen_reports_batch_and_incomplete_counts(conn, monkeypatch, failed, scored):
     conn.executemany("INSERT INTO pool (id,title,status) VALUES (?, ?, 'new')", [(str(n), str(n)) for n in range(3)])
     conn.commit()
-    monkeypatch.setattr(tg, "_get_llm", lambda *a: object())
+    monkeypatch.setattr("humorhist.llm.screening_client", lambda: object())
     monkeypatch.setattr("humorhist.harvest.screen.screen_pool", lambda *a, **kw: {
         "scored": scored, "batches": 2, "failed_batches": failed,
     })
@@ -61,7 +61,7 @@ def test_failed_ack_never_starts_work_and_releases_admission(conn, monkeypatch):
 
 @pytest.mark.parametrize("drafted,failed", [(1, 2), (0, 2)])
 def test_buffer_partial_counts_and_announcements(conn, monkeypatch, drafted, failed):
-    monkeypatch.setattr(tg, "_get_llm", lambda *a: object())
+    monkeypatch.setattr(tg, "_get_llm", lambda *a, **kw: object())
     monkeypatch.setattr("humorhist.drafting.draft_candidates", lambda *a, **kw: {
         "drafted": drafted, "failed": failed, "draft_ids": ["d1"] if drafted else [],
     })
@@ -117,7 +117,7 @@ def test_expired_cancel_never_holds_intent_mutex(conn):
 def test_screen_message_redacts_and_counts_reasons(conn, monkeypatch):
     conn.execute("INSERT INTO pool (id,title,status) VALUES ('p','p','new')")
     conn.commit()
-    monkeypatch.setattr(tg, "_get_llm", lambda *a: object())
+    monkeypatch.setattr("humorhist.llm.screening_client", lambda: object())
     monkeypatch.setattr("humorhist.harvest.screen.screen_pool", lambda *a, **kw: {
         "scored": 0, "batches": 1, "failed_batches": 1, "skipped": 0,
         "failures": [{"category": "http_error", "status": 403, "error": "secret"},
@@ -137,7 +137,7 @@ def test_limited_screen_shows_blocked_without_marking_incomplete(conn, monkeypat
     conn.execute("CREATE TABLE screen_attempts (pool_id TEXT PRIMARY KEY, state TEXT NOT NULL)")
     conn.execute("INSERT INTO screen_attempts VALUES ('0', 'failed')")
     conn.commit()
-    monkeypatch.setattr(tg, "_get_llm", lambda *a: StubClient([[{"n": 1, "score": 5}]]))
+    monkeypatch.setattr("humorhist.llm.screening_client", lambda: StubClient([[{"n": 1, "score": 5}]]))
     stub = tg.StubTelegram()
     tg.telegram_screen(conn, stub, "123", limit=1).result(5)
     text = stub.sent[-1]["text"]

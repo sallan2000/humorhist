@@ -16,9 +16,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -118,6 +121,9 @@ class NousClient:
         self.timeout = timeout
         self.max_retries = max_retries
 
+    def _http_client(self) -> httpx.Client:
+        return httpx.Client(timeout=self.timeout)
+
     def complete_json(
         self,
         system: str,
@@ -157,7 +163,7 @@ class NousClient:
         retries = 0 if _single_attempt else self.max_retries
         for attempt in range(retries + 1):
             try:
-                with httpx.Client(timeout=self.timeout) as client:
+                with self._http_client() as client:
                     resp = client.post(
                         f"{self.base_url}/chat/completions",
                         json=payload,
@@ -199,6 +205,10 @@ class StubClient:
         self.responses = list(responses or [])
         self.calls: list[dict[str, Any]] = []
 
+    def preflight(self) -> str:
+        """Offline test capability: canned responses never use a provider."""
+        return "free"
+
     def complete_json(
         self,
         system: str,
@@ -234,6 +244,146 @@ class StubClient:
 def default_client() -> LLMClient:
     """Return the configured real client."""
     return NousClient()
+
+
+def _screen_base_url(base_url: str) -> None:
+    """Enforce the Nous HTTPS origin; never include the supplied URL in errors."""
+    try:
+        parts = urlsplit(base_url)
+        valid = (
+            parts.scheme == "https"
+            and parts.hostname == "inference-api.nousresearch.com"
+            and parts.port in (None, 443)
+            and parts.username is None
+            and parts.password is None
+            and not parts.query
+            and not parts.fragment
+            and not any(c in base_url for c in "\r\n\t\\")
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise LLMUnavailable("invalid screening provider endpoint") from None
+
+
+def _screen_keyfile(path: str) -> str:
+    """Read a private file via trusted, non-symlink absolute-path ancestors.
+
+    Every directory is owned by root or the effective UID and is not group- or
+    world-writable, including sticky directories. Descriptor-relative traversal
+    avoids replacing an ancestor with a symlink between checking and opening.
+    """
+    try:
+        parts = path.split("/")
+        if not path.startswith("/") or any(part in ("", ".", "..") for part in parts[1:]):
+            raise ValueError("invalid credential file")
+        with ExitStack() as stack:
+            directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            stack.callback(os.close, directory)
+            uid = os.geteuid()
+            for part in parts[1:-1]:
+                info = os.fstat(directory)
+                if info.st_uid not in (0, uid) or info.st_mode & 0o022:
+                    raise ValueError("invalid credential directory")
+                directory = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                stack.callback(os.close, directory)
+            info = os.fstat(directory)
+            if info.st_uid not in (0, uid) or info.st_mode & 0o022:
+                raise ValueError("invalid credential directory")
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            keyfile = stack.enter_context(os.fdopen(fd, "rb"))
+            info = os.fstat(keyfile.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077:
+                raise ValueError("invalid credential file")
+            raw = keyfile.read(16385)
+            if len(raw) > 16384:
+                raise ValueError("invalid credential file")
+            key = raw.decode("utf-8").strip()
+            if not key:
+                raise ValueError("invalid credential file")
+            return key
+    except (OSError, ValueError, UnicodeError):
+        raise LLMUnavailable("invalid or unavailable screening credential file") from None
+
+
+class ScreeningClient(NousClient):
+    """Nous-only client with an exact-model anonymous catalog cost gate.
+
+    The model is immutable after construction. Each pool run refreshes the gate;
+    direct completions also gate themselves. Catalog zero prices do not guarantee
+    account billing or access. There is no paid override.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_model" and hasattr(self, "_model"):
+            raise AttributeError("screening model is immutable")
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in {"model", "_model"}:
+            raise AttributeError("screening model is immutable")
+        super().__delattr__(name)
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @model.setter
+    def model(self, value: str) -> None:
+        if hasattr(self, "_model"):
+            raise AttributeError("screening model is immutable")
+        self._model = value
+
+    def preflight(self) -> str:
+        from humorhist.screen_catalog import CatalogResult, check_screen_model
+
+        try:
+            result = check_screen_model(self.model)
+        except Exception:
+            # Fail closed at the catalog boundary without exposing provider details.
+            return "unavailable"
+        categories = {"invalid_model", "unavailable", "invalid_catalog", "model_missing", "unsafe_pricing"}
+        if (isinstance(result, CatalogResult) and result.allowed is True
+                and result.category == "free" and result.model_id == self.model):
+            return "free"
+        if isinstance(result, CatalogResult) and result.allowed is False and result.category in categories:
+            return result.category
+        return "unavailable"
+
+    def _http_client(self) -> httpx.Client:
+        # Avoid environment proxy configuration and redirects crossing origins.
+        return httpx.Client(timeout=self.timeout, follow_redirects=False, trust_env=False)
+
+    def complete_json(self, system: str, user: str, **kwargs: Any) -> Any:
+        _screen_base_url(self.base_url)
+        category = ScreeningClient.preflight(self)
+        if category != "free":
+            raise LLMCallError("preflight_" + category)
+        kwargs["_single_attempt"] = True
+        return super().complete_json(system, user, **kwargs)
+
+
+def screening_client(timeout: float = 120.0) -> ScreeningClient:
+    """Create a noninteractive, static-credential Nous screening client.
+
+    A nonempty HUMORHIST_LLM_API_KEY takes precedence over
+    HUMORHIST_LLM_API_KEY_FILE. The file must be owner-only, regular, and
+    owned by the effective UID. Its path must be absolute, without symlinks,
+    and all directories must be owned by root or the effective UID and not
+    group- or world-writable (including sticky directories such as /tmp).
+    OAuth is never consulted. Only HTTPS Nous on port 443 is allowed.
+    HUMORHIST_SCREEN_MODEL falls back to the existing drafting model setting.
+    """
+    base_url = os.environ.get("HUMORHIST_LLM_BASE_URL") or DEFAULT_BASE_URL
+    _screen_base_url(base_url)
+    key = os.environ.get("HUMORHIST_LLM_API_KEY")
+    if not key:
+        path = os.environ.get("HUMORHIST_LLM_API_KEY_FILE")
+        if not path:
+            raise LLMUnavailable("no static screening credential available")
+        key = _screen_keyfile(path)
+    model = os.environ.get("HUMORHIST_SCREEN_MODEL") or os.environ.get("HUMORHIST_LLM_MODEL") or DEFAULT_MODEL
+    return ScreeningClient(api_key=key, base_url=base_url, model=model, timeout=timeout, max_retries=0)
 
 
 def nous_auth_token() -> str | None:

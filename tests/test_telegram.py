@@ -2443,3 +2443,122 @@ def test_screen_status_never_requests_llm(tmp_path, monkeypatch):
     stub = tg.StubTelegram(updates=_message_batch('/screen status', 1))
     tg.run_review_bot(conn, stub, '12345', max_iterations=5)
     assert any('pending=1' in m['text'] for m in stub.sent)
+
+
+def test_screen_status_redacts_corrupt_diagnostics(tmp_path):
+    conn = _fresh_db(tmp_path)
+    conn.execute("INSERT INTO pool (id,title,status) VALUES ('pool000','secret-title','new')")
+    conn.execute("CREATE TABLE screen_attempts (pool_id TEXT, state TEXT, category TEXT, status INTEGER, "
+                 "started_at TEXT, completed_at TEXT)")
+    conn.execute("INSERT INTO screen_attempts VALUES ('pool000','secret-state','secret-category',NULL,"
+                 "'secret-timestamp',NULL)")
+    conn.commit()
+    stub = tg.StubTelegram(updates=_message_batch('/screen status', 1))
+    tg.run_review_bot(conn, stub, '12345', max_iterations=5)
+    text = stub.sent[-1]['text']
+    assert 'Blocked unscored=1' in text and 'unknown' in text
+    assert 'secret-' not in text and 'pool000' not in text
+
+
+@pytest.mark.parametrize('category,status,label', [
+    ('http_error', 429, 'http_error_http_429'),
+    ('timeout', None, 'timeout'),
+    ('invalid_response', None, 'invalid_response'),
+    ('secret-category', None, 'unknown'),
+])
+def test_screen_completion_logs_before_failed_delivery(tmp_path, monkeypatch, caplog, category, status, label):
+    import logging
+
+    conn = _fresh_db(tmp_path)
+    monkeypatch.setattr('humorhist.llm.screening_client', lambda *args, **kw: object())
+    result = {'scored': 1, 'selected': 2, 'batches': 1, 'failed_batches': 1,
+              'unscored': 1, 'skipped': 0, 'blocked': 1,
+              'failures': [{'category': category, 'status': status, 'error': 'secret-provider'}],
+              'run_id': 'a' * 32, 'batch_id': 'secret-batch',
+              'batch_ids': ['b' * 32, 'secret-batch']}
+    monkeypatch.setattr('humorhist.harvest.screen.screen_pool', lambda *args, **kw: result)
+    monkeypatch.setattr(tg, '_telegram_job', lambda conn, client, chat, kind, progress, work: work(conn))
+
+    class FailedDelivery:
+        calls = 0
+
+        def send_message(self, *args):
+            self.calls += 1
+            assert 'screening complete' in caplog.text
+            raise RuntimeError('secret-token')
+
+    transport = FailedDelivery()
+    with caplog.at_level(logging.INFO, logger='humorhist.telegram'):
+        tg.telegram_screen(conn, transport, '12345', limit=2)
+    assert transport.calls == 1
+    assert label in caplog.text and 'delivery_error' in caplog.text
+    assert 'run_id=' + 'a' * 32 in caplog.text
+    assert 'batch_id=' + 'b' * 32 in caplog.text
+    assert 'secret-' not in caplog.text
+
+
+def test_screen_log_correlates_real_multiple_durable_batches(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from humorhist.llm import LLMCallError, StubClient
+
+    conn = _fresh_db(tmp_path)
+    conn.executemany("INSERT INTO pool (id,title,status) VALUES (?,?,'new')", [('a', 'a'), ('b', 'b')])
+    conn.commit()
+    llm = StubClient([[{'n': 1, 'score': 5}], LLMCallError('secret-provider')])
+    monkeypatch.setattr('humorhist.llm.screening_client', lambda: llm)
+    monkeypatch.setattr(tg, '_telegram_job', lambda conn, client, chat, kind, progress, work: work(conn))
+
+    class Delivery:
+        def send_message(self, *args):
+            pass
+
+    with caplog.at_level(logging.INFO, logger='humorhist.telegram'):
+        tg.telegram_screen(conn, Delivery(), '12345', batch_size=1)
+    rows = conn.execute("SELECT run_id,batch_id FROM screen_batches WHERE state='pending' ORDER BY rowid").fetchall()
+    assert len(rows) == 2
+    assert all('run_id=' + row['run_id'] in caplog.text and 'batch_id=' + row['batch_id'] in caplog.text for row in rows)
+    assert 'secret-provider' not in caplog.text
+
+
+@pytest.mark.parametrize('limit,selected', [(1, 1), (None, 2)])
+def test_screen_completion_separates_blocked_from_selected(tmp_path, monkeypatch, limit, selected):
+    conn = _fresh_db(tmp_path)
+    conn.execute("INSERT INTO pool (id,title,status) VALUES ('pool000','x','new')")
+    conn.execute("CREATE TABLE screen_attempts (pool_id TEXT, state TEXT)")
+    conn.execute("INSERT INTO screen_attempts VALUES ('pool000','failed')")
+    conn.commit()
+    monkeypatch.setattr('humorhist.llm.screening_client', lambda *args, **kw: object())
+    monkeypatch.setattr('humorhist.harvest.screen.screen_pool', lambda *args, **kw: {
+        'scored': 1, 'selected': selected, 'eligible_selected': 1, 'batches': 1, 'failed_batches': 0,
+        'unscored': 1, 'skipped': 1, 'blocked': 1, 'failures': [],
+    })
+    monkeypatch.setattr(tg, '_telegram_job', lambda conn, client, chat, kind, progress, work: work(conn))
+    stub = tg.StubTelegram()
+    tg.telegram_screen(conn, stub, '12345', limit=limit)
+    assert 'scored=1/1' in stub.sent[-1]['text']
+    assert 'blocked=1' in stub.sent[-1]['text']
+    assert 'unscored=0' in stub.sent[-1]['text']
+
+
+def test_unlimited_screen_concurrent_reservation_uses_selection_result(tmp_path, monkeypatch):
+    import humorhist.harvest.screen as screen
+    from humorhist.llm import StubClient
+
+    conn = _fresh_db(tmp_path)
+    conn.executemany("INSERT INTO pool (id,title,status) VALUES (?,?,'new')", [('a', 'x'), ('b', 'y')])
+    conn.commit()
+    original = screen._select_unscored
+    def concurrent_reservation(worker, limit, retry_failed=False):
+        other = db.connect(str(tmp_path / 'test.sqlite'))
+        other.execute("INSERT INTO screen_attempts (pool_id,state,generation) VALUES ('a','pending','race')")
+        other.commit()
+        other.close()
+        return original(worker, limit, retry_failed)
+    monkeypatch.setattr(screen, '_select_unscored', concurrent_reservation)
+    monkeypatch.setattr('humorhist.llm.screening_client', lambda *args, **kw: StubClient([[{'n': 1, 'score': 5}]]))
+    monkeypatch.setattr(tg, '_telegram_job', lambda conn, client, chat, kind, progress, work: work(conn))
+    stub = tg.StubTelegram()
+    tg.telegram_screen(conn, stub, '12345')
+    text = stub.sent[-1]['text']
+    assert 'scored=1/1' in text and 'blocked=1' in text and 'unscored=0' in text

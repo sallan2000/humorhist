@@ -215,7 +215,7 @@ def test_replay_after_real_background_screen_finishes(conn, monkeypatch):
     import humorhist.harvest.screen as screen
     calls = []
     completed = threading.Event()
-    monkeypatch.setattr(tg, '_get_llm', lambda *a, **k: object())
+    monkeypatch.setattr('humorhist.llm.screening_client', lambda: object())
     def fake_screen(worker, llm, **kwargs):
         calls.append('screen')
         return {'scored': 0, 'batches': 0, 'failed_batches': 0}

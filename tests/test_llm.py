@@ -191,3 +191,271 @@ def test_nous_auth_token_reads_file(monkeypatch, tmp_path):
 def test_nous_auth_token_returns_none_when_missing(monkeypatch, tmp_path):
     monkeypatch.setattr("humorhist.llm.Path.home", lambda: tmp_path)
     assert nous_auth_token() is None
+
+
+@pytest.fixture
+def screen_env(monkeypatch, tmp_path):
+    import os
+    import stat
+
+    for name in ("HUMORHIST_LLM_API_KEY_FILE", "HUMORHIST_LLM_BASE_URL", "HUMORHIST_SCREEN_MODEL", "HUMORHIST_LLM_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("humorhist.llm.nous_auth_token", lambda: pytest.fail("OAuth must not be read"))
+    # Test roots can live below /tmp or another group-writable directory.
+    # Simulate trusted ancestors outside tmp_path only; test-created
+    # descendants retain their real ownership and permissions.
+    ancestors = {(info.st_dev, info.st_ino) for path in tmp_path.parents if (info := path.stat())}
+    original_fstat = os.fstat
+
+    def trusted_test_ancestor(fd):
+        info = original_fstat(fd)
+        if (info.st_dev, info.st_ino) in ancestors:
+            fields = list(info)
+            fields[stat.ST_MODE] = info.st_mode & ~0o022
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr("humorhist.llm.os.fstat", trusted_test_ancestor)
+
+
+def test_screen_requires_static_credential(screen_env):
+    from humorhist.llm import screening_client
+
+    with pytest.raises(LLMUnavailable):
+        screening_client()
+
+
+def test_screen_model_and_draft_defaults(screen_env, monkeypatch):
+    from humorhist.llm import DEFAULT_MODEL, default_client, screening_client
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "test-secret")
+    assert screening_client().model == default_client().model == DEFAULT_MODEL
+    monkeypatch.setenv("HUMORHIST_LLM_MODEL", "draft-model")
+    assert screening_client().model == default_client().model == "draft-model"
+    monkeypatch.setenv("HUMORHIST_SCREEN_MODEL", "screen-model")
+    assert screening_client().model == "screen-model"
+    assert default_client().model == "draft-model"
+
+
+def test_screen_keyfile_and_env_precedence(screen_env, monkeypatch, tmp_path):
+    from humorhist.llm import screening_client
+
+    keyfile = tmp_path / "private-key"
+    keyfile.write_text("file-secret\n")
+    keyfile.chmod(0o600)
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY_FILE", str(keyfile))
+    assert screening_client().api_key == "file-secret"
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "env-secret")
+    keyfile.chmod(0o644)
+    assert screening_client().api_key == "env-secret"
+
+
+@pytest.mark.parametrize(
+    "kind", ["symlink_parent", "group_writable", "world_writable", "sticky_writable", "foreign_owner", "relative"]
+)
+def test_screen_rejects_untrusted_keyfile_ancestors(screen_env, monkeypatch, tmp_path, kind):
+    import os
+    import stat
+    import traceback
+
+    from humorhist.llm import screening_client
+
+    parent = tmp_path / "sensitive-parent"
+    parent.mkdir(mode=0o700)
+    keyfile = parent / "sensitive-file"
+    keyfile.write_text("sensitive-content")
+    keyfile.chmod(0o600)
+    if kind == "symlink_parent":
+        link = tmp_path / "sensitive-link"
+        link.symlink_to(parent, target_is_directory=True)
+        keyfile = link / keyfile.name
+    elif kind == "group_writable":
+        parent.chmod(0o720)
+    elif kind == "world_writable":
+        parent.chmod(0o702)
+    elif kind == "sticky_writable":
+        parent.chmod(0o1777)
+    elif kind == "foreign_owner":
+        parent_info = parent.stat()
+        original_fstat = os.fstat
+
+        def foreign_parent(fd):
+            info = original_fstat(fd)
+            if (info.st_dev, info.st_ino) == (parent_info.st_dev, parent_info.st_ino):
+                fields = list(info)
+                fields[stat.ST_UID] = 123456789
+                return os.stat_result(fields)
+            return info
+
+        monkeypatch.setattr("humorhist.llm.os.fstat", foreign_parent)
+    else:
+        monkeypatch.chdir(tmp_path)
+        keyfile = keyfile.relative_to(tmp_path)
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY_FILE", str(keyfile))
+    with pytest.raises(LLMUnavailable) as exc:
+        screening_client()
+    output = "".join(traceback.format_exception(exc.value))
+    assert "sensitive" not in output
+
+
+@pytest.mark.parametrize("kind", ["permissive", "symlink", "directory", "missing", "empty", "wrong_owner"])
+def test_screen_rejects_bad_keyfiles_without_leaks(screen_env, monkeypatch, tmp_path, kind):
+    from humorhist.llm import screening_client
+
+    keyfile = tmp_path / "sensitive-path"
+    if kind == "directory":
+        keyfile.mkdir()
+    elif kind != "missing":
+        keyfile.write_text("sensitive-secret" if kind != "empty" else "  \n")
+        keyfile.chmod(0o644 if kind == "permissive" else 0o600)
+    if kind == "symlink":
+        link = tmp_path / "link"
+        link.symlink_to(keyfile)
+        keyfile = link
+    if kind == "wrong_owner":
+        monkeypatch.setattr("humorhist.llm.os.geteuid", lambda: -1)
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY_FILE", str(keyfile))
+    with pytest.raises(LLMUnavailable) as exc:
+        screening_client()
+    assert "sensitive" not in str(exc.value)
+    assert str(keyfile) not in str(exc.value)
+    assert exc.value.__cause__ is None
+
+
+@pytest.mark.parametrize("url", [
+    "http://inference-api.nousresearch.com/v1",
+    "https://evil.example/v1",
+    "https://inference-api.nousresearch.com.evil.example/v1",
+    "https://user:secret@inference-api.nousresearch.com/v1",
+    "https://inference-api.nousresearch.com:444/v1",
+    "https://inference-api.nousresearch.com/v1?secret=value",
+])
+def test_screen_rejects_unsafe_endpoint(screen_env, monkeypatch, url):
+    from humorhist.llm import screening_client
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "secret-key")
+    monkeypatch.setenv("HUMORHIST_LLM_BASE_URL", url)
+    with pytest.raises(LLMUnavailable) as exc:
+        screening_client()
+    assert "secret" not in str(exc.value)
+    assert url not in str(exc.value)
+
+
+def test_screen_catalog_exception_fails_closed_without_leaking(screen_env, monkeypatch, capsys):
+    import traceback
+
+    from humorhist.llm import LLMCallError, screening_client
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "test-private-key")
+
+    def broken_catalog(_model):
+        raise RuntimeError("test-private-key sensitive-provider-detail")
+
+    monkeypatch.setattr("humorhist.screen_catalog.check_screen_model", broken_catalog)
+    client = screening_client()
+    assert client.preflight() == "unavailable"
+    with respx.mock(assert_all_called=False) as mock:
+        post = mock.post(f"{DEFAULT_BASE_URL}/chat/completions").mock()
+        with pytest.raises(LLMCallError) as exc:
+            client.complete_json("s", "u")
+        assert exc.value.category == "preflight_unavailable"
+        assert post.call_count == 0
+    traceback.print_exception(exc.value)
+    captured = capsys.readouterr()
+    assert "test-private-key" not in captured.out + captured.err
+    assert "sensitive-provider-detail" not in captured.out + captured.err
+
+
+def test_direct_screening_fails_closed_without_post(screen_env, monkeypatch):
+    import respx
+
+    from humorhist.llm import LLMCallError, screening_client
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "private-key")
+    monkeypatch.setenv("HUMORHIST_SCREEN_MODEL", "exact")
+    with respx.mock(assert_all_called=False) as mock:
+        catalog = mock.get("https://inference-api.nousresearch.com/v1/models").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "exact", "pricing": {"prompt": "0", "completion": "1"}}]}))
+        post = mock.post("https://inference-api.nousresearch.com/v1/chat/completions").mock()
+        with pytest.raises(LLMCallError) as exc:
+            screening_client().complete_json("s", "u")
+        assert exc.value.category == "preflight_unsafe_pricing"
+        assert catalog.call_count == 1 and post.call_count == 0
+        assert "authorization" not in catalog.calls[0].request.headers
+        assert "private-key" not in str(exc.value)
+
+
+@pytest.mark.parametrize("status", [301, 307, 400, 429, 500])
+def test_screen_one_request_no_redirect_no_retry(screen_env, monkeypatch, status):
+    from humorhist.llm import LLMCallError, screening_client
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "secret-key")
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.method == "GET":
+            assert "authorization" not in request.headers
+            return httpx.Response(200, stream=httpx.ByteStream(b'{"data":[{"id":"tencent/hy3:free","pricing":{"prompt":"0","completion":"0"}}]}'))
+        return httpx.Response(status, headers={"Location": "https://evil.example/steal"}, text="secret-key")
+
+    real_client = httpx.Client
+    monkeypatch.setattr("humorhist.llm.httpx.Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    client = screening_client()
+    with pytest.raises(LLMCallError) as exc:
+        client.complete_json_once("s", "u")
+    assert exc.value.status == status
+    assert "secret-key" not in str(exc.value)
+    assert len(seen) == 2
+
+
+def test_screen_success_and_endpoint_revalidation(screen_env, monkeypatch):
+    from humorhist.llm import screening_client
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "secret-key")
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.method == "GET":
+            assert "authorization" not in request.headers
+            return httpx.Response(200, stream=httpx.ByteStream(b'{"data":[{"id":"tencent/hy3:free","pricing":{"prompt":"0","completion":"0"}}]}'))
+        return _chat_response('{"ok": true}')
+
+    real_client = httpx.Client
+    monkeypatch.setattr("humorhist.llm.httpx.Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    client = screening_client()
+    assert client.complete_json_once("s", "u") == {"ok": True}
+    assert len(seen) == 2
+    client.base_url = "https://evil.example"
+    with pytest.raises(LLMUnavailable):
+        client.complete_json_once("s", "u")
+    assert len(seen) == 2
+
+
+def test_screen_timeout_is_single_attempt_and_does_not_print_secrets(screen_env, monkeypatch, capsys):
+    import traceback
+
+    from humorhist.llm import LLMCallError, screening_client
+
+    monkeypatch.setenv("HUMORHIST_LLM_API_KEY", "sensitive-token")
+    monkeypatch.setenv("HUMORHIST_LLM_BASE_URL", "https://inference-api.nousresearch.com:443/v1")
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.method == "GET":
+            assert "authorization" not in request.headers
+            return httpx.Response(200, stream=httpx.ByteStream(b'{"data":[{"id":"tencent/hy3:free","pricing":{"prompt":"0","completion":"0"}}]}'))
+        raise httpx.ReadTimeout("sensitive-token", request=request)
+
+    real_client = httpx.Client
+    monkeypatch.setattr("humorhist.llm.httpx.Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    client = screening_client()
+    client.max_retries = 10
+    with pytest.raises(LLMCallError) as exc:
+        client.complete_json("s", "u")
+    assert exc.value.category == "timeout"
+    assert len(seen) == 2
+    traceback.print_exception(exc.value)
+    assert "sensitive-token" not in capsys.readouterr().err

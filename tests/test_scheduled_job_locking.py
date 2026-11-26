@@ -11,6 +11,7 @@ import humorhist.harvest.screen as screen
 import humorhist.harvest.seed as seed
 import humorhist.harvest.wikipedia_lists as wiki
 import humorhist.job_control as control
+import humorhist.llm as llm
 import humorhist.telegram as telegram
 
 
@@ -18,6 +19,7 @@ import humorhist.telegram as telegram
 def jobs(monkeypatch, tmp_path):
     monkeypatch.setattr(env, "load_env", lambda: None)
     from scripts import buffer_health, weekly_pipeline
+    monkeypatch.setattr(llm, "screening_client", lambda **kwargs: object())
 
     logs = []
     for job in (weekly_pipeline, buffer_health):
