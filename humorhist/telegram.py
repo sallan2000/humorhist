@@ -1703,14 +1703,65 @@ def telegram_harvest(conn, client, chat_id, *, seed: bool = True, wikipedia: boo
         from humorhist.harvest.seed import load_seed
         from humorhist.harvest.wikipedia_lists import harvest_wikipedia_lists
 
-        parts = []
+        lines = []
+        failures = 0
+        sources = 0
         if seed:
-            parts.append(f"seed +{load_seed(worker)}")
+            sources += 1
+            try:
+                result = load_seed(worker)
+                lines.append(
+                    f"Seed list: {result['inserted']} added, {result['skipped_duplicate']} already in pool, "
+                    f"{result['skipped_invalid']} invalid."
+                )
+            except Exception:  # noqa: BLE001 - report the other source independently
+                failures += 1
+                lines.append("Seed list: failed; some candidates may have been added before the error.")
         if wikipedia:
-            parts.append(f"wiki +{harvest_wikipedia_lists(worker)}")
-        client.send_message(chat_id, f"🌾 Harvest done ({'; '.join(parts)}). Pool now: {db.counts(worker)}")
+            sources += 1
+            try:
+                result = harvest_wikipedia_lists(worker)
+                failed = result['pages_failed']
+                failures += bool(failed)
+                lines.append(
+                    f"Wikipedia: {result['inserted']} added, {result['skipped_duplicate']} already in pool, "
+                    f"{result['skipped_invalid']} invalid; {result['pages_fetched']} pages read, "
+                    f"{failed} pages failed."
+                )
+                reasons = []
+                for key, label in (
+                    ("http_403", "access denied (HTTP 403)"),
+                    ("http_429", "rate limited (HTTP 429)"),
+                    ("http_other", "other HTTP errors"),
+                    ("network_failed", "network errors"),
+                    ("other_failed", "other errors"),
+                ):
+                    if result.get(key, 0):
+                        reasons.append(f"{label}: {result[key]}")
+                if reasons:
+                    lines.append("Wikipedia failures: " + "; ".join(reasons) + ".")
+            except Exception:  # noqa: BLE001 - never expose provider errors in chat
+                failures += 1
+                lines.append("Wikipedia: failed; some candidates may have been added before the error.")
+        if not sources:
+            heading = "🌾 Harvest skipped: no sources selected."
+        elif failures:
+            heading = "⚠️ Harvest incomplete: one or more sources failed."
+        else:
+            heading = "🌾 Harvest complete."
+        pool = db.counts(worker)['pool']
+        lines.extend([
+            f"Candidate pool: {pool} total.",
+            "Harvest collects candidates only; it does not create drafts.",
+            "Next: /screen to score unscored candidates, then /draft to create drafts.",
+        ])
+        if failures:
+            lines.append("Check the source errors before retrying the harvest.")
+        client.send_message(chat_id, "\n".join([heading, *lines]))
 
-    return _telegram_job(conn, client, chat_id, "harvest", "🌾 Harvesting new events…", work)
+    return _telegram_job(
+        conn, client, chat_id, "harvest", "🌾 Harvesting candidates (this does not create drafts)…", work
+    )
 
 
 def telegram_screen(conn, client, chat_id, *, batch_size: int = 20, limit: int | None = None):
@@ -1912,10 +1963,14 @@ def telegram_draft(conn, client, chat_id, *, count: int = 3, min_score: float = 
         pending = len(review.pending_drafts(worker))
         drafted = result.get("drafted", 0)
         failed = result.get("failed", 0)
+        from humorhist.drafting import describe_failure_counts
+
+        details = describe_failure_counts(result.get("failures"))
+        failure_note = f" Failures: {details}." if details else ""
         client.send_message(
             chat_id,
             f"✍️ Drafted {drafted} new draft(s). {pending} pending total — "
-            f"send /reviewdraft to review them. Failed: {failed}.",
+            f"send /reviewdraft to review them. Failed: {failed}.{failure_note}",
         )
         _record_announced(worker, result)
 

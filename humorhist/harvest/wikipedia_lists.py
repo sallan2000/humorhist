@@ -62,6 +62,10 @@ def _extract_redirect_target(wikitext: str) -> str | None:
 class HarvestError(Exception):
     """Raised when a Wikipedia API fetch fails or a page is missing/malformed."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 # --------------------------------------------------------------------------- #
 # HTTP layer
@@ -124,6 +128,8 @@ def _fetch_raw(
     req_params = dict(params)
     req_params["page"] = title
     resp = client.get(API_URL, params=req_params, headers=headers)
+    if resp.status_code != 200:
+        raise HarvestError(f"Wikipedia returned HTTP {resp.status_code}", status_code=resp.status_code)
     try:
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - surface as HarvestError
@@ -418,6 +424,11 @@ def harvest_wikipedia_lists(
         "skipped_duplicate": 0,
         "skipped_invalid": 0,
         "pages_failed": 0,
+        "http_403": 0,
+        "http_429": 0,
+        "http_other": 0,
+        "network_failed": 0,
+        "other_failed": 0,
     }
 
     own_client = client is None
@@ -428,11 +439,24 @@ def harvest_wikipedia_lists(
             try:
                 wikitext = fetch_page_wikitext(page, client=client)
             except HarvestError as exc:
-                logger.warning("Skipping %s after fetch failure: %s", page, exc)
+                if exc.status_code in (403, 429):
+                    key = f"http_{exc.status_code}"
+                elif exc.status_code is not None:
+                    key = "http_other"
+                else:
+                    key = "other_failed"
+                summary[key] += 1
+                logger.warning("Wikipedia page fetch failed: %s", key)
+                summary["pages_failed"] += 1
+                continue
+            except httpx.RequestError:
+                logger.warning("Wikipedia page fetch failed: network error")
+                summary["network_failed"] += 1
                 summary["pages_failed"] += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - one bad page must not abort
-                logger.warning("Skipping %s after unexpected error: %s", page, exc)
+                logger.warning("Wikipedia page fetch failed: unexpected %s", type(exc).__name__)
+                summary["other_failed"] += 1
                 summary["pages_failed"] += 1
                 continue
 

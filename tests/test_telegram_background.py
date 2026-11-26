@@ -7,6 +7,8 @@ import pytest
 from humorhist import db, job_control
 from humorhist import telegram as tg
 
+SEED_RESULT = {"inserted": 0, "skipped_duplicate": 0, "skipped_invalid": 0}
+WIKI_RESULT = {**SEED_RESULT, "pages_fetched": 1, "pages_failed": 0}
 
 @pytest.fixture
 def conn(tmp_path):
@@ -33,11 +35,11 @@ def test_polling_responds_while_harvest_waits(conn, monkeypatch):
     def slow(worker):
         started.set()
         assert release.wait(5)
-        return 0
+        return SEED_RESULT
 
     monkeypatch.setattr(tg, "_telegram_job", capture)
     monkeypatch.setattr("humorhist.harvest.seed.load_seed", slow)
-    monkeypatch.setattr("humorhist.harvest.wikipedia_lists.harvest_wikipedia_lists", lambda c: 0)
+    monkeypatch.setattr("humorhist.harvest.wikipedia_lists.harvest_wikipedia_lists", lambda c: WIKI_RESULT)
 
     class Transport(tg.StubTelegram):
         calls = 0
@@ -60,7 +62,7 @@ def test_polling_responds_while_harvest_waits(conn, monkeypatch):
     finally:
         release.set()
     futures[0].result(5)
-    assert sum("Harvest done" in m["text"] for m in stub.sent) == 1
+    assert sum("Harvest complete" in m["text"] for m in stub.sent) == 1
 
 
 def test_failure_is_sanitized_connection_closed_and_job_retriable(conn, monkeypatch):
@@ -93,12 +95,11 @@ def test_failure_is_sanitized_connection_closed_and_job_retriable(conn, monkeypa
 
     monkeypatch.setattr("humorhist.harvest.seed.load_seed", fail)
     future = tg.telegram_harvest(conn, stub, "123", wikipedia=False)
-    with pytest.raises(ValueError):
-        future.result(5)
-    assert sum("job failed" in m["text"] for m in stub.sent) == 1
+    future.result(5)
+    assert sum("Harvest incomplete" in m["text"] for m in stub.sent) == 1
     assert "SECRET-bot-token" not in str(stub.sent)
     assert workers[0].closed
-    monkeypatch.setattr("humorhist.harvest.seed.load_seed", lambda worker: 1)
+    monkeypatch.setattr("humorhist.harvest.seed.load_seed", lambda worker: SEED_RESULT)
     tg.telegram_harvest(conn, stub, "123", wikipedia=False).result(5)
 
 
@@ -121,7 +122,7 @@ def test_harvest_duplicate_busy(conn, monkeypatch):
     def slow(worker):
         started.set()
         assert release.wait(5)
-        return 0
+        return SEED_RESULT
 
     monkeypatch.setattr("humorhist.harvest.seed.load_seed", slow)
     stub = tg.StubTelegram()
@@ -133,7 +134,7 @@ def test_harvest_duplicate_busy(conn, monkeypatch):
         release.set()
     future.result(5)
     assert sum("already running" in m["text"] for m in stub.sent) == 1
-    assert sum("Harvest done" in m["text"] for m in stub.sent) == 1
+    assert sum("Harvest complete" in m["text"] for m in stub.sent) == 1
 
 
 def test_external_draft_still_triggers_one_nudge(conn):

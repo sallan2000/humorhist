@@ -17,17 +17,87 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
+from collections import Counter
 from datetime import UTC, datetime
 
 import humorhist.db as db
-from humorhist.brief import generate_angles
-from humorhist.factcheck import factcheck, fetch_wikipedia_extract
-from humorhist.llm import LLMClient
+from humorhist.brief import AnglesError, generate_angles
+from humorhist.factcheck import FactCheckError, factcheck, fetch_wikipedia_extract
+from humorhist.llm import LLMClient, LLMError, LLMUnavailable
 
 # Candidates are drawn from a window this many times larger than the number
 # requested, then sampled, so repeated runs do not always pick the same
 # top-scoring items.
 SELECTION_WINDOW_MULTIPLIER = 4
+
+STAGES = frozenset({"prepare", "extract", "factcheck", "angles", "persist", "unknown"})
+CATEGORIES = frozenset({"unavailable", "provider", "source", "factcheck", "validation", "database", "unexpected"})
+
+
+class DraftStageError(Exception):
+    """A deliberately redacted failure at a known drafting stage."""
+
+    def __init__(self, stage: str, category: str):
+        self.stage = stage
+        self.category = category
+        super().__init__(f"{stage}:{category}")
+
+
+def _category(stage: str, exc: Exception) -> str:
+    if isinstance(exc, LLMUnavailable):
+        return "unavailable"
+    if isinstance(exc, LLMError):
+        return "provider"
+    if isinstance(exc, FactCheckError):
+        # FactCheckError conflates transport, response and validation failures;
+        # do not infer a cause from its unsafe free-form message.
+        return "source" if stage == "extract" else "factcheck"
+    if isinstance(exc, AnglesError):
+        return "validation"
+    if isinstance(exc, sqlite3.Error):
+        return "database"
+    return "unexpected"
+
+
+def _stage(stage, fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        # Exception messages, chained tracebacks and dynamic class names can
+        # contain provider URLs or credentials; expose only fixed vocabulary.
+        raise DraftStageError(stage, _category(stage, exc)) from None
+
+
+def format_failure_counts(failures) -> str:
+    """Aggregate only allowlisted stage/category values; never render input."""
+    counts = Counter()
+    for failure in failures if isinstance(failures, list) else []:
+        if not isinstance(failure, dict):
+            continue
+        stage = failure.get("stage")
+        category = failure.get("category")
+        if not isinstance(stage, str) or stage not in STAGES:
+            stage = "unknown"
+        if not isinstance(category, str) or category not in CATEGORIES:
+            category = "unexpected"
+        counts[(stage, category)] += 1
+    return ", ".join(f"{stage}:{category}={count}" for (stage, category), count in sorted(counts.items()))
+
+
+def describe_failure_counts(failures) -> str:
+    """Describe stages without rendering untrusted exception text."""
+    labels = {
+        "prepare": "preparing candidates", "extract": "fetching Wikipedia extracts",
+        "factcheck": "fact-checking", "angles": "generating angles", "persist": "saving drafts",
+        "unknown": "an unknown stage",
+    }
+    counts = Counter()
+    for failure in failures if isinstance(failures, list) else []:
+        stage = failure.get("stage") if isinstance(failure, dict) else None
+        if not isinstance(stage, str) or stage not in STAGES:
+            stage = "unknown"
+        counts[stage] += 1
+    return ", ".join(f"{count} during {labels[stage]}" for stage, count in sorted(counts.items()))
 
 
 def select_candidates(
@@ -87,17 +157,22 @@ def draft_one(
     Returns the new draft id. Raises on failure (caller decides whether to
     continue).
     """
-    item = _row_to_item(row)
+    item = _stage("prepare", _row_to_item, row)
 
     # Non-destructive: never overwrite an existing draft for this pool item
     # (the editor may have reviewed/edited/approved it). Callers select only
     # status='new' items, but a re-run or scheduled pass must still be safe.
-    if db.draft_exists_for_pool(conn, item["id"]):
-        return db.make_id("draft", item["id"])
+    if _stage("prepare", db.draft_exists_for_pool, conn, item["id"]):
+        return _stage("prepare", db.make_id, "draft", item["id"])
 
-    extract = fetch_wikipedia_extract(item["source_url"] or item["title"], client=http_client)
-    brief = factcheck(client, item, extract)
-    angles = generate_angles(client, item, brief)
+    extract = _stage("extract", fetch_wikipedia_extract, item["source_url"] or item["title"], client=http_client)
+    brief = _stage("factcheck", factcheck, client, item, extract)
+    angles = _stage("angles", generate_angles, client, item, brief)
+
+    return _stage("persist", _persist_draft, conn, item, brief, angles)
+
+
+def _persist_draft(conn, item, brief, angles):
 
     draft_id = db.make_id("draft", item["id"])
     now = datetime.now(UTC).isoformat()
@@ -139,7 +214,9 @@ def draft_candidates(
         try:
             drafted.append(draft_one(conn, client, row, http_client=http_client))
         except Exception as exc:  # noqa: BLE001 - one bad candidate must not abort the run
-            failures.append({"pool_id": row["id"], "title": row["title"], "error": str(exc)})
+            stage = exc.stage if isinstance(exc, DraftStageError) and exc.stage in STAGES else "unknown"
+            category = exc.category if isinstance(exc, DraftStageError) and exc.category in CATEGORIES else "unexpected"
+            failures.append({"pool_id": row["id"], "stage": stage, "category": category})
 
     return {
         "selected": len(rows),

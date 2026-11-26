@@ -2044,16 +2044,20 @@ def wait_for_telegram_jobs(monkeypatch):
 
 def test_harvest_command_runs_and_reports(tmp_path, monkeypatch, wait_for_telegram_jobs):
     conn = _fresh_db(tmp_path)
-    monkeypatch.setattr("humorhist.harvest.seed.load_seed", lambda c: 3, raising=False)
+    monkeypatch.setattr("humorhist.harvest.seed.load_seed", lambda c: {"inserted": 3, "skipped_duplicate": 2, "skipped_invalid": 1}, raising=False)
     monkeypatch.setattr(
         "humorhist.harvest.wikipedia_lists.harvest_wikipedia_lists",
-        lambda c: 5,
+        lambda c: {"inserted": 5, "skipped_duplicate": 4, "skipped_invalid": 0, "pages_fetched": 2, "pages_failed": 1},
         raising=False,
     )
     stub = tg.StubTelegram(updates=_message_batch("/harvest", 1))
     tg.run_review_bot(conn, stub, "12345", max_iterations=5)
-    assert any("Harvesting new events" in m["text"] for m in stub.sent)
-    assert any("Harvest done" in m["text"] and "Pool now" in m["text"] for m in stub.sent)
+    assert any("Harvesting candidates" in m["text"] for m in stub.sent)
+    result = stub.sent[-1]["text"]
+    assert "Harvest incomplete" in result and "1 pages failed" in result
+    assert "Seed list: 3 added, 2 already in pool, 1 invalid" in result
+    assert "Wikipedia: 5 added, 4 already in pool" in result
+    assert "does not create drafts" in result and "/screen" in result and "/draft" in result
 
 
 def test_screen_command_skips_without_llm(tmp_path, monkeypatch):
@@ -2093,6 +2097,20 @@ def test_draft_command_runs_and_reports(tmp_path, monkeypatch, wait_for_telegram
     assert any("Drafting 2 candidate(s)" in m["text"] for m in stub.sent)
     assert any("Drafted 1 new draft(s)" in m["text"] for m in stub.sent)
     assert conn.execute("SELECT status FROM drafts WHERE id='nd1'").fetchone()["status"] == "pending"
+
+
+def test_draft_command_explains_failure_stage(tmp_path, monkeypatch, wait_for_telegram_jobs):
+    monkeypatch.setattr(tg, "_get_llm", lambda *args: object())
+    monkeypatch.setattr("humorhist.drafting.draft_candidates", lambda *a, **kw: {
+        "selected": 1, "drafted": 0, "failed": 1, "draft_ids": [],
+        "failures": [{"stage": "extract", "category": "source", "error": "secret-token"}],
+    })
+    conn = _fresh_db(tmp_path)
+    stub = tg.StubTelegram(updates=_message_batch("/draft", 1))
+    tg.run_review_bot(conn, stub, "12345", max_iterations=5)
+    message = stub.sent[-1]["text"]
+    assert "Failed: 1" in message and "1 during fetching Wikipedia extracts" in message
+    assert "secret-token" not in message
 
 
 # --- /buffer command + proactive nudge ------------------------------------

@@ -221,3 +221,74 @@ def test_buffer_deferred_backlog_and_published_counts(jobs, monkeypatch):
     assert buffer.main() == 0
     assert calls == [1]
     assert any("ready=0 deferred=5 approved=1 queued=1 published=1" in line for line in lines)
+
+
+@pytest.mark.parametrize("job_index", [0, 1])
+def test_jobs_aggregate_redacted_draft_diagnostics(jobs, monkeypatch, job_index):
+    job, lines = jobs[job_index], jobs[2]
+    sent = []
+    monkeypatch.setenv("HUMORHIST_TELEGRAM_CHAT_ID", "chat")
+    monkeypatch.setenv("HUMORHIST_TELEGRAM_BOT_TOKEN", "token")
+    class Transport:
+        def send_message(self, chat, message):
+            sent.append(message)
+    monkeypatch.setattr(telegram, "TelegramClient", Transport)
+    monkeypatch.setattr(drafting, "draft_candidates", lambda *a, **k: {
+        "selected": 3, "drafted": 0, "failed": 3, "failures": [
+            {"stage": "extract", "category": "validation", "error": "secret-token-and-url"},
+            {"stage": "extract", "category": "validation"},
+            {"stage": "secret-token-and-url", "category": "secret-token-and-url"}]})
+    assert job.main() == 1
+    text = "\n".join(lines + sent)
+    assert "extract:validation=2" in text and "unknown:unexpected=1" in text
+    assert "secret-token-and-url" not in text
+    if job_index == 1:
+        assert len(sent) == 1 and "2 during fetching Wikipedia extracts" in sent[0]
+        assert "0 created, 3 failed out of 3 selected" in sent[0]
+
+
+@pytest.mark.parametrize("mode", ["send", "missing", "disabled", "notify_error", "success"])
+def test_healthy_buffer_alerts_only_on_failure(jobs, monkeypatch, mode):
+    import humorhist.buffer as buf
+    _, job, lines = jobs
+    monkeypatch.setattr(buf, "buffer_health", lambda conn: {
+        "auto_draft": True, "level": "silent", "depth": 7, "pending": 0})
+    sent = []
+    class Transport:
+        def send_message(self, chat, message):
+            sent.append(message)
+            if mode == "notify_error":
+                boom()
+    monkeypatch.setattr(telegram, "TelegramClient", Transport)
+    if mode != "missing":
+        monkeypatch.setenv("HUMORHIST_TELEGRAM_CHAT_ID", "chat")
+        monkeypatch.setenv("HUMORHIST_TELEGRAM_BOT_TOKEN", "token")
+    if mode == "disabled":
+        monkeypatch.setattr(sys, "argv", sys.argv + ["--no-notify"])
+    if mode != "success":
+        monkeypatch.setattr(drafting, "draft_candidates", boom)
+    assert job.main() == (0 if mode == "success" else 1)
+    assert len(sent) == (1 if mode in ("send", "notify_error") else 0)
+    if mode == "missing":
+        assert "notify:NotConfigured" in lines[-1]
+    if mode == "notify_error":
+        assert "notify:RuntimeError" in lines[-1]
+    assert "secret-token-and-url" not in "\n".join(lines + sent)
+
+
+@pytest.mark.parametrize("phase", ["setup", "health"])
+def test_buffer_early_failure_attempts_one_redacted_alert(jobs, monkeypatch, phase):
+    import humorhist.buffer as buf
+    _, job, lines = jobs
+    messages = []
+    class Transport:
+        def send_message(self, chat, message):
+            messages.append(message)
+    monkeypatch.setattr(telegram, "TelegramClient", Transport)
+    monkeypatch.setenv("HUMORHIST_TELEGRAM_CHAT_ID", "chat")
+    monkeypatch.setenv("HUMORHIST_TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setattr(db if phase == "setup" else buf,
+                        "connect" if phase == "setup" else "buffer_health", boom)
+    assert job.main() == 1
+    assert len(messages) == 1 and f"{phase}:RuntimeError" in messages[0]
+    assert "secret-token-and-url" not in "\n".join(lines + messages)
