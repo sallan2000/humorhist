@@ -11,8 +11,11 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import sqlite3
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import humorhist.db as db
@@ -56,10 +59,10 @@ def cmd_harvest(args: argparse.Namespace) -> int:
 
 def cmd_screen(args: argparse.Namespace) -> int:
     from humorhist.harvest.screen import screen_pool
-    from humorhist.llm import default_client
+    from humorhist.llm import screening_client
 
     conn = _open_db(args.db)
-    client = default_client()
+    client = screening_client()
     print(f"Screening unscored candidates (batch={args.batch_size}, limit={args.limit})...")
     result = screen_pool(conn, client, batch_size=args.batch_size, limit=args.limit,
                          retry_failed=args.retry_failed)
@@ -68,19 +71,59 @@ def cmd_screen(args: argparse.Namespace) -> int:
     cur = conn.execute("SELECT count(*) AS n, round(avg(funny_score),2) AS avg FROM pool WHERE funny_score IS NOT NULL")
     row = cur.fetchone()
     print(f"Scored so far: {row['n']} (avg {row['avg']})")
-    return int(bool(result.get("unscored") or result.get("failed_batches")))
+    return int(bool(result.get("unscored") or result.get("failed_batches") or result.get("preflight_failed")))
+
+
+def _screen_timestamp(value) -> str:
+    """Only emit a parsed, timezone-aware ISO timestamp from stored data."""
+    if not isinstance(value, str) or len(value) > 40:
+        return 'unknown'
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.astimezone(UTC).isoformat() if parsed.tzinfo is not None else 'unknown'
+    except (ValueError, OverflowError):
+        return 'unknown'
 
 
 def cmd_screen_status(args: argparse.Namespace) -> int:
-    from humorhist.harvest.screen import screen_attempt_status
+    from humorhist.harvest.screen import format_screen_failures
 
-    conn = _open_db(args.db)
     try:
-        rows = screen_attempt_status(conn)
+        # URI encoding preserves literal '?' and '#' in database filenames.
+        conn = sqlite3.connect(Path(args.db).absolute().as_uri() + '?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        print(f"Cannot open database read-only: {exc}", file=sys.stderr)
+        return 1
+    try:
+        attempts = {r[1] for r in conn.execute('PRAGMA table_info(screen_attempts)')}
+        pool = {r[1] for r in conn.execute('PRAGMA table_info(pool)')}
+        fields = ('pool_id', 'state', 'category', 'status', 'started_at', 'completed_at')
+        projection = ', '.join(f'a.{name}' if name in attempts else f'NULL AS {name}' for name in fields)
+        can_join = 'pool_id' in attempts and {'id', 'title', 'funny_score'} <= pool
+        pool_fields = 'p.title, p.funny_score' if can_join else 'NULL AS title, NULL AS funny_score'
+        join = ' LEFT JOIN pool p ON p.id=a.pool_id' if can_join else ''
+        rows = ([dict(row) for row in conn.execute(
+            f'SELECT {projection}, {pool_fields} FROM screen_attempts a{join}'
+        )] if attempts else [])
         for row in rows:
-            print(f"{row['state']}  {row['pool_id']}  score={row['funny_score']}  {row['title']}")
+            state = row['state'] if row['state'] in ('pending', 'failed') else 'unknown'
+            ident = row['pool_id']
+            if isinstance(ident, str):
+                # Always use the same lossless, single-line JSON representation.
+                ident = json.dumps(ident, ensure_ascii=True).replace('\x7f', r'\u007f')
+            else:
+                ident = 'unavailable (non-string ID)'
+            reason = format_screen_failures([row]).rsplit('=', 1)[0]
+            timestamp = _screen_timestamp(row.get('completed_at') or row.get('started_at'))
+            print(f"{state}  id_json={ident}  reason={reason}  timestamp={timestamp}")
+        blocked = sum(row['title'] is not None and row['funny_score'] is None for row in rows)
+        print(f"Blocked unscored: {blocked if can_join or not rows else 'unknown (legacy schema)'}")
         print(f"{len(rows)} screening reservations. See README for recovery; retries may incur charges.")
         return 0
+    except sqlite3.Error as exc:
+        print(f"Cannot inspect database: {exc}", file=sys.stderr)
+        return 1
     finally:
         conn.close()
 

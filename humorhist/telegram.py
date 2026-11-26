@@ -1920,8 +1920,14 @@ def telegram_harvest(conn, client, chat_id, *, seed: bool = True, wikipedia: boo
 
 def telegram_screen(conn, client, chat_id, *, batch_size: int = 20, limit: int | None = None):
     """Score candidates on a background connection."""
-    llm = _get_llm(chat_id, client)
-    if llm is None:
+    from humorhist.llm import LLMUnavailable, screening_client
+
+    try:
+        llm = screening_client()
+    except LLMUnavailable:
+        client.send_message(
+            chat_id, "⚠️ Screening LLM unavailable right now. Check the screening configuration. (Action skipped.)"
+        )
         return None
 
     def work(worker):
@@ -1933,17 +1939,52 @@ def telegram_screen(conn, client, chat_id, *, batch_size: int = 20, limit: int |
         ).fetchone()[0]
         result = screen_pool(worker, llm, batch_size=batch_size, limit=limit)
         # Results may contain provider errors; report only safe counters.
-        scored = result["scored"]
-        selected = result.get("selected", selected)
-        incomplete = result.get("unscored", max(0, selected - scored))
-        status = "⚠️ Screening incomplete" if incomplete or result["failed_batches"] else "🔍 Screened"
+        def count(key, default=0):
+            value = result.get(key, default)
+            return value if type(value) is int and value >= 0 else 0
+
+        scored = count("scored")
+        eligible = result.get("eligible_selected")
+        if type(eligible) is int and eligible >= 0:
+            selected = eligible
+        elif limit is not None:
+            selected = count("selected", selected)
+        else:
+            selected = "unknown"
+        incomplete = (max(0, selected - scored) if isinstance(selected, int)
+                      else count("unscored"))
+        failed = count("failed_batches")
+        batches, skipped, blocked = count("batches"), count("skipped"), count("blocked")
+        uncertain = result.get("release_uncertain") is True
+        is_incomplete = (incomplete or failed or uncertain or result.get("preflight_failed")
+                         or (blocked and limit is None))
+        status = "⚠️ Screening incomplete" if is_incomplete else "🔍 Screened"
         reasons = format_screen_failures(result.get("failures"))
-        client.send_message(
-            chat_id, f"{status}: scored={scored}/{selected}, batches={result['batches']}, "
-            f"failed_batches={result['failed_batches']}, unscored={incomplete}, "
-            f"skipped={result.get('skipped', 0)}, blocked={result.get('blocked', 0)}."
-            + (f" Reasons: {reasons}." if reasons else "")
+        ids = []
+        for key in ("run_id", "batch_id"):
+            value = result.get(key)
+            if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value):
+                ids.append(f"{key}={value}")
+        batch_ids = result.get("batch_ids")
+        if isinstance(batch_ids, list):
+            ids.extend(f"batch_id={value}" for value in batch_ids
+                       if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value))
+        logger.info(
+            "[telegram] screening complete selected=%s scored=%s batches=%s failed_batches=%s "
+            "unscored=%s skipped=%s blocked=%s release_uncertain=%s reasons=%s %s",
+            selected, scored, batches, failed, incomplete, skipped, blocked,
+            uncertain, reasons or "unknown", " ".join(ids),
         )
+        try:
+            client.send_message(
+                chat_id, f"{status}: scored={scored}/{selected}, batches={batches}, "
+                f"failed_batches={failed}, unscored={incomplete}, skipped={skipped}, blocked={blocked}."
+                + (f" Reasons: {reasons}." if reasons else "")
+                + (" Warning: reservation release uncertain; reservations may remain pending. "
+                   "Inspect screening status." if uncertain else "")
+            )
+        except Exception:  # noqa: BLE001 - delivery may be ambiguous; never retry
+            logger.warning("[telegram] screening result delivery failed category=delivery_error")
 
     return _telegram_job(
         conn, client, chat_id, "screen", f"🔍 Scoring the pool with the LLM (batch {batch_size})…", work
@@ -2529,12 +2570,19 @@ def run_review_bot(
             # optional /screen [limit]
             rest = text.split(maxsplit=1)
             if len(rest) > 1 and rest[1].strip().lower() == "status":
-                from humorhist.harvest.screen import screen_attempt_status
+                from humorhist.cli import _screen_timestamp
+                from humorhist.harvest.screen import format_screen_failures, screen_attempt_status
                 attempts = screen_attempt_status(conn)
                 pending = sum(r["state"] == "pending" for r in attempts)
                 failed = sum(r["state"] == "failed" for r in attempts)
+                blocked = sum(r["title"] is not None and r["funny_score"] is None for r in attempts)
+                reasons = format_screen_failures(attempts) or "unknown"
+                timestamps = [_screen_timestamp(r.get("completed_at") or r.get("started_at")) for r in attempts]
+                known = sorted(t for t in timestamps if t != "unknown")
+                latest = known[-1] if known else "unknown"
                 client.send_message(
                     chat_id, f"Screening reservations: pending={pending}, failed={failed}, total={len(attempts)}. "
+                    f"Blocked unscored={blocked}; reasons: {reasons}; latest timestamp={latest}. "
                     "Use CLI screen-status for IDs and README recovery instructions; retries may incur charges."
                 )
             elif len(rest) == 1 or rest[1].strip().isdigit():

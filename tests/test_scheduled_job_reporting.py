@@ -10,6 +10,7 @@ import humorhist.env as env
 import humorhist.harvest.screen as screen
 import humorhist.harvest.seed as seed
 import humorhist.harvest.wikipedia_lists as wiki
+import humorhist.llm as llm
 import humorhist.telegram as telegram
 
 
@@ -22,6 +23,7 @@ def jobs(monkeypatch, tmp_path):
     monkeypatch.setattr(weekly, "log", lines.append)
     monkeypatch.setattr(buffer, "log", lines.append)
     monkeypatch.setattr(weekly, "_llm", lambda: object())
+    monkeypatch.setattr(llm, "screening_client", lambda **kw: object())
     monkeypatch.setattr(buffer, "_llm", lambda: object())
     monkeypatch.setattr(seed, "load_seed", lambda conn: {"inserted": 2})
     monkeypatch.setattr(wiki, "harvest_wikipedia_lists", lambda conn: {"inserted": 3, "pages_failed": 0})
@@ -33,6 +35,31 @@ def jobs(monkeypatch, tmp_path):
 
 def boom(*args, **kwargs):
     raise RuntimeError("secret-token-and-url")
+
+
+def test_weekly_screen_and_draft_use_separate_factories(jobs, monkeypatch):
+    weekly, _, _ = jobs
+    screen_client, draft_client = object(), object()
+    calls = []
+    monkeypatch.setattr(llm, "screening_client", lambda **kw: calls.append(kw) or screen_client)
+    monkeypatch.setattr(weekly, "_llm", lambda: draft_client)
+    monkeypatch.setattr(screen, "screen_pool", lambda conn, client, **kw:
+                        {"scored": 0, "batches": 0, "failed_batches": 0} if client is screen_client else boom())
+    monkeypatch.setattr(drafting, "draft_candidates", lambda conn, client, **kw:
+                        {"selected": 0, "drafted": 0, "failed": 0} if client is draft_client else boom())
+    assert weekly.main() == 0
+    assert calls == [{"timeout": 300.0}]
+
+
+def test_weekly_screen_factory_failure_still_drafts(jobs, monkeypatch):
+    weekly, _, lines = jobs
+    monkeypatch.setattr(llm, "screening_client", boom)
+    calls = []
+    monkeypatch.setattr(drafting, "draft_candidates", lambda *a, **kw:
+                        calls.append(1) or {"selected": 0, "drafted": 0, "failed": 0})
+    assert weekly.main() == 1
+    assert calls == [1] and "screen:RuntimeError" in lines[-1]
+    assert "secret-token-and-url" not in "\n".join(lines)
 
 
 def test_weekly_partial_results_and_phase_isolation(jobs, monkeypatch):

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +49,15 @@ def log(msg: str) -> None:
         fh.write(line + "\n")
 
 
+def _screen_ids(result: dict) -> str:
+    values = [("run_id", result.get("run_id"))]
+    batches = result.get("batch_ids")
+    if isinstance(batches, list):
+        values.extend(("batch_id", value) for value in batches)
+    return " ".join(f"{key}={value}" for key, value in values
+                    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value))
+
+
 def _llm():
     from humorhist.llm import resilient_client
 
@@ -73,6 +83,7 @@ def main() -> int:
     from humorhist.harvest.seed import load_seed
     from humorhist.harvest.wikipedia_lists import harvest_wikipedia_lists
     from humorhist.job_control import lock_path_for_db, try_acquire
+    from humorhist.llm import screening_client
 
     failures = []
     conn = None
@@ -119,11 +130,19 @@ def main() -> int:
         try:
             before = conn.execute("SELECT COUNT(*) n FROM pool WHERE funny_score IS NULL").fetchone()["n"]
             log(f"SCREEN: {before} unscored pool items")
-            res = screen_pool(conn, _llm(), batch_size=20)
+            res = screen_pool(conn, screening_client(timeout=300.0), batch_size=20)
             log(f"SCREEN: scored={res['scored']} batches={res['batches']} failed_batches={res['failed_batches']}")
             reasons = format_screen_failures(res.get("failures"))
+            uncertain = res.get("release_uncertain") is True
             log(f"SCREEN: unscored={max(0, before - res['scored'])} skipped={res.get('skipped', 0)}"
-                + (f" reasons={reasons}" if reasons else ""))
+                + f" release_uncertain={uncertain}"
+                + (f" reasons={reasons}" if reasons else "") + f" {_screen_ids(res)}")
+            if uncertain:
+                log("SCREEN WARNING: reservation release uncertain; reservations may remain pending. "
+                    "Inspect screening status.")
+                failures.append("screen:release_uncertain")
+            if res.get("preflight_failed"):
+                failures.append("screen:preflight_failed")
             if res["failed_batches"]:
                 failures.append("screen:failed_batches")
             if res["scored"] < before:

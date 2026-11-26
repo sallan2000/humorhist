@@ -101,7 +101,9 @@ Configure the LLM with environment variables; keep credentials out of the repo.
 CLI commands using the default client require an API key. The Telegram bot and
 scheduled jobs prefer the key and can fall back to the Nous OAuth token in
 `~/.hermes/auth.json`; that token is temporary and is not a reliable unattended
-credential. Use `python -m humorhist.cli llm-check` to inspect credential readiness.
+credential. This describes the general client, not the dedicated screening client
+below. Use `python -m humorhist.cli llm-check` to inspect general credential
+readiness; it does not establish screening access or billing.
 
     HUMORHIST_LLM_API_KEY     API key for a chat-completions API; recommended
                               for unattended jobs.
@@ -192,7 +194,10 @@ Options:
     --batch-size N       events per LLM call (default 20)
     --limit N            only score the first N unscored events
 
-Only rows with a NULL score are scored, so re-running is safe.
+Only eligible rows with a NULL score are scored. Failed or pending reservations
+block automatic resubmission; see "Screening retries and charges" below before
+re-running or recovering an attempt. Requests can incur charges even when no
+score is saved.
 
 ### 3. Draft (fact-check + angles)
 
@@ -692,15 +697,38 @@ logs report selected, drafted and failed counts and safe failure-stage summaries
 
 ### Screening retries and charges
 
+Screening uses a nonempty `HUMORHIST_LLM_API_KEY` in
+preference to `HUMORHIST_LLM_API_KEY_FILE`; it does not fall back to Hermes
+OAuth. The key file must be an owner-only regular file owned by the effective
+user, reached by an absolute path without symlinks; its directories must be
+owned by root or that user and not group- or world-writable. Supply secrets
+securely, never in commands, shell history, logs, or the repository. Inherited
+environment settings take precedence over `.env` values.
+
+`HUMORHIST_SCREEN_MODEL` selects the exact screening model; if unset or empty,
+it falls back to `HUMORHIST_LLM_MODEL`, then `tencent/hy3:free`. Drafting keeps
+its separate model setting. Screening accepts only the Nous HTTPS endpoint on
+port 443, and does not silently switch providers or models. Before a screening
+request, the client checks the exact ID against the public Nous catalog
+with an anonymous request. It fails closed if the catalog is unavailable or
+invalid, the ID is missing or ambiguous, or pricing is missing, invalid or
+nonzero. Catalog prices are not an account entitlement or a billing guarantee;
+check provider terms, access, usage and spending limits independently. A free
+suffix alone is not proof of free use.
+
 Screening records an attempt before sending each batch. A failed or interrupted
 attempt remains blocked on later runs, even if no score was saved, because the
 provider may have charged for it. Runs stop after a provider failure; reports
 show unscored, skipped and blocked counts and sanitized failure categories. Empty,
 malformed or partial responses stop the run; valid scores are saved and missing
 entries remain blocked. A limited CLI or Telegram run reports its selected
-unscored count separately from all blocked rows; `screen_all` exits nonzero if
-any blocked rows remain, even when its limit was reached. Screening clients must
-provide a single-attempt `complete_json_once` method. To explicitly retry
+unscored count separately from all blocked rows. `screen_all` reports incomplete
+selected work as a failure; blocked rows outside a successfully completed limit
+alone do not cause failure. It stops if an iteration scores no rows, including
+when all selected claims are lost to concurrent producers; further eligible work
+may remain. Live screening uses
+only the dedicated single-attempt `ScreeningClient`; unknown adapters and
+subclasses fail closed. To explicitly retry
 failed (not interrupted/in-progress) attempts, run `python -m humorhist.cli screen
 --retry-failed` with the usual database arguments; this may incur charges.
 Interrupted `pending` attempts require operator review and a deliberate database
@@ -711,13 +739,24 @@ attempt records, so requests made before this change cannot be identified.
 
 ### Screening reservations and recovery
 
-`humorhist --db PATH screen-status` lists reservation IDs and states without
-contacting the provider; Telegram `/screen status` shows counts. Pending means
+Before even inspecting reservations, conservatively stop all producers and make a
+verified SQLite backup as described below. `python -m humorhist.cli --db PATH
+screen-status` opens an existing database read-only, without migration or provider
+requests; it lists reservation IDs and states. Telegram `/screen status` shows
+counts and is not covered by this CLI read-only guarantee. CLI status also reports sanitized reason/status and time
+when available; legacy reservations show unknown rather than invented details.
+Pending means
 the result is unknown, not that a request was never sent. Failed includes
 timeouts and invalid responses; the provider may still have charged. No
 automatic retry occurs. After reviewing the cost and provider history,
-`humorhist --db PATH screen --retry-failed` explicitly retries failed rows
+`python -m humorhist.cli --db PATH screen --retry-failed` explicitly retries failed rows
 (and also processes new eligible rows). It never retries pending rows.
+
+Only allowlisted diagnostics are reported or stored; do not copy raw provider
+responses, prompts, credentials, headers or exception details into reports. A
+previously observed HTTP 400 does not establish its cause: the response body
+was not retained, and model, credential or request-parameter failure cannot be
+inferred from the status alone.
 
 Pending recovery is deliberately offline-only: there is no shared lock that
 can exclude old software or all entry points. First stop and disable *all*
@@ -726,9 +765,41 @@ legacy scripts on every host using this database; verify all their processes
 have exited and cannot restart. Back up the database with SQLite's online
 backup API, inspect each ID with screen-status and reconcile the provider's
 request/billing history. Only if you accept possible duplicate charges, use
-SQLite to delete the specific reviewed reservation with a parameterized
-`DELETE FROM screen_attempts WHERE pool_id = ? AND state = 'pending'`, commit,
-and check the result before restarting producers. The next normal screening
-may submit it again. Do not bulk-delete reservations. Never clear while any
-producer might be active. Legacy rescreen_60 is disabled; existing scores
-are not cleared and no safe bulk rescreen is currently provided.
+the following commands for one reviewed reservation. Replace neither command
+with a bulk delete. These commands use Python's SQLite library and prompt for
+paths and the exact JSON-encoded pool ID; no provider request is made. Keep the backup in a
+private directory on secure storage. First create a new backup (the command
+refuses to overwrite an existing file):
+
+    python - <<'PY'
+    import os, sqlite3
+    from pathlib import Path
+    db = Path(input('Database path: ')).expanduser().resolve(strict=True)
+    backup = Path(input('New backup path: ')).expanduser().absolute()
+    fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+    with sqlite3.connect(db.as_uri() + '?mode=ro', uri=True) as source, sqlite3.connect(backup) as dest:
+        source.backup(dest)
+        print('Backup quick_check:', dest.execute('PRAGMA quick_check').fetchone()[0])
+    PY
+
+Confirm the backup is usable and its `quick_check` is `ok` before continuing.
+With all producers still stopped, copy the **entire value** following `id_json=`
+from the reviewed status line, including its outer quotes and all backslashes.
+Every string ID uses JSON, including simple IDs: for example `"legacy-id"`
+and `"\"legacy-id\""` identify different reservations. Do not decode, trim,
+normalize or retype the ID as plain text; leading/trailing spaces and Unicode are
+significant. An unavailable non-string ID cannot be recovered by this helper.
+
+    python scripts/recover_screen_reservation.py
+
+Enter the database path and paste the JSON value at the prompt. The helper parses
+it as a JSON string, prints the safely escaped decoded ID for review, and requires
+an explicit `DELETE` confirmation. It refuses malformed or non-string JSON and
+anything other than exactly one matching pending reservation; its parameterized
+delete uses the decoded ID exactly. Verify the displayed ID before confirming.
+
+Check the result before restarting producers. The next normal screening may
+submit it again and incur charges. Never clear while any producer might be
+active. Legacy rescreen_60 is disabled; existing scores are not cleared and no
+safe bulk rescreen is currently provided.
