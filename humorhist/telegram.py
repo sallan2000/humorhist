@@ -138,6 +138,8 @@ class TelegramTransport(Protocol):
 
     def send_photo(self, chat_id: str, photo: bytes | str, caption: str | None = None) -> dict: ...
 
+    def send_document(self, chat_id: str, document: bytes, caption: str) -> dict: ...
+
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> dict: ...
 
 
@@ -184,6 +186,12 @@ class StubTelegram:
         }
         if caption is not None:
             msg["caption"] = caption
+        self.sent.append(msg)
+        return msg
+
+    def send_document(self, chat_id: str, document: bytes, caption: str) -> dict:
+        self._mid += 1
+        msg = {"message_id": self._mid, "chat_id": chat_id, "document": document, "caption": caption}
         self.sent.append(msg)
         return msg
 
@@ -278,6 +286,25 @@ class TelegramClient:
             params["reply_markup"] = reply_markup
         return self._call("sendMessage", params)
 
+    def send_document(self, chat_id: str, document: bytes, caption: str) -> dict:
+        """Upload bytes, never a local path; do not expose API errors or retry uploads."""
+        if not self.token:
+            raise TelegramError("no bot token: set HUMORHIST_TELEGRAM_BOT_TOKEN or pass token=")
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(
+                    f"{API_BASE}/bot{self.token}/sendDocument",
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"document": ("queue-export.txt", document, "text/plain; charset=utf-8")},
+                )
+                resp.raise_for_status()
+                body = resp.json()
+            if not body.get("ok"):
+                raise TelegramError("Telegram rejected document")
+            return body["result"]
+        except Exception:
+            raise TelegramError("Telegram document upload failed") from None
+
     def send_photo(self, chat_id: str, photo: bytes | str, caption: str | None = None) -> dict:
         params: dict[str, Any] = {"chat_id": chat_id}
         # ``photo`` may be raw bytes (we send multipart) or a file_id / URL
@@ -332,24 +359,58 @@ def _keyboard(draft_id: str, *, fast: bool = False, token: str = "") -> dict:
                     "text": "❌ Reject now" if fast else "❌ Reject",
                     "callback_data": f"{'fastreject' if fast else 'reject'}:{draft_id}:{token}",
                 },
-                {"text": "⏸ Later", "callback_data": f"later:{draft_id}:{token}"},
+                {"text": "⏸ Later", "callback_data": f"{'fastlater' if fast else 'later'}:{draft_id}:{token}"},
             ],
             [
-                {"text": "⏭ Next draft ▶️", "callback_data": f"next:{draft_id}"},
+                {"text": "⏭ Next draft ▶️", "callback_data": f"{'nextfast' if fast else 'next'}:{draft_id}"},
             ],
         ]
     }
 
 
-def _next_keyboard(draft_id: str) -> dict:
+def _next_keyboard(draft_id: str, *, fast: bool = False) -> dict:
     """Keyboard for the 'no more pending' state shown after the last draft."""
     return {
         "inline_keyboard": [
             [
-                {"text": "⏭ Review more ▶️", "callback_data": f"next:{draft_id}"},
-            ]
+                {"text": "⏭ Review more ▶️", "callback_data": f"{'nextfast' if fast else 'next'}:{draft_id}"},
+            ],
+            [{"text": "⚡ Fast review (no confirmation)", "callback_data": f"nextfast:{draft_id}"}],
+            [{"text": "🏠 Menu", "callback_data": "menu:home"}],
         ]
     }
+
+
+def _main_menu(client, chat_id):
+    client.send_message(chat_id, "What would you like to do? /help lists all commands.", reply_markup={
+        "inline_keyboard": [
+            [{"text": "📖 Review", "callback_data": "menu:review"}],
+            [{"text": "📋 Queue", "callback_data": "menu:queue"}],
+            [{"text": "🔎 Find drafts", "callback_data": "menu:find"}],
+        ]
+    })
+
+
+def _find_menu(client, chat_id):
+    with _intent_lock:
+        # Opening a new menu revokes unused buttons from older menus in this chat.
+        for nonce, entry in list(_intents.items()):
+            if entry[:2] == (str(chat_id), "") and entry[2] in ("screen", "draft"):
+                del _intents[nonce]
+        screen = _new_intent(chat_id, "", "screen", "")
+        draft = _new_intent(chat_id, "", "draft", "")
+    client.send_message(
+        chat_id,
+        "Find drafts in three separate steps: 1. Harvest candidates; 2. Screen them; "
+        "3. Draft the best candidates. Each button starts only that step. "
+        "Harvest uses network sources; screening and drafting use an LLM and may incur charges.",
+        reply_markup={"inline_keyboard": [
+            [{"text": "1️⃣ Harvest candidates", "callback_data": "find:harvest"}],
+            [{"text": "2️⃣ Screen candidates (LLM)", "callback_data": f"find:screen:{screen}"}],
+            [{"text": "3️⃣ Create drafts (LLM)", "callback_data": f"find:draft:{draft}"}],
+            [{"text": "🏠 Menu", "callback_data": "menu:home"}],
+        ]},
+    )
 
 
 # Confirmation intents deliberately disappear on restart. Consume after commit;
@@ -623,7 +684,9 @@ def _open_notes_prompt(conn: sqlite3.Connection, client: TelegramTransport, chat
         f"(or send /skip to leave the existing notes untouched):"
     )
     version = _decision_token(conn, draft_id)
-    note = client.send_message(chat_id, prompt)
+    note = client.send_message(chat_id, prompt, reply_markup={
+        "inline_keyboard": [[{"text": "⏭ Skip notes", "callback_data": f"skipnotes:{draft_id}"}]]
+    })
     return {
         "draft_id": draft_id,
         "note_message_id": note["message_id"],
@@ -663,6 +726,49 @@ def handle_callback(
         client.answer_callback_query(cq["id"], text="Transaction open; retry")
         return None
     data = (cq.get("data") or "").strip()
+    if data.startswith("export:"):
+        draft_id, sep, token = data[len("export:"):].rpartition(":")
+        with review._transaction(conn):
+            if not sep or not token or token != _decision_token(conn, draft_id):
+                _expired_decision(conn, client, chat_id, cq, draft_id or data[len("export:"):])
+                return None
+            row = next((r for r in review.queued_drafts(conn) if r["draft_id"] == draft_id), None)
+            if row is None:
+                _expired_decision(conn, client, chat_id, cq, draft_id)
+                return None
+            label = _label(conn, draft_id)
+            export = (review.format_publish_export(conn, [row], include_image_path=False)
+                      if row.get("post_copy") else None)
+            if export:
+                short = row.get("short_code") or draft_id
+                export = export.replace(f"── {short} — {row['title']}", f"── {label}", 1)
+        client.answer_callback_query(cq["id"], text="")
+        if export is None:
+            client.send_message(chat_id, f"⚠️ {label} has no post copy to export. Edit or regenerate copy first.")
+        else:
+            chunks = _chunk_text(export)
+            if len(chunks) > 1:
+                chunks = _chunk_text(export, 4000 - _units(label) - 2)
+            urls = [m.group() for m in re.finditer(r"https?://[^\s]+", export)]
+            split_urls = {url for url in urls if _units(url) > 3700 or not any(url in chunk for chunk in chunks)}
+            if split_urls:
+                try:
+                    client.send_document(chat_id, export.encode("utf-8"), "Full queue export (UTF-8 text)")
+                except Exception:  # noqa: BLE001 - upload outcome can be ambiguous
+                    client.send_message(
+                        chat_id, "⚠️ Could not confirm the export document was sent. "
+                        "Check this chat before trying the export again; no post was made."
+                    )
+                    return None
+                export = re.sub(
+                    r"https?://[^\s]+",
+                    lambda m: "[Full URL in attached text document]",
+                    export,
+                )
+            _send_long(client, chat_id, export, context=label, reply_markup={"inline_keyboard": [[
+                {"text": "✅ Mark manually posted", "callback_data": f"posted:{draft_id}:{token}"}
+            ]]})
+        return None
     if data.startswith(("posted:", "postyes:", "unpost:")):
         action, _, rest = data.partition(":")
         draft_id, sep, token = rest.rpartition(":")
@@ -738,7 +844,9 @@ def handle_callback(
             _expired_decision(conn, client, chat_id, cq, draft_id or rest)
             return None
         if action.startswith("fast") or fast:
-            return _commit_decision(conn, client, chat_id, cq, draft_id, decision, token)
+            return _commit_decision(
+                conn, client, chat_id, cq, draft_id, decision, token, fast=action.startswith("fast") or fast
+            )
         token = _new_intent(chat_id, draft_id, decision, token)
         client.answer_callback_query(cq["id"], text="")
         client.send_message(
@@ -776,6 +884,18 @@ def handle_callback(
         _, _, draft_id = data.partition(":")
         client.answer_callback_query(cq["id"], text="add notes")
         return _open_notes_prompt(conn, client, chat_id, draft_id)
+    if data.startswith("skipjoke:"):
+        draft_id = data.partition(":")[2]
+        entry = (awaiting or {}).get(draft_id, {})
+        message_id = (cq.get("message") or {}).get("message_id")
+        if (awaiting is None or entry.get("stage") != "editor_line" or message_id is None
+                or entry.get("note_message_id") != message_id):
+            client.answer_callback_query(cq["id"], text="Prompt expired")
+            return None
+        client.answer_callback_query(cq["id"], text="skipped")
+        return handle_text(conn, client, chat_id, awaiting, {
+            "message": {"text": "/skip", "reply_to_message": {"message_id": message_id}}
+        })
     if data.startswith("skipnotes:"):
         # ⏭ Skip (no notes): dismiss the optional notes prompt. Equivalent to a
         # /skip reply, but a one-tap button so the reviewer never has to type it.
@@ -787,10 +907,13 @@ def handle_callback(
             client.send_message(chat_id, f"⚠️ Notes prompt expired for {_label(conn, draft_id)}; no change made.")
             return None
         client.answer_callback_query(cq["id"], text="skipped")
-        client.send_message(chat_id, f"⏭️ No notes saved for {_label(conn, draft_id)}.")
+        client.send_message(
+            chat_id, f"⏭️ No notes saved for {_label(conn, draft_id)}.",
+            reply_markup=_next_keyboard(draft_id, fast=entry.get("fast", False))
+        )
         return {"skipped": draft_id}
 
-    if data.startswith("later:"):
+    if data.startswith(("later:", "fastlater:")):
         rest = data.partition(":")[2]
         draft_id, sep, token = rest.rpartition(":")
         try:
@@ -807,6 +930,7 @@ def handle_callback(
         client.send_message(
             chat_id,
             f"⏸ Draft {_label(conn, draft_id)} deferred for 30 days (it'll resurface in the review queue then).",
+            reply_markup=_next_keyboard(draft_id, fast=data.startswith("fastlater:")),
         )
         return {"draft_id": draft_id, "deferred": True}
     if data.startswith("view:"):
@@ -985,6 +1109,7 @@ def _commit_decision(
     token: str | None,
     *,
     nonce: str | None = None,
+    fast: bool = False,
 ) -> dict | None:
     """Commit an approve/reject and run the decision-specific follow-up.
 
@@ -1013,6 +1138,7 @@ def _commit_decision(
             f"🚫 Draft {_label(conn, draft_id)} rejected. It's out of the queue; "
             f"re-list it any time with /listrejected (or /reviewdraft if "
             f"you change your mind later).",
+            reply_markup=_next_keyboard(draft_id, fast=fast),
         )
         return {"draft_id": draft_id, "decision": "reject", "committed": True}
     # The joke is the whole point of the product: capture the human-written
@@ -1021,7 +1147,10 @@ def _commit_decision(
     note = client.send_message(
         chat_id,
         f"Draft {_label(conn, draft_id)} approved. Reply here with your one-line "
-        f"joke (the editor_line) — or send /skip to leave it blank:",
+        f"joke (the editor_line) — or send /skip to leave it blank. "
+        "Replying or skipping automatically attempts LLM post-copy generation if an LLM is available; "
+        "this may incur charges:",
+        reply_markup={"inline_keyboard": [[{"text": "⏭ Skip joke", "callback_data": f"skipjoke:{draft_id}"}]]},
     )
     # Stash the decision so a follow-up reply knows whether to also capture
     # a (secondary) notes step after the editor_line.
@@ -1030,6 +1159,7 @@ def _commit_decision(
         "decision": decision,
         "note_message_id": note["message_id"],
         "stage": "editor_line",
+        "fast": fast,
         "committed": True,
         "version": version,
     }
@@ -1144,9 +1274,13 @@ def handle_text(
                 )
             awaiting.pop(draft_id, None)
             if editor_line is None:
-                client.send_message(chat_id, f"Joke left blank for {_label(conn, draft_id)}.")
+                client.send_message(
+                    chat_id, f"Joke left blank for {_label(conn, draft_id)}.", reply_markup=_next_keyboard(draft_id)
+                )
             else:
-                client.send_message(chat_id, f"Joke saved for {_label(conn, draft_id)}.")
+                client.send_message(
+                    chat_id, f"Joke saved for {_label(conn, draft_id)}.", reply_markup=_next_keyboard(draft_id)
+                )
             return {"editor_line_set": draft_id}
         with review._transaction(conn):
             if st["version"] != _decision_token(conn, draft_id):
@@ -1179,6 +1313,7 @@ def handle_text(
         awaiting[draft_id] = {
             "note_message_id": note["message_id"],
             "stage": "notes",
+            "fast": st.get("fast", False),
             "decision": decision,
             "version": version,
         }
@@ -1187,7 +1322,10 @@ def handle_text(
     # --- notes stage: optional free-form annotation (merge, don't clobber) ---
     if text == "/skip":
         awaiting.pop(draft_id, None)
-        client.send_message(chat_id, f"Notes left blank for {_label(conn, draft_id)}.")
+        client.send_message(
+            chat_id, f"Notes left blank for {_label(conn, draft_id)}.",
+            reply_markup=_next_keyboard(draft_id, fast=st.get("fast", False))
+        )
         return {"skipped": draft_id}
     # If this note came from a *pending* draft's "steer angles" prompt, regenerate
     # the angles with the note as steering (the /notes -> angles behaviour).
@@ -1220,6 +1358,7 @@ def handle_text(
             chat_id,
             f"🔄 Angles regenerated for {_label(conn, draft_id)} using your note as steering. "
             "Review them with /reviewdraft.",
+            reply_markup=_next_keyboard(draft_id),
         )
         return {"angles_regenerated": draft_id}
     # merge=True keeps the editor_line we just captured; only notes change.
@@ -1230,7 +1369,10 @@ def handle_text(
             return {"expired": draft_id}
         review.apply_review(conn, draft_id, decision=decision, notes=text, merge=True)
     awaiting.pop(draft_id, None)
-    client.send_message(chat_id, f"Notes saved for {_label(conn, draft_id)}.")
+    client.send_message(
+        chat_id, f"Notes saved for {_label(conn, draft_id)}.",
+        reply_markup=_next_keyboard(draft_id, fast=st.get("fast", False))
+    )
     return {"noted": draft_id}
 
 
@@ -1278,6 +1420,7 @@ HELP_TEXT = (
     "/image <id> - (re)generate the story image for an approved+queued draft\n"
     "/status - approved / rejected / pending breakdown (+ stuck-capture nudge)\n"
     "/publish - read-only export of queued posts (copy + link + image + checklist) for manual posting\n"
+    "/menu or /start - open the guided menu\n"
     "/help - this message\n\n"
     "The bot also nudges you with 🆕 N new draft(s) when fresh drafts appear."
 )
@@ -1501,6 +1644,7 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         )
         return 0
     lines = [f"📋 Queued drafts ({len(rows)}) — edit copy before publishing (#id = draft number):"]
+    lines.append("  Export for manual posting; mark posted only after you post it yourself.")
     lines.append("  ✏️ Edit copy   🗑 Remove from queue   ❌ Reject draft (confirm)   ↩️ Reopen to pending")
     keyboard: list[list[dict]] = []
     for r in rows:
@@ -1550,7 +1694,11 @@ def send_queue_list(conn: sqlite3.Connection, client: TelegramTransport, chat_id
         keyboard.append(
             [
                 {
-                    "text": f"✅ Mark posted: {title[:16]} (#{short})",
+                    "text": f"📤 Export: {title[:16]} (#{short})",
+                    "callback_data": f"export:{did}:{r['version']}",
+                },
+                {
+                    "text": f"✅ Mark manually posted: {title[:16]} (#{short})",
                     "callback_data": f"posted:{did}:{r['version']}",
                 }
             ]
@@ -2030,7 +2178,9 @@ def run_review_session(
     if draft is None:
         if review.deferred_drafts(conn):
             client.send_message(
-                chat_id, "⏸ No drafts ready now. Deferred drafts remain; use /listlater to review them."
+                chat_id, "⏸ No drafts ready now. Deferred drafts remain; use /listlater to review them.",
+                reply_markup={"inline_keyboard": [[{"text": "⏸ Deferred drafts", "callback_data": "menu:later"}],
+                                                    [{"text": "🏠 Menu", "callback_data": "menu:home"}]]},
             )
             return 0
         client.send_message(
@@ -2038,6 +2188,8 @@ def run_review_session(
             "✅ All caught up — no drafts pending. Send /reviewdraft any time "
             "to check again (new drafts from /draft or the daily timer will "
             "appear here).",
+            reply_markup={"inline_keyboard": [[{"text": "🔎 Find drafts", "callback_data": "menu:find"}],
+                                                [{"text": "🏠 Menu", "callback_data": "menu:home"}]]},
         )
         return 0
     if after_id and draft is pending[0]:
@@ -2081,7 +2233,7 @@ def run_review_bot(
     fast_mode = False
 
     def _handle(upd: dict) -> None:
-        nonlocal current_id
+        nonlocal current_id, fast_mode
         offset_ref[0] = max(offset_ref[0], upd.get("update_id", 0) + 1)
         # Acknowledge rejected updates in the polling offset, but never dispatch
         # them or mutate a pending review session's state.
@@ -2093,8 +2245,51 @@ def run_review_bot(
         # next pending draft, without the user typing /reviewdraft again.
         if "callback_query" in upd:
             data = (upd.get("callback_query") or {}).get("data") or ""
-            if data.startswith("next:"):
+            if data.startswith(("find:screen", "find:draft")):
+                parts = data.split(":")
+                valid = False
+                if len(parts) == 3 and parts[1] in ("screen", "draft"):
+                    with _intent_lock:
+                        entry = _intents.get(parts[2])
+                        if entry == (str(chat_id), "", parts[1], ""):
+                            del _intents[parts[2]]
+                            valid = True
+                if not valid:
+                    client.answer_callback_query(
+                        upd["callback_query"]["id"], text="Button expired; open Find drafts again"
+                    )
+                    return
+                # Consume before acknowledgement and dispatch; never hold the lock over I/O.
                 client.answer_callback_query(upd["callback_query"]["id"], text="")
+                _dispatch("/" + parts[1])
+                return
+            if data in ("menu:home", "menu:review", "menu:queue", "menu:find", "menu:later",
+                        "find:harvest", "review:normal", "review:fast"):
+                client.answer_callback_query(upd["callback_query"]["id"], text="")
+                if data == "menu:home":
+                    _main_menu(client, chat_id)
+                elif data == "menu:review":
+                    client.send_message(
+                        chat_id, "Choose review mode. Normal asks for confirmation; fast commits on the first tap.",
+                        reply_markup={"inline_keyboard": [
+                            [{"text": "📖 Normal review (confirm)", "callback_data": "review:normal"}],
+                            [{"text": "⚡ Fast review (no confirmation)", "callback_data": "review:fast"}],
+                            [{"text": "🏠 Menu", "callback_data": "menu:home"}],
+                        ]})
+                elif data == "menu:queue":
+                    send_queue_list(conn, client, chat_id)
+                elif data == "menu:later":
+                    send_deferred_list(conn, client, chat_id)
+                elif data == "menu:find":
+                    _find_menu(client, chat_id)
+                elif data.startswith("find:"):
+                    _dispatch("/" + data.partition(":")[2])
+                else:
+                    _dispatch("/reviewdraft" + (" fast" if data == "review:fast" else ""))
+                return
+            if data.startswith(("next:", "nextfast:")):
+                client.answer_callback_query(upd["callback_query"]["id"], text="")
+                fast_mode = data.startswith("nextfast:")
                 after_id = data.partition(":")[2]
                 pending = review.pending_drafts(conn)
                 next_row = _next_pending(conn, pending, after_id)
@@ -2126,6 +2321,7 @@ def run_review_bot(
                     awaiting[res["draft_id"]] = {
                         "note_message_id": res["note_message_id"],
                         "stage": res.get("stage", "editor_line"),
+                        "fast": res.get("fast", False),
                         "decision": res.get("decision", "approve"),
                         # Propagate setjoke so handle_text routes the reply through
                         # review.set_editor_line (targeted UPDATE) instead of the
@@ -2353,7 +2549,9 @@ def run_review_bot(
             # /image <id>  -> (re)generate the story image for an approved+queued draft
             rest = text.split(maxsplit=1)
             telegram_image(conn, client, chat_id, rest[1].strip() if len(rest) > 1 else None)
-        elif cmd in ("/help", "/start"):
+        elif cmd in ("/start", "/menu"):
+            _main_menu(client, chat_id)
+        elif cmd == "/help":
             client.send_message(chat_id, HELP_TEXT)
         else:
             client.send_message(chat_id, "Unknown command. Send /help.")
@@ -2370,11 +2568,7 @@ def run_review_bot(
             client.get_updates(offset=offset_ref[0], timeout=0)
         return decided
 
-    client.send_message(
-        chat_id,
-        "HumorHist review bot ready. Send /reviewdraft to review, "
-        "/listapproved to browse greenlit drafts, /help for commands.",
-    )
+    _main_menu(client, chat_id)
     iters = 0
     last_pending: set[str] | None = None
     try:

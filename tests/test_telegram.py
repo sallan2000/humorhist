@@ -638,10 +638,15 @@ def test_run_review_bot_one_by_one(tmp_path):
     # GAP 3 confirm gate each draft yields TWO button messages (the Approve
     # tap, then the Confirm/Cancel gate) = 4 total for two drafts.
     button_msgs = [m for m in stub.sent if "reply_markup" in m]
-    # 3 per draft: the draft card (Approve/Reject/Later), the GAP 3 Confirm/Cancel
-    # gate, and the ⏭ Skip (no notes) prompt on the optional notes step. = 6 for
-    # two drafts, shown one at a time (not dumped all at once up front).
-    assert len(button_msgs) == 6
+    # Cards, confirmation gates and capture prompts are interleaved per draft,
+    # even though the guided menu and completion messages also have buttons.
+    for did in ("d1", "d2"):
+        assert sum(f"approve:{did}:" in str(m) and f"confirm:approve:{did}:" not in str(m)
+                   for m in button_msgs) == 1
+        assert sum(f"skipnotes:{did}" in str(m) for m in button_msgs) == 1
+    assert next(i for i, m in enumerate(button_msgs) if "skipnotes:d1" in str(m)) < next(
+        i for i, m in enumerate(button_msgs) if "approve:d2:" in str(m)
+    )
     # and the confirm gate was actually shown for each
     assert sum("confirm:approve:d1" in str(m) for m in button_msgs) == 1
     assert sum("confirm:approve:d2" in str(m) for m in button_msgs) == 1
